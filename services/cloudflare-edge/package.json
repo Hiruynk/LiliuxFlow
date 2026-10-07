@@ -18,9 +18,15 @@
     "upload": "node scripts/deployment.mjs upload",
     "promote": "node scripts/deployment.mjs promote",
     "config:deployment:check": "node scripts/config.mjs --deployment-check",
-    "dev:remote": "node scripts/deployment.mjs dev"
+    "dev:remote": "node scripts/deployment.mjs dev",
+    "audit:security": "npm audit --audit-level=high"
   },
   "devDependencies": {
     "wrangler": "4.147.0"
+  },
+  "overrides": {
+    "miniflare": {
+      "sharp": "0.35.5"
+    }
   }
 }
