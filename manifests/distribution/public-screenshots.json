@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "screenshots": [
+    {
+      "path": "assets/screenshots/model-management.jpg",
+      "bytes": 90785,
+      "sha256": "ac857e8d9807b34da27a13bb74500f5a9e025f6774b785b517fa748ca719152e",
+      "width": 1920,
+      "height": 1080,
+      "source": "Actual browser screenshot at the requested viewport; no rescale or UI content edits.",
+      "captured_at_utc": "2026-10-06T04:03:57.384784+00:00",
+      "private_avatar_keys_hostname_included": false,
+      "observed_state": "English dark Models page; three context profiles shown Unloaded/STOPPED; no model lifecycle action.",
+      "locale": "en",
+      "theme": "dark"
+    },
+    {
+      "path": "assets/screenshots/welcome-dark.jpg",
+      "bytes": 71098,
+      "sha256": "576edfcea24c2e23ae3f7897f3aa84df9f3884539d1256278c27f9e6be4bb262",
+      "width": 1600,
+      "height": 900,
+      "source": "Actual browser screenshot at the requested viewport; no rescale or UI content edits.",
+      "captured_at_utc": "2026-10-06T04:03:51.916127+00:00",
+      "private_avatar_keys_hostname_included": false,
+      "observed_state": "English dark welcome; complete introduction and request-flow panel with bottom breathing room; next section excluded.",
+      "locale": "en",
+      "theme": "dark"
+    }
+  ],
+  "screenshots_not_full_acceptance": true
+}

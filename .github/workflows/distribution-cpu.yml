@@ -1,0 +1,55 @@
+name: Distribution CPU guards
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  cpu-guards:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # official v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          lfs: false
+          submodules: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
+        with:
+          enable-cache: false
+      - name: Guard every tracked source path and blob format
+        run: python3 scripts/distribution/package.py --check-tree
+      - name: Verify original notice bytes
+        run: python3 scripts/distribution/notices.py
+      - name: Run source-replay and serving-refusal CPU fixtures
+        run: |
+          python3 -m unittest discover -s scripts/distribution -p test_notices.py
+          python3 -m unittest discover -s scripts/distribution -p test_public_screenshot_policy.py
+          python3 -m unittest discover -s scripts/distribution -p test_advisory_resources.py
+          python3 -m unittest discover -s scripts/distribution -p test_context_profiles.py
+          python3 -m unittest discover -s scripts/distribution -p test_guard_recovery_ops.py
+          python3 -m unittest discover -s scripts/distribution -p test_ui_recipe.py
+          python3 -m unittest discover -s scripts/distribution -p test_native_cleanroom.py
+          python3 -m unittest discover -s scripts/distribution -p test_source_candidate_native.py
+          python3 -m unittest discover -s scripts/distribution -p test_native_tool_copy.py
+          python3 -m unittest discover -s scripts/distribution -p test_user_launchd_logs.py
+          python3 -m unittest discover -s scripts/distribution -p test_package_policy.py
+          python3 -m unittest discover -s scripts/distribution -p test_model_helper_cancel.py
+      - name: Verify early build source identity under Python 3.12
+        run: uv run --no-project --python 3.12 python -m unittest discover -s scripts/distribution -p test_build_source_identity.py -v
+      - name: Check authenticated management-only state in locked Compat environment
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/liliuxflow-compat-cpu
+        run: |
+          uv run --locked --no-dev --project services/compat python -m unittest discover -s scripts/distribution -p test_optional_models.py -v
+          uv run --locked --no-dev --project services/compat python -m unittest discover -s scripts/distribution -p test_portable_product.py -v
+      - name: Exercise the pinned model installer SDK with simulated HTTP only
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/liliuxflow-model-installer
+        run: |
+          uv run --locked --no-dev --project services/model-installer python -m unittest discover -s scripts/distribution -p test_optional_model_sdk.py -v
+          uv run --locked --no-dev --project services/model-installer python -m unittest discover -s scripts/distribution -p test_public_ci.py -v

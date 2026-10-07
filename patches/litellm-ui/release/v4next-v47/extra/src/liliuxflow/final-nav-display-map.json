@@ -1,0 +1,76 @@
+{
+  "navLabels": {
+    "Virtual Keys": "navigation.keys",
+    "Playground": "navigation.playground",
+    "Models + Endpoints": "navigation.modelEndpoints",
+    "Agentic": "ui.finalNav.agenticGroup",
+    "Agents": "ui.admin.display.agents.e3cb5d3b",
+    "Workflow Runs": "ui.admin.display.workflow.runs.c0abff27",
+    "Memory": "ui.admin.display.memory.a01a2b06",
+    "MCP Servers": "ui.admin.display.mcp.servers.7dbc7210",
+    "Skills": "ui.admin.display.skills.8840d1c9",
+    "Guardrails": "navigation.guardrails",
+    "Policies": "navigation.policies",
+    "Tools": "ui.admin.display.tools.83d26720",
+    "Search Tools": "ui.admin.display.search.tools.445d9d0d",
+    "Vector Stores": "ui.admin.display.vector.stores.83a6438b",
+    "Tool Policies": "ui.admin.display.tool.policies.63bf3aff",
+    "Usage": "navigation.usage",
+    "Logs": "navigation.logs",
+    "Guardrails Monitor": "ui.admin.display.guardrails.monitor.52f6e4ed",
+    "Teams": "navigation.teams",
+    "Internal Users": "navigation.users",
+    "Organizations": "navigation.organizations",
+    "Access Groups": "navigation.accessGroups",
+    "Budgets": "navigation.budgets",
+    "API Reference": "ui.admin.display.api.reference.e2ad2bce",
+    "AI Hub": "ui.admin.display.ai.hub.d80417fb",
+    "Learning Resources": "ui.admin.display.learning.resources.8765bdb6",
+    "Response Cache": "navigation.cache",
+    "Experimental": "ui.admin.display.experimental.7c6680fa",
+    "Prompts": "ui.admin.display.prompts.7c5cc715",
+    "API Playground": "ui.admin.display.api.playground.0570ea13",
+    "Tag Management": "ui.admin.display.tag.management.17b4c026",
+    "Old Usage": "ui.admin.display.old.usage.8f2a66dc",
+    "Settings": "navigation.settings",
+    "Router Settings": "ui.admin.display.router.settings.70e5f7c9",
+    "Logging & Alerts": "ui.admin.display.logging.alerts.ec39f117",
+    "Admin Settings": "ui.admin.display.admin.settings.2dc3eb52",
+    "Cost Tracking": "ui.admin.display.cost.tracking.e1c7a02c",
+    "UI Theme": "ui.admin.display.ui.theme.deb545be",
+    "Cost Optimization": "ui.admin.display.cost.optimization.d92dc69b",
+    "AI Gateway": "shell.gateway",
+    "Observability": "ui.finalNav.a37c93100e7c",
+    "Access Control": "ui.finalNav.c3ceee351e98",
+    "Developer Tools": "ui.finalNav.85c1562cd9ce"
+  },
+  "navGroups": {
+    "AI GATEWAY": "ui.finalNav.326e75f98f6d",
+    "OBSERVABILITY": "ui.finalNav.c2fd58c653bb",
+    "ACCESS CONTROL": "ui.finalNav.cc552ea09227",
+    "DEVELOPER TOOLS": "ui.finalNav.7b4c40b08aef",
+    "SETTINGS": "ui.finalNav.02f6ea12816a"
+  },
+  "modes": {
+    "AI Gateway": "shell.gateway",
+    "Chat": "shell.chat"
+  },
+  "theme": {
+    "Switch to light mode": "ui.finalNav.bfa0cab91d75",
+    "Switch to dark mode (beta)": "ui.finalNav.71573d901236"
+  },
+  "community": {
+    "Join Slack": "shell.joinSlack",
+    "LiteLLM Slack community": "shell.slackCommunity",
+    "LiteLLM on GitHub": "shell.githubLink"
+  },
+  "meterLabels": {
+    "Seats": "ui.admin.display.seats.3edb76b0",
+    "Teams": "navigation.teams"
+  },
+  "meterFraction": "ui.finalNav.19f9c1045f29",
+  "planActive": "ui.finalNav.d0426e9bb06e",
+  "planNoExpiration": "ui.finalNav.911b279b133d",
+  "planExpired": "ui.finalNav.5f81210a0a4d",
+  "planExpires": "ui.finalNav.8d16138f121d"
+}

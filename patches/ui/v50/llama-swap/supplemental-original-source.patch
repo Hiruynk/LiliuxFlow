@@ -1,0 +1,193 @@
+--- a/ui/src/components/ActivityStats.svelte
++++ b/ui/src/components/ActivityStats.svelte
+@@ -64,10 +64,10 @@
+     <div class="text-sm">
+       <span class="font-semibold">{nf.format(stats?.total_requests ?? 0)}</span>{$uiText("ui.manager.display.completed.0effa70c")}</div>
+     <div class="text-sm">
+-      <span class="font-semibold">{nf.format(stats?.total_cache_tokens ?? 0)}</span>{$uiText("ui.manager.display.tokens.8604596c")}</div>
++      <span class="font-semibold">{stats?.total_cache_tokens == null ? "-" : nf.format(stats.total_cache_tokens)}</span>{$uiText("ui.manager.display.tokens.8604596c")}</div>
+     <div class="text-sm">
+-      <span class="font-semibold">{nf.format(stats?.total_input_tokens ?? 0)}</span>{$uiText("ui.manager.display.tokens.8604596c")}</div>
++      <span class="font-semibold">{stats?.total_input_tokens == null ? "-" : nf.format(stats.total_input_tokens)}</span>{$uiText("ui.manager.display.tokens.8604596c")}</div>
+     <div class="text-sm">
+-      <span class="font-semibold">{nf.format(stats?.total_output_tokens ?? 0)}</span>{$uiText("ui.manager.display.tokens.8604596c")}</div>
++      <span class="font-semibold">{stats?.total_output_tokens == null ? "-" : nf.format(stats.total_output_tokens)}</span>{$uiText("ui.manager.display.tokens.8604596c")}</div>
+   </div>
+ </Card.Root>
+--- a/ui/src/components/ActivityTable.svelte
++++ b/ui/src/components/ActivityTable.svelte
+@@ -1,5 +1,6 @@
+ <script lang="ts">
+ import {uiText} from "../liliuxflow/runtime";
++import LocalizedRelativeTime from "../liliuxflow/LocalizedRelativeTime.svelte";
+ import {displayEnum} from "../liliuxflow/display";
+ 
+   import type { ActivityLogEntry, InflightRequestEntry, ReqRespCapture } from "../lib/types";
+@@ -352,7 +353,7 @@
+         id: "time",
+         accessorKey: "timestamp",
+         header: "Time",
+-        cell: ({ row }) => formatRelativeTime(row.original.timestamp),
++        cell: ({ row }) => renderComponent(LocalizedRelativeTime, { timestamp: row.original.timestamp }),
+       },
+     ];
+ 
+@@ -399,7 +400,7 @@
+         accessorFn: (row) => row.tokens.cache_tokens,
+         header: () => renderComponent(HeaderLabel, { label: "Cached", tooltip: "prompt tokens from cache" }),
+         cell: ({ row }) =>
+-          row.original.tokens.cache_tokens > 0
++          typeof row.original.tokens.cache_tokens === "number" && row.original.tokens.cache_tokens >= 0
+             ? row.original.tokens.cache_tokens.toLocaleString()
+             : "-",
+       },
+@@ -407,13 +408,13 @@
+         id: "prompt",
+         accessorFn: (row) => row.tokens.input_tokens,
+         header: () => renderComponent(HeaderLabel, { label: "Prompt", tooltip: "new prompt tokens processed" }),
+-        cell: ({ row }) => row.original.tokens.input_tokens.toLocaleString(),
++        cell: ({ row }) => typeof row.original.tokens.input_tokens === "number" && row.original.tokens.input_tokens >= 0 ? row.original.tokens.input_tokens.toLocaleString() : "-",
+       },
+       {
+         id: "generated",
+         accessorFn: (row) => row.tokens.output_tokens,
+         header: "Generated",
+-        cell: ({ row }) => row.original.tokens.output_tokens.toLocaleString(),
++        cell: ({ row }) => typeof row.original.tokens.output_tokens === "number" && row.original.tokens.output_tokens >= 0 ? row.original.tokens.output_tokens.toLocaleString() : "-",
+       },
+       {
+         id: "drafted",
+--- a/ui/src/lib/activityExport.ts
++++ b/ui/src/lib/activityExport.ts
+@@ -5,8 +5,8 @@
+ import { formatAbsoluteTime, formatDuration, formatSpeed } from "./format";
+ 
+ /** Format a draft acceptance rate as "p% (accepted/drafted)". */
+-export function formatDrafted(drafted: number, accepted: number): string {
+-  return drafted > 0
++export function formatDrafted(drafted: number | null, accepted: number | null): string {
++  return typeof drafted === "number" && typeof accepted === "number" && drafted > 0 && accepted >= 0
+     ? ((accepted * 100) / drafted).toFixed(1) + "% (" + accepted + "/" + drafted + ")"
+     : "-";
+ }
+@@ -75,17 +75,17 @@
+     }
+ 
+     summary.durationMs += row.duration_ms;
+-    summary.cacheTokens += row.tokens.cache_tokens;
+-    summary.inputTokens += row.tokens.input_tokens;
+-    summary.outputTokens += row.tokens.output_tokens;
+-    summary.draftTokens += row.tokens.draft_tokens;
+-    summary.draftAccTokens += row.tokens.draft_acc_tokens;
+-
+-    if (row.tokens.input_tokens > 0 && row.tokens.prompt_per_second > 0) {
++    if (typeof row.tokens.cache_tokens === "number" && row.tokens.cache_tokens >= 0) summary.cacheTokens += row.tokens.cache_tokens;
++    if (typeof row.tokens.input_tokens === "number" && row.tokens.input_tokens >= 0) summary.inputTokens += row.tokens.input_tokens;
++    if (typeof row.tokens.output_tokens === "number" && row.tokens.output_tokens >= 0) summary.outputTokens += row.tokens.output_tokens;
++    if (typeof row.tokens.draft_tokens === "number" && row.tokens.draft_tokens >= 0) summary.draftTokens += row.tokens.draft_tokens;
++    if (typeof row.tokens.draft_acc_tokens === "number" && row.tokens.draft_acc_tokens >= 0) summary.draftAccTokens += row.tokens.draft_acc_tokens;
++
++    if (typeof row.tokens.input_tokens === "number" && typeof row.tokens.prompt_per_second === "number" && row.tokens.input_tokens > 0 && row.tokens.prompt_per_second > 0) {
+       promptTokens += row.tokens.input_tokens;
+       promptSeconds += row.tokens.input_tokens / row.tokens.prompt_per_second;
+     }
+-    if (row.tokens.output_tokens > 0 && row.tokens.tokens_per_second > 0) {
++    if (typeof row.tokens.output_tokens === "number" && typeof row.tokens.tokens_per_second === "number" && row.tokens.output_tokens > 0 && row.tokens.tokens_per_second > 0) {
+       genTokens += row.tokens.output_tokens;
+       genSeconds += row.tokens.output_tokens / row.tokens.tokens_per_second;
+     }
+@@ -119,11 +119,11 @@
+     case "resp_content_type":
+       return row.resp_content_type || "-";
+     case "cached":
+-      return row.tokens.cache_tokens > 0 ? row.tokens.cache_tokens.toLocaleString() : "-";
++      return typeof row.tokens.cache_tokens === "number" && row.tokens.cache_tokens >= 0 ? row.tokens.cache_tokens.toLocaleString() : "-";
+     case "prompt":
+-      return row.tokens.input_tokens.toLocaleString();
++      return typeof row.tokens.input_tokens === "number" && row.tokens.input_tokens >= 0 ? row.tokens.input_tokens.toLocaleString() : "-";
+     case "generated":
+-      return row.tokens.output_tokens.toLocaleString();
++      return typeof row.tokens.output_tokens === "number" && row.tokens.output_tokens >= 0 ? row.tokens.output_tokens.toLocaleString() : "-";
+     case "drafted":
+       return formatDrafted(row.tokens.draft_tokens, row.tokens.draft_acc_tokens);
+     case "prompt_speed":
+--- a/ui/src/lib/format.ts
++++ b/ui/src/lib/format.ts
+@@ -17,8 +17,8 @@
+ }
+ 
+ /** Format a tokens-per-second value; negative values are reported as "unknown". */
+-export function formatSpeed(speed: number): string {
+-  return speed < 0 ? "unknown" : speed.toFixed(2) + " t/s";
++export function formatSpeed(speed: number | null): string {
++  return typeof speed !== "number" || !Number.isFinite(speed) || speed < 0 ? "unknown" : speed.toFixed(2) + " t/s";
+ }
+ 
+ /** Format a byte count as B / KB / MB. */
+--- a/ui/src/lib/types.ts
++++ b/ui/src/lib/types.ts
+@@ -57,13 +57,13 @@
+ }
+ 
+ export interface TokenMetrics {
+-  cache_tokens: number;
+-  draft_tokens: number;
+-  draft_acc_tokens: number;
+-  input_tokens: number;
+-  output_tokens: number;
+-  prompt_per_second: number;
+-  tokens_per_second: number;
++  cache_tokens: number | null;
++  draft_tokens: number | null;
++  draft_acc_tokens: number | null;
++  input_tokens: number | null;
++  output_tokens: number | null;
++  prompt_per_second: number | null;
++  tokens_per_second: number | null;
+ }
+ 
+ export interface ActivityLogEntry {
+@@ -196,9 +196,9 @@
+ 
+ export interface ActivityStatsData {
+   total_requests: number;
+-  total_input_tokens: number;
+-  total_output_tokens: number;
+-  total_cache_tokens: number;
++  total_input_tokens: number | null;
++  total_output_tokens: number | null;
++  total_cache_tokens: number | null;
+   prompt_histogram: HistogramData | null;
+   gen_histogram: HistogramData | null;
+ }
+--- a/ui/src/routes/ModelDetail.svelte
++++ b/ui/src/routes/ModelDetail.svelte
+@@ -1,6 +1,7 @@
+ <script lang="ts">
+   import {displayEnum} from "../liliuxflow/display";
+-import {uiText} from "../liliuxflow/runtime";
++import {uiText, locale} from "../liliuxflow/runtime";
++import { localizedUptime } from "../liliuxflow/timeDisplay";
+ 
+   import { params } from "svelte-spa-router";
+   import { models } from "../stores/api";
+@@ -45,7 +46,7 @@
+     const timer = setInterval(() => (now = Date.now()), 1000);
+     return () => clearInterval(timer);
+   });
+-  let uptime = $derived(readyAt !== undefined ? formatUptime(now - readyAt) : "");
++  let uptime = $derived(readyAt !== undefined ? localizedUptime(now - readyAt, $locale) : "");
+ </script>
+ 
+ <div class="flex h-full flex-col gap-4 overflow-y-auto p-2">
+@@ -72,8 +73,8 @@
+               {/if}
+               <span class="text-xs uppercase tracking-wide">{displayEnum($uiText,'state',model.state)}</span>
+               {#if isReady}
+-                <span class="text-xs" title={readySince ? `Ready since ${formatAbsoluteTime(readySince)}` : undefined}>
+-                  up {uptime}
++                <span class="text-xs" title={readySince ? $uiText("ui.browser.model.readySince", { value: formatAbsoluteTime(readySince) }) : undefined}>
++                  {$uiText("ui.browser.model.uptime", { value: uptime })}
+                 </span>
+               {/if}
+             </div>

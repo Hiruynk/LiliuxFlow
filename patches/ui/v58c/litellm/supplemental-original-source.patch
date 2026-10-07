@@ -1,0 +1,42 @@
+--- a/ui/litellm-dashboard/src/components/model_info_view.tsx
++++ b/ui/litellm-dashboard/src/components/model_info_view.tsx
+@@ -552,7 +552,7 @@
+             </>)}
+           <Button variant="destructive" onClick={() => setIsDeleteModalOpen(true)} className="flex items-center" disabled={!canEditModel} data-testid="delete-model-button">
+             <TrashIcon className="h-4 w-4"/>
+-            {deleteLabel}
++            <LocalizedValue node={deleteLabel} sourceDisplayChoices={{"Delete Model":"ui.admin.display.delete.model.df4145c3"}} sourceChoiceProvenance="data"/>
+           </Button>
+         </div>
+       </div>
+--- a/ui/litellm-dashboard/src/app/(dashboard)/agents/_components/agent_card_discovery.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/agents/_components/agent_card_discovery.tsx
+@@ -240,7 +240,7 @@
+           <div className="flex justify-end">
+             <Button onClick={handleDiscover} disabled={loading || !effectiveUrl.trim()}>
+               {renderDiscoverIcon()}
+-              {discoverLabel}
++              <LocalizedValue node={discoverLabel} sourceDisplayChoices={{"Discover":"ui.admin.dynamic.868c4e6d13c0","Re-discover":"ui.admin.dynamic.31812643e3f6"}}/>
+             </Button>
+           </div>
+         </>) : (<>
+@@ -253,7 +253,7 @@
+             }} disabled={loading}/>
+             <Button onClick={handleDiscover} disabled={loading}>
+               {renderDiscoverIcon()}
+-              {discoverLabel}
++              <LocalizedValue node={discoverLabel} sourceDisplayChoices={{"Discover":"ui.admin.dynamic.868c4e6d13c0","Re-discover":"ui.admin.dynamic.31812643e3f6"}}/>
+             </Button>
+           </div>
+         </>)}
+--- a/ui/litellm-dashboard/src/app/(dashboard)/agents/_components/add_agent_form.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/agents/_components/add_agent_form.tsx
+@@ -425,7 +425,7 @@
+         <MCPToolPermissions accessToken={accessToken ?? ""} selectedServers={mcpSelection?.servers ?? []} selectedAccessGroups={mcpSelection?.accessGroups ?? []} selectedToolsets={mcpSelection?.toolsets ?? []} toolPermissions={mcpToolPermissions ?? {}} onChange={(toolPerms: Record<string, string[]>) => form.setValue("mcp_tool_permissions", toolPerms)}/>
+       </div>
+     </div>);
+-    const rateLimitField = (name: keyof AgentFormValues & string, label: string, placeholder: string) => (<AgentFormField name={name} label={label} className="gap-1">
++    const rateLimitField = (name: keyof AgentFormValues & string, label: string, placeholder: string) => (<AgentFormField name={name} label={<LocalizedValue node={label} sourceDisplayChoices={{"TPM Limit": "ui.admin.display.tpm.limit.64527afc", "RPM Limit": "ui.admin.display.rpm.limit.2ed6ba5b", "Session TPM Limit": "ui.admin.display.session.tpm.limit.71579e54", "Session RPM Limit": "ui.admin.display.session.rpm.limit.f1dd443a"}} sourceChoiceProvenance="data"/>} className="gap-1">
+       {({ value, onChange, ref, ...control }) => (<AgentNumberInput {...control} value={value} onChange={onChange} inputRef={ref} min={0} placeholder={placeholder} disabled={!requireTraceIdOutbound}/>)}
+     </AgentFormField>);
+     const renderObservabilityStep = () => (<div className="space-y-6">

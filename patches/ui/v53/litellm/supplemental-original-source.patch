@@ -1,0 +1,277 @@
+--- a/ui/litellm-dashboard/src/components/shared/PaginatedSearchSelect.tsx
++++ b/ui/litellm-dashboard/src/components/shared/PaginatedSearchSelect.tsx
+@@ -1,5 +1,6 @@
+ "use client";
+ 
++import { useTranslation } from "react-i18next";
+ import { Loader2 } from "lucide-react";
+ import { useMemo, useRef, useState, type SyntheticEvent } from "react";
+ 
+@@ -64,10 +65,10 @@
+   hasNextPage = false,
+   isLoading = false,
+   isFetchingNextPage = false,
+-  placeholder = "Search…",
+-  emptyText = "No results",
++  placeholder,
++  emptyText,
+   errorText,
+-  loadingText = "Loading…",
++  loadingText,
+   autoHighlight = false,
+   disabled = false,
+   className,
+@@ -76,6 +77,7 @@
+   "aria-invalid": ariaInvalid,
+   "aria-describedby": ariaDescribedBy,
+ }: PaginatedSearchSelectProps) {
++  const { t } = useTranslation();
+   const [pickedOption, setPickedOption] = useState<SearchSelectOption | null>(null);
+   const wholeSelectionRef = useRef(false);
+ 
+@@ -138,13 +140,13 @@
+         onFocus={(event) => event.currentTarget.select()}
+         onKeyDown={snapshotWholeSelection}
+         onPaste={snapshotWholeSelection}
+-        placeholder={placeholder}
++        placeholder={placeholder ?? t("ui.keyDisplay53.search")}
+         showClear={value != null && value !== ""}
+         className={`w-full ${className ?? ""}`}
+       />
+       <ComboboxContent>
+         <ComboboxEmpty className={errorText == null ? undefined : "text-destructive"}>
+-          {errorText ?? (isLoading ? loadingText : emptyText)}
++          {errorText ?? (isLoading ? (loadingText ?? t("common.loading")) : (emptyText ?? t("ui.admin.display.no.results.da931867")))}
+         </ComboboxEmpty>
+         <ComboboxList onScroll={handleScroll} data-testid="paginated-search-select-list">
+           {(item: SearchSelectOption) => (
+--- a/ui/litellm-dashboard/src/components/shared/SearchSelect.tsx
++++ b/ui/litellm-dashboard/src/components/shared/SearchSelect.tsx
+@@ -45,8 +45,8 @@
+   sourceOptionLabels,
+   value,
+   onValueChange,
+-  placeholder = "Select…",
+-  emptyText = "No results",
++  placeholder,
++  emptyText,
+   disabled = false,
+   className,
+   inputId,
+@@ -76,12 +76,12 @@
+       <ComboboxInput
+         id={inputId}
+         aria-label={ariaLabel}
+-        placeholder={placeholder}
++        placeholder={placeholder ?? t("ui.keyDisplay53.select")}
+         showClear={allowClear && value != null && value !== ""}
+         className={`h-8 w-full text-sm ${className ?? ""}`}
+       />
+       <ComboboxContent side="bottom" collisionAvoidance={{ side: "shift", align: "shift", fallbackAxisSide: "none" }}>
+-        <ComboboxEmpty>{emptyText}</ComboboxEmpty>
++        <ComboboxEmpty>{emptyText ?? t("ui.admin.display.no.results.da931867")}</ComboboxEmpty>
+         <ComboboxList>
+           {(item: SearchSelectOption) => (
+             <ComboboxItem key={item.value} value={item}>
+--- a/ui/litellm-dashboard/src/components/shared/MultiSelect.tsx
++++ b/ui/litellm-dashboard/src/components/shared/MultiSelect.tsx
+@@ -33,9 +33,10 @@
+         option.value.toLowerCase().includes(normalizedQuery) ||
+         (option.description?.toLowerCase().includes(normalizedQuery) ?? false));
+ };
+-export function MultiSelect({ id, options, sourceOptionLabels, value = [], onValueChange, placeholder = "Select options", emptyText = "No options found", disabled = false, loading = false, allowCustomValues = false, className, }: MultiSelectProps) {
++export function MultiSelect({ id, options, sourceOptionLabels, value = [], onValueChange, placeholder, emptyText, disabled = false, loading = false, allowCustomValues = false, className, }: MultiSelectProps) {
+     const { t } = useTranslation();
+     const displayLabel = (option: MultiSelectOption): string => {
++        if (allowCustomValues && option.value === query.trim() && option.label === `Create "${query.trim()}"` && !safeOptions.some(item => item.value.toLowerCase() === query.trim().toLowerCase())) return t("ui.keyDisplay53.createValue", { value: query.trim(), interpolation: { escapeValue: false } });
+         const descriptor = sourceOptionLabels && Object.hasOwn(sourceOptionLabels, option.value) ? sourceOptionLabels[option.value] : undefined;
+         return descriptor && option.label === descriptor.sourceLabel ? t(descriptor.key) : option.label;
+     };
+@@ -68,13 +69,13 @@
+               {selected.map((option) => (<ComboboxChip key={option.value} aria-label={displayLabel(option)}>
+                   {displayLabel(option)}
+                 </ComboboxChip>))}
+-              {localizeProps(<ComboboxChipsInput id={id} placeholder={loading ? "Loading..." : placeholder} className="min-w-24" aria-label={placeholder || undefined}/>, { "placeholder": { byValue: { "Loading...": "ui.admin.dynamic.1a418b5f8515" } } })}
++              {localizeProps(<ComboboxChipsInput id={id} placeholder={loading ? "Loading..." : (placeholder ?? t("ui.admin.dynamic.9fca03c18038"))} className="min-w-24" aria-label={placeholder ?? t("ui.admin.dynamic.9fca03c18038")}/>, { "placeholder": { byValue: { "Loading...": "ui.admin.dynamic.1a418b5f8515" } } })}
+               {canClear(selected) && localizeProps(<ComboboxClear className="ml-auto self-center" aria-label="Clear all"/>, { "aria-label": "ui.admin.display.clear.all.2fc9417a" })}
+             </>)}
+         </ComboboxValue>
+       </ComboboxChips>
+       <ComboboxContent anchor={anchor}>
+-        <ComboboxEmpty>{emptyText}</ComboboxEmpty>
++        <ComboboxEmpty>{emptyText ?? t("ui.admin.display.no.options.found.aab7692b")}</ComboboxEmpty>
+         <ComboboxList>
+           {(option: MultiSelectOption) => (<ComboboxItem key={option.value} value={option} disabled={option.disabled}>
+               <span className="min-w-0">
+--- a/ui/litellm-dashboard/src/components/organisms/create_key_button.tsx
++++ b/ui/litellm-dashboard/src/components/organisms/create_key_button.tsx
+@@ -617,7 +617,7 @@
+                         </SimpleTooltip>, { "content": "ui.admin.tooltip.9a896ad01b3f" }) }}/></span>} name="user_id" className="mt-4" required rules={requiredRule(keyOwner === "another_user", `Please input the user ID of the user you are assigning the key to`)}>
+                     {(control) => (<div>
+                         <div className="mb-2 flex">
+-                          {localizeProps(<PaginatedSearchSelect options={userOptions} value={typeof control.value === "string" ? control.value : undefined} onValueChange={control.onChange} onSearchChange={fetchUsers} isLoading={userSearchLoading} placeholder="Type email to search for users" emptyText="No users found" loadingText="Searching..." inputId={control.id} aria-required={control["aria-required"] === "true" ? true : undefined} aria-invalid={control["aria-invalid"] === "true" ? true : undefined} aria-describedby={control["aria-describedby"]}/>, { "placeholder": "ui.admin.display.type.email.to.search.for.79ddbfd0", "loadingText": "ui.admin.display.searching.afdf6f18" })}
++                          {localizeProps(<PaginatedSearchSelect options={userOptions} value={typeof control.value === "string" ? control.value : undefined} onValueChange={control.onChange} onSearchChange={fetchUsers} isLoading={userSearchLoading} placeholder="Type email to search for users" emptyText="No users found" loadingText="Searching..." inputId={control.id} aria-required={control["aria-required"] === "true" ? true : undefined} aria-invalid={control["aria-invalid"] === "true" ? true : undefined} aria-describedby={control["aria-describedby"]}/>, { "placeholder": "ui.admin.display.type.email.to.search.for.79ddbfd0", "loadingText": "ui.admin.display.searching.afdf6f18", "emptyText": "ui.admin.display.no.users.found.969d3772" })}
+                           <Button variant="outline" className="ml-2" onClick={() => setIsCreateUserModalVisible(true)}><LocalizedText id="ui.admin.display.create.user.c064cd49"/></Button>
+                         </div>
+                         <div className="text-xs text-muted-foreground"><LocalizedText id="ui.admin.display.search.by.email.to.find.20ef56f3"/></div>
+@@ -630,7 +630,7 @@
+                     {localizeProps(<SearchSelect inputId="create-key-agent" placeholder="Select an agent" emptyText="No agents found" value={selectedAgentId} onValueChange={setSelectedAgentId} options={agentsList.map((a) => ({
+                     label: a.agent_name || a.agent_id,
+                     value: a.agent_id,
+-                }))}/>, { "placeholder": "ui.admin.display.select.an.agent.2794adab" })}
++                }))}/>, { "placeholder": "ui.admin.display.select.an.agent.2794adab", "emptyText": "ui.keyDisplay53.noAgents" })}
+                     <div className="text-xs text-muted-foreground mt-2"><LocalizedText id="ui.admin.display.this.key.will.be.used.5f8e8bc2"/></div>
+                   </div>)}
+                 <MountedFormField label={<span><LocalizedRichText id="ui.admin.rich.0222babd617d" components={{ "value0": localizeProps(<SimpleTooltip content="The organization this key belongs to. Selecting an organization filters the available teams.">
+@@ -660,11 +660,11 @@
+                   <h3 className="text-lg font-medium text-foreground mb-4"><LocalizedText id="ui.admin.display.key.details.12d88dd8"/></h3>
+                   <MountedFormField label={<span>
+                         {keyOwner === "you" || keyOwner === "another_user" ? <LocalizedText id="ui.admin.dynamic.b04db74539d1"/> : <LocalizedText id="ui.admin.dynamic.4e11bad1842d"/>}{" "}
+-                        <SimpleTooltip content={keyOwner === "you" || keyOwner === "another_user"
++                        {localizeProps(<SimpleTooltip content={keyOwner === "you" || keyOwner === "another_user"
+                     ? "A descriptive name to identify this key"
+                     : "Unique identifier for this service account"}>
+                           <Info className="ml-1 inline size-3.5 align-text-bottom"/>
+-                        </SimpleTooltip>
++                        </SimpleTooltip>, { "content": { byValue: {"A descriptive name to identify this key": "ui.keyDisplay53.keyNameHint", "Unique identifier for this service account": "ui.keyDisplay53.serviceIdHint"} } })}
+                       </span>} name="key_alias" required rules={requiredRule(true, `Please input a ${keyOwner === "you" ? "key name" : "service account ID"}`)} help="required">
+                     {(control) => <Input {...control} value={(control.value as string | undefined) ?? ""}/>}
+                   </MountedFormField>
+@@ -690,13 +690,13 @@
+                         </SimpleTooltip>, { "content": "ui.admin.tooltip.2cc17d218110" }) }}/></span>} name="key_type" className="mt-4">
+                     {(control) => (<Select items={KEY_TYPE_OPTIONS} value={control.value as string | undefined} onValueChange={(value: string | null) => value != null && changeKeyType(control.onChange)(value)}>
+                         <SelectTrigger id={control.id} className="w-full" aria-invalid={control["aria-invalid"]} aria-describedby={control["aria-describedby"]}>
+-                          {localizeProps(<SelectValue placeholder="Select key type"/>, { "placeholder": "ui.admin.display.select.key.type.e9d76b48" })}
++                          {localizeProps(<SelectValue placeholder="Select key type">{(selected: string | null) => <LocalizedValue node={KEY_TYPE_OPTIONS.find(option => option.value === selected)?.label ?? selected} sourceDisplayChoices={{"AI APIs": "ui.admin.display.ai.apis.c7c1b4ad", "Management": "ui.admin.display.management.a29bffec", "Full Access": "ui.admin.display.full.access.5160f6c3"}} sourceChoiceProvenance="data"/>}</SelectValue>, { "placeholder": "ui.admin.display.select.key.type.e9d76b48" })}
+                         </SelectTrigger>
+                         <SelectContent>
+                           {KEY_TYPE_OPTIONS.map((option) => (<SelectItem key={option.value} value={option.value}>
+                               <div className="py-1">
+-                                <div className="font-medium">{option.label}</div>
+-                                <div className="mt-0.5 text-[11px] text-muted-foreground">{option.hint}</div>
++                                <div className="font-medium">{<LocalizedValue node={option.label} sourceDisplayChoices={{"AI APIs": "ui.admin.display.ai.apis.c7c1b4ad", "Management": "ui.admin.display.management.a29bffec", "Full Access": "ui.admin.display.full.access.5160f6c3"}} sourceChoiceProvenance="ui-producer"/>}</div>
++                                <div className="mt-0.5 text-[11px] text-muted-foreground">{<LocalizedValue node={option.hint} sourceDisplayChoices={{"Can call only AI API routes (chat/completions, embeddings, etc.)": "ui.keyDisplay53.aiRoutesHint", "Can call only management routes (user/team/key management)": "ui.keyDisplay53.managementRoutesHint", "Can call all routes (AI APIs, Management, and read-only)": "ui.keyDisplay53.allRoutesHint"}} sourceChoiceProvenance="ui-producer"/>}</div>
+                               </div>
+                             </SelectItem>))}
+                         </SelectContent>
+--- a/ui/litellm-dashboard/src/components/common_components/team_dropdown.tsx
++++ b/ui/litellm-dashboard/src/components/common_components/team_dropdown.tsx
+@@ -43,7 +43,7 @@
+             label: team.team_alias || team.team_id,
+             value: team.team_id,
+             sublabel: team.team_id,
+-        }))} value={value} onValueChange={handleChange} onSearchChange={setSearch} onLoadMore={fetchNextPage} hasNextPage={hasNextPage} isLoading={isLoading} isFetchingNextPage={isFetchingNextPage} placeholder="Search or select a team" emptyText="No teams found" loadingText="Loading teams…" disabled={disabled} inputId={id}/>, { "placeholder": "ui.admin.display.search.or.select.a.team.0c5f1e38", "loadingText": "ui.admin.display.loading.teams.4b21453c" })}
++        }))} value={value} onValueChange={handleChange} onSearchChange={setSearch} onLoadMore={fetchNextPage} hasNextPage={hasNextPage} isLoading={isLoading} isFetchingNextPage={isFetchingNextPage} placeholder="Search or select a team" emptyText="No teams found" loadingText="Loading teams…" disabled={disabled} inputId={id}/>, { "placeholder": "ui.admin.display.search.or.select.a.team.0c5f1e38", "loadingText": "ui.admin.display.loading.teams.4b21453c", "emptyText": "ui.admin.display.no.teams.found.54ea19ff" })}
+     </div>);
+ };
+ export default TeamDropdown;
+--- a/ui/litellm-dashboard/src/components/VirtualKeysPage/VirtualKeysTable.tsx
++++ b/ui/litellm-dashboard/src/components/VirtualKeysPage/VirtualKeysTable.tsx
+@@ -176,10 +176,10 @@
+             {localizeProps(<DataTableFilterDrawer table={table} open={filtersOpen} onOpenChange={setFiltersOpen} title="Filters" description="Narrow down virtual keys">
+               {({ get, set }) => (<>
+                   {localizeProps(<DataTableFilterField label="Team">
+-                    {localizeProps(<SearchSelect options={teamOptions} value={(get("team_id") as string) || undefined} onValueChange={(value) => set("team_id", value ?? undefined)} placeholder="Select a team…" emptyText="No teams found"/>, { "placeholder": "ui.admin.display.select.a.team.38603673" })}
++                    {localizeProps(<SearchSelect options={teamOptions} value={(get("team_id") as string) || undefined} onValueChange={(value) => set("team_id", value ?? undefined)} placeholder="Select a team…" emptyText="No teams found"/>, { "placeholder": "ui.admin.display.select.a.team.38603673", "emptyText": "ui.admin.display.no.teams.found.54ea19ff" })}
+                   </DataTableFilterField>, { "label": "ui.admin.display.team.e3be00b5" })}
+                   {localizeProps(<DataTableFilterField label="Organization">
+-                    {localizeProps(<SearchSelect options={orgOptions} value={(get("org_id") as string) || undefined} onValueChange={(value) => set("org_id", value ?? undefined)} placeholder="Select an organization…" emptyText="No organizations found"/>, { "placeholder": "ui.admin.display.select.an.organization.0f2b5d29" })}
++                    {localizeProps(<SearchSelect options={orgOptions} value={(get("org_id") as string) || undefined} onValueChange={(value) => set("org_id", value ?? undefined)} placeholder="Select an organization…" emptyText="No organizations found"/>, { "placeholder": "ui.admin.display.select.an.organization.0f2b5d29", "emptyText": "ui.organizationDropdown.noOrganizationsFound" })}
+                   </DataTableFilterField>, { "label": "ui.admin.display.organization.2725ef15" })}
+                   {localizeProps(<DataTableFilterField label="User ID">
+                     {localizeProps(<Input value={(get("user_id") as string) ?? ""} onChange={(event) => set("user_id", event.target.value)} placeholder="Enter User ID…"/>, { "placeholder": "ui.admin.display.enter.user.id.7b08df99" })}
+--- a/ui/litellm-dashboard/src/components/common_components/AccessGroupSelector.tsx
++++ b/ui/litellm-dashboard/src/components/common_components/AccessGroupSelector.tsx
+@@ -1,3 +1,5 @@
++import { LocalizedValue } from "@/liliuxflow/LocalizedText";
++import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import React from "react";
+ import { Users } from "lucide-react";
+ import { Skeleton } from "@/components/ui/skeleton";
+@@ -40,7 +42,7 @@
+       <div>
+         {showLabel && (
+           <p className="mb-2 flex items-center text-sm font-medium text-foreground">
+-            <Users className="mr-2 size-4" /> {labelText}
++            <Users className="mr-2 size-4" /> {<LocalizedValue node={labelText} sourceDisplayChoices={{"Access Group": "ui.admin.display.access.group.ccdfe054"}} sourceChoiceProvenance="data"/>}
+           </p>
+         )}
+         <Skeleton className="h-8 w-full" style={style} />
+@@ -60,11 +62,11 @@
+     <div>
+       {showLabel && (
+         <p className="mb-2 flex items-center text-sm font-medium text-foreground">
+-          <Users className="mr-2 size-4" /> {labelText}
++          <Users className="mr-2 size-4" /> {<LocalizedValue node={labelText} sourceDisplayChoices={{"Access Group": "ui.admin.display.access.group.ccdfe054"}} sourceChoiceProvenance="data"/>}
+         </p>
+       )}
+       <div style={style}>
+-        <MultiSelect
++        {localizeProps(<MultiSelect
+           options={options}
+           value={value}
+           onValueChange={onChange ?? (() => {})}
+@@ -72,7 +74,7 @@
+           emptyText={isError ? "Failed to load access groups" : "No access groups found"}
+           disabled={disabled}
+           className={`w-full rounded-md ${className ?? ""}`}
+-        />
++        />, { placeholder: { byValue: {"Select access groups": "ui.keyDisplay53.accessSelect"} }, emptyText: { byValue: {"Failed to load access groups": "ui.keyDisplay53.accessError", "No access groups found": "ui.admin.display.no.access.groups.found.5c76ec37"} } })}
+       </div>
+     </div>
+   );
+--- a/ui/litellm-dashboard/src/components/common_components/PassThroughRoutesSelector.tsx
++++ b/ui/litellm-dashboard/src/components/common_components/PassThroughRoutesSelector.tsx
+@@ -1,3 +1,5 @@
++import { LocalizedValue } from "@/liliuxflow/LocalizedText";
++import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import React, { useEffect, useState } from "react";
+ import { MultiSelect, type MultiSelectOption } from "@/components/shared/MultiSelect";
+ import { getPassThroughEndpointsCall } from "../networking";
+@@ -55,7 +57,7 @@
+   }, [accessToken, teamId]);
+ 
+   return (
+-    <MultiSelect
++    localizeProps(<MultiSelect
+       options={passThroughRoutes}
+       value={value}
+       onValueChange={(routes) => onChange?.(routes)}
+@@ -65,7 +67,7 @@
+       allowCustomValues
+       disabled={disabled}
+       className={className}
+-    />
++    />, { placeholder: { byValue: {"Select pass through routes": "ui.admin.display.select.pass.through.routes.cf654ef0"} }, emptyText: "ui.keyDisplay53.noPassRoutes" })
+   );
+ };
+ 
+--- a/ui/litellm-dashboard/src/components/common_components/KeyLifecycleSettings.tsx
++++ b/ui/litellm-dashboard/src/components/common_components/KeyLifecycleSettings.tsx
+@@ -1,3 +1,4 @@
++import { LocalizedValue } from "@/liliuxflow/LocalizedText";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import React, { useState } from "react";
+@@ -106,18 +107,12 @@
+                   <Select value={showCustomInput ? "custom" : rotationInterval || null} onValueChange={(next: string | null) => next !== null && handleIntervalChange(next)}>
+                     <SelectTrigger className="w-full">
+                       {localizeProps(<SelectValue placeholder="Select interval">
+-                        {(selected: string | null) => selected === null ? ("Select interval") : (<span title={INTERVAL_LABELS[selected] ?? selected}>
+-                              {INTERVAL_LABELS[selected] ?? selected}
+-                            </span>)}
++                        {(selected: string | null) => selected === null ? (<LocalizedValue node="Select interval" sourceDisplayChoices={{"Select interval": "ui.admin.display.select.interval.56f48231"}} sourceChoiceProvenance="ui-producer"/>) : (localizeProps(<span title={INTERVAL_LABELS[selected] ?? selected}><LocalizedValue node={INTERVAL_LABELS[selected] ?? selected} sourceDisplayChoices={{"7 days": "ui.admin.display.7.days.45db998c", "30 days": "ui.admin.display.30.days.715af67e", "90 days": "ui.keyDisplay53.days90", "180 days": "ui.keyDisplay53.days180", "365 days": "ui.keyDisplay53.days365", "Custom interval": "ui.keyDisplay53.customInterval"}} sourceChoiceProvenance="data"/></span>, { title: { byValue: {"7 days": "ui.admin.display.7.days.45db998c", "30 days": "ui.admin.display.30.days.715af67e", "90 days": "ui.keyDisplay53.days90", "180 days": "ui.keyDisplay53.days180", "365 days": "ui.keyDisplay53.days365", "Custom interval": "ui.keyDisplay53.customInterval"} } }))}
+                       </SelectValue>, { "placeholder": "ui.admin.display.select.interval.56f48231" })}
+                     </SelectTrigger>
+                     <SelectContent>
+-                      {PREDEFINED_INTERVALS.map((interval) => (<SelectItem key={interval} value={interval} title={INTERVAL_LABELS[interval]}>
+-                          {INTERVAL_LABELS[interval]}
+-                        </SelectItem>))}
+-                      <SelectItem value="custom" title={INTERVAL_LABELS.custom}>
+-                        {INTERVAL_LABELS.custom}
+-                      </SelectItem>
++                      {PREDEFINED_INTERVALS.map((interval) => (localizeProps(<SelectItem key={interval} value={interval} title={INTERVAL_LABELS[interval]}><LocalizedValue node={INTERVAL_LABELS[interval]} sourceDisplayChoices={{"7 days": "ui.admin.display.7.days.45db998c", "30 days": "ui.admin.display.30.days.715af67e", "90 days": "ui.keyDisplay53.days90", "180 days": "ui.keyDisplay53.days180", "365 days": "ui.keyDisplay53.days365", "Custom interval": "ui.keyDisplay53.customInterval"}} sourceChoiceProvenance="ui-producer"/></SelectItem>, { title: { byValue: {"7 days": "ui.admin.display.7.days.45db998c", "30 days": "ui.admin.display.30.days.715af67e", "90 days": "ui.keyDisplay53.days90", "180 days": "ui.keyDisplay53.days180", "365 days": "ui.keyDisplay53.days365", "Custom interval": "ui.keyDisplay53.customInterval"} } })))}
++                      {localizeProps(<SelectItem value="custom" title={INTERVAL_LABELS.custom}><LocalizedValue node={INTERVAL_LABELS.custom} sourceDisplayChoices={{"7 days": "ui.admin.display.7.days.45db998c", "30 days": "ui.admin.display.30.days.715af67e", "90 days": "ui.keyDisplay53.days90", "180 days": "ui.keyDisplay53.days180", "365 days": "ui.keyDisplay53.days365", "Custom interval": "ui.keyDisplay53.customInterval"}} sourceChoiceProvenance="ui-producer"/></SelectItem>, { title: { byValue: {"7 days": "ui.admin.display.7.days.45db998c", "30 days": "ui.admin.display.30.days.715af67e", "90 days": "ui.keyDisplay53.days90", "180 days": "ui.keyDisplay53.days180", "365 days": "ui.keyDisplay53.days365", "Custom interval": "ui.keyDisplay53.customInterval"} } })}
+                     </SelectContent>
+                   </Select>
+ 

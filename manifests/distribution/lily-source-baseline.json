@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "source_commit": "db3f8a7cdb33f1e88b68c6889331abd31098c923",
+  "files": [
+    {
+      "path": "src/generate.rs",
+      "sha256": "28d3dd8259412dc85ecfad8c6901caa672252c25ffc6f7a80f2624bbec9b90e8"
+    },
+    {
+      "path": "src/kernels/attention.rs",
+      "sha256": "371e8bdf406a8f73befdd42d73ce4ca24ff13eb699de31e6a27904b414618ed7"
+    },
+    {
+      "path": "src/kernels/elementwise.rs",
+      "sha256": "a606549ccadb0852af93facde920a3293cb5002991892bda63ec3d0e1be3c3a0"
+    },
+    {
+      "path": "src/kernels/gdn.rs",
+      "sha256": "d8bfc0f1f5560d8b379dc35f74bf0509e72439a02d6d82ed3657fbbf766b44b1"
+    },
+    {
+      "path": "src/kernels/gemm.rs",
+      "sha256": "b008d5098d5750dafa2cc70a522de0876c8dbf0d512c8fffe05851fb8fab22cb"
+    },
+    {
+      "path": "src/kernels/hc.rs",
+      "sha256": "9f07df8df045028cdec94ab6d45acf58d92d5892db35f751e69002226ddea681"
+    },
+    {
+      "path": "src/kernels/metal/attention.metal",
+      "sha256": "2ea41543263ebed3b7871ce1d758bd3728904972806c1e9cdd54c8a86f0b06d2"
+    },
+    {
+      "path": "src/kernels/metal/elementwise.metal",
+      "sha256": "a5a1494821e73ca5a94c7197ad6e26df67c919d7d2771acffd97734ca8b77260"
+    },
+    {
+      "path": "src/kernels/metal/gdn.metal",
+      "sha256": "2afe42cca3cfffeeb459255e3f8471ffc730ce96aa60dafe3f6b656db1d8aff4"
+    },
+    {
+      "path": "src/kernels/metal/gemm.metal",
+      "sha256": "fe39ba3dc950d672c2cbf630b7efddac1ff349ceba8032303c37f4fef840302f"
+    },
+    {
+      "path": "src/kernels/metal/hc.metal",
+      "sha256": "be266f8f7d163c3b2bbe6e64da5cc0c66ee4649b5462b6cdb285fe72d4cf83db"
+    },
+    {
+      "path": "src/kernels/metal/moe.metal",
+      "sha256": "ed9a6165afb7400d7a7a7a0c20371ae9d7677ee4f905b23b49d970a9a82fb2d3"
+    },
+    {
+      "path": "src/kernels/metal/norm.metal",
+      "sha256": "02518162002d31a10e1cf29d0a0d82be72804a19a424644edced85525ff3eb0f"
+    },
+    {
+      "path": "src/kernels/metal/ple.metal",
+      "sha256": "42f123da080fc9e23e57479329682a828a6111dd8f5729cef1d6075f67afe58d"
+    },
+    {
+      "path": "src/kernels/metal/qsa.metal",
+      "sha256": "96ca4c16cb2b70bde659f5e22daaf7b000111947b3e53864b651b334af64af3f"
+    },
+    {
+      "path": "src/kernels/metal/quant.metal",
+      "sha256": "70a7a6cb5fe56d59a639be63c9ec2ed887d9aee62c7644f0aa12105c56f511b6"
+    },
+    {
+      "path": "src/kernels/metal/sample.metal",
+      "sha256": "b0b729e7891c79f101ea762a6b4da4bb409010884a88cba285dc4f2f6afde4ce"
+    },
+    {
+      "path": "src/kernels/metal/skinny.metal",
+      "sha256": "b6db4b6d57b218b51419054153b07a0a9943ea861e13a50535c2ace11e000d54"
+    },
+    {
+      "path": "src/kernels/metal/spec.metal",
+      "sha256": "d5ff159252ef2f5716941d0a0fb9f518fa6e31227f929bf0ba6c6908abf7353e"
+    },
+    {
+      "path": "src/kernels/metal/vision.metal",
+      "sha256": "9cb5167943ee09f32229fe60a3dbe184009b77bda176a65a882a88e3960591c3"
+    },
+    {
+      "path": "src/kernels/moe.rs",
+      "sha256": "376d034f9baf6903000696fb41f3ad2959a0134e08f361966157fe4138867553"
+    },
+    {
+      "path": "src/kernels/norm.rs",
+      "sha256": "198a1c22ed105cc46de83fce7c6710632ca2fa548dc8bd127aa6cdf6a2702830"
+    },
+    {
+      "path": "src/kernels/ple.rs",
+      "sha256": "047065775db5465cf1992c62960efb9961c7271d2929fa931053095eb2522f13"
+    },
+    {
+      "path": "src/kernels/qsa.rs",
+      "sha256": "8426f76102bcbb24e66a9c3a930660a2bb8b721d7c3dcad3dbc5393fc2e03b18"
+    },
+    {
+      "path": "src/kernels/quant.rs",
+      "sha256": "f7f66db73b4aec831e81d46abaa24e894c5cc6a881ebc9b6678a06bec094201f"
+    },
+    {
+      "path": "src/kernels/sample.rs",
+      "sha256": "951d47ece1c5fa176bdad49e8af3c2861eb1bc2e94c0aeb845ba0facdebc15ab"
+    },
+    {
+      "path": "src/kernels/skinny.rs",
+      "sha256": "e67fc999c0b7dc4d4c674e496a510355623e29862f2f03740b4f606120bd47c6"
+    },
+    {
+      "path": "src/kernels/spec.rs",
+      "sha256": "9680e31e814db75e0381d2dab9148f65a9c61411ad7231aabfef9b6f607efdf4"
+    },
+    {
+      "path": "src/kernels/vision.rs",
+      "sha256": "7d8703ea593d96c28b43d9f03069c181634877f18bd63ede09b82802a5a93023"
+    },
+    {
+      "path": "src/qwen4exp/config.rs",
+      "sha256": "e30980ebe6b026c0276b92c8f3d26fb685cabdc98cd8a19bf9c01cbe026bc3fc"
+    },
+    {
+      "path": "src/qwen4exp/expert_cache.rs",
+      "sha256": "e9847a079975355ab11ea78b049f2346f15cc1750056f92c14c930b24ff3928b"
+    },
+    {
+      "path": "src/qwen4exp/expert_store.rs",
+      "sha256": "0f15394045206554cd0d4ea44aacf8aa528da8fbb61d5c700b8466929326ad89"
+    },
+    {
+      "path": "src/qwen4exp/image.rs",
+      "sha256": "9cacadb162fa2556eaaf42782829c85278cc3f065e1dd0c42ef882bd5c5f9fac"
+    },
+    {
+      "path": "src/qwen4exp/mod.rs",
+      "sha256": "6237b1bb4e17b7839306024403e5bd24fbe7b22cd6cb1fc8351f0bf708c9a781"
+    },
+    {
+      "path": "src/qwen4exp/model.rs",
+      "sha256": "cd1f9ff902b6994ea0c3455e66e10cb4d3c7bbd92956b6ded9c0b6c174027e52"
+    },
+    {
+      "path": "src/qwen4exp/ngram.rs",
+      "sha256": "39311e2f30185bb2fa42dbb6eb6c94cba87fa434714d2338627b27e7754e1bde"
+    },
+    {
+      "path": "src/qwen4exp/positions.rs",
+      "sha256": "8d33fae3c25a6a8b3640dd93efff1e3b16fc823bc15312e2c3629e0cbbde78a3"
+    },
+    {
+      "path": "src/qwen4exp/probe.rs",
+      "sha256": "4d1a005e8092edbec31157b0b7915d86e353772eb0b19d4b55f5b2a419365563"
+    },
+    {
+      "path": "src/qwen4exp/spec.rs",
+      "sha256": "09916e14287b173efdfa80d82a119c3487ea3dc95326772f238d802818466be4"
+    },
+    {
+      "path": "src/qwen4exp/vision.rs",
+      "sha256": "cbab323213d853951c55903d19bdaa5e44b222c0b9a241cd4487342f6e6b644b"
+    },
+    {
+      "path": "src/qwen4exp/vision_weights.rs",
+      "sha256": "57c323c7ed9957994960efe94df2504c3af1196c80a737b24058d53c9014b94e"
+    },
+    {
+      "path": "src/qwen4exp/weights.rs",
+      "sha256": "4c6026cce13fc4fec5f01c301549eecacaebcf999d688051ea5e36a6ca3f0dac"
+    },
+    {
+      "path": "src/serve.rs",
+      "sha256": "7e8f950f16c22910d823fa902cdbc9f3f23dfce29c636f25bef9b67af8b096a1"
+    },
+    {
+      "path": "src/tokenizer.rs",
+      "sha256": "62100e0f193eb8b81c999f549725dd94cff8332b6e7c7c8f69e50a22e5dfe213"
+    },
+    {
+      "path": "tests/unit/serve.rs",
+      "sha256": "e894f53a9c74fc75e9d8e4a6ce2e8b951961c214b6c996eb35ded2e56dbbd3f1"
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "family": "Instrument Sans",
+  "style": "normal",
+  "subset": "latin",
+  "format": "woff2",
+  "weightAxis": {
+    "tag": "wght",
+    "min": 400,
+    "default": 400,
+    "max": 700
+  },
+  "font": {
+    "file": "InstrumentSans-latin-variable.woff2",
+    "bytes": 30092,
+    "sha256": "2ee17598a98d8a59e4df8152d015bec9ab8e4d5672cc0ab42bef806b568e3971",
+    "internalVersion": "Version 1.000;gftools[0.9.28]",
+    "modifiedLocally": false
+  },
+  "distribution": {
+    "package": "@fontsource-variable/instrument-sans",
+    "version": "5.3.0",
+    "registryMetadataUrl": "https://registry.npmjs.org/@fontsource-variable%2finstrument-sans/5.3.0",
+    "tarballUrl": "https://registry.npmjs.org/@fontsource-variable/instrument-sans/-/instrument-sans-5.3.0.tgz",
+    "tarballIntegrity": "sha512-u4gKbDBTNFGkg997tfQn3eHOhHuquWUFTRT/rwzuKtrxX5P2ekfs2x+LgBPP4P32+cC+vUwF1Cr+IdRoPQbrGw==",
+    "tarballSha1": "56e1c0410be5a224078909ab88113ff776c32019",
+    "fontMember": "package/files/instrument-sans-latin-wght-normal.woff2",
+    "fontSourceUrl": "https://cdn.jsdelivr.net/npm/@fontsource-variable/instrument-sans@5.3.0/files/instrument-sans-latin-wght-normal.woff2",
+    "upstreamVersion": "v4"
+  },
+  "upstream": {
+    "projectUrl": "https://github.com/Instrument/instrument-sans",
+    "readmeUrl": "https://github.com/Instrument/instrument-sans/blob/master/README.md",
+    "googleFontsUrl": "https://github.com/google/fonts/tree/main/ofl/instrumentsans",
+    "designer": "Rodrigo Fuenzalida",
+    "artDirection": "Jordan Egstad"
+  },
+  "license": {
+    "spdx": "OFL-1.1",
+    "file": "OFL.txt",
+    "bytes": 4403,
+    "sha256": "9e27a72ed30eb49a08678f6a5d6ed98ec7ba5368f541637ee0683ec9134ef966",
+    "sourceUrl": "https://raw.githubusercontent.com/google/fonts/2fc9491da70cf3e1bafd3c3da49244c5a496e9d5/ofl/instrumentsans/OFL.txt",
+    "sourceCommit": "2fc9491da70cf3e1bafd3c3da49244c5a496e9d5",
+    "copyright": "Copyright 2022 The Instrument Sans Project Authors (https://github.com/Instrument/instrument-sans)",
+    "textModified": false
+  },
+  "metrics": {
+    "unitsPerEm": 1000,
+    "hheaAscent": 970,
+    "hheaDescent": -250,
+    "hheaLineGap": 0,
+    "typoAscent": 970,
+    "typoDescent": -250,
+    "typoLineGap": 0,
+    "winAscent": 986,
+    "winDescent": 350,
+    "xHeight": 510,
+    "capHeight": 720,
+    "useTypoMetrics": true
+  }
+}

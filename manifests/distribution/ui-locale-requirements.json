@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "state": "REQUIRED_NOT_YET_VERIFIED",
+  "supported_locales": ["en", "zh-Hant", "zh-Hans", "ja"],
+  "apps": ["litellm", "llama-swap"],
+  "english_catalog_role": "complete runtime resources, not development-only",
+  "english_to_hant_fallback": false,
+  "login_and_selectors": "all four locales before and after authentication",
+  "coverage_method": "exact source-used key set plus all dynamic finite source maps; direct per-language resource existence, parameter/plural/rich-slot parity",
+  "switching": "no reload, form/session/filter/date/stream reset or new inference",
+  "excluded_from_translation": ["model output", "user input", "API fields", "aliases", "raw logs"],
+  "final_source_browser_native_acceptance": "NOT_RUN",
+  "historical_three_locale_receipts": "preserved, not four-locale acceptance"
+}

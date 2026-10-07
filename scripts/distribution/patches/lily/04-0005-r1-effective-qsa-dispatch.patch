@@ -1,0 +1,88 @@
+diff --git a/src/kernels/qsa.rs b/src/kernels/qsa.rs
+index 534364a..8d1a549 100644
+--- a/src/kernels/qsa.rs
++++ b/src/kernels/qsa.rs
+@@ -597,3 +597,3 @@ impl SparseAttnRoute {
+-    /// `LILY_QSA_ROUTE`: `tile1` (the default: measured fastest at 8K and
+-    /// 32K, see docs/architecture.md), `tile2`, `tile4` or `split` (the
+-    /// per-query kernel).
++    /// Resolve the process-level route and record the value that the native
++    /// child actually selected. The requested string is reduced to a fixed
++    /// label so an invalid environment value is never copied into logs.
+@@ -601,7 +601,25 @@ impl SparseAttnRoute {
+-        match std::env::var("LILY_QSA_ROUTE").as_deref() {
+-            Ok("tile") | Err(_) => Self::Tiled,
+-            Ok("split") => Self::Split,
+-            Ok(other) => {
+-                eprintln!("LILY_QSA_ROUTE={other}: unknown route, using tile");
+-                Self::Tiled
+-            }
++        static ROUTE: std::sync::OnceLock<SparseAttnRoute> = std::sync::OnceLock::new();
++        *ROUTE.get_or_init(|| {
++            let value = std::env::var("LILY_QSA_ROUTE").ok();
++            let (route, requested) = Self::from_value(value.as_deref());
++            eprintln!(
++                "LILY_QSA_ROUTE_EFFECTIVE requested={requested} route={}",
++                route.label()
++            );
++            route
++        })
++    }
++
++    fn from_value(value: Option<&str>) -> (Self, &'static str) {
++        match value {
++            None => (Self::Tiled, "unset"),
++            Some("tile") => (Self::Tiled, "tile"),
++            Some("split") => (Self::Split, "split"),
++            Some(_) => (Self::Tiled, "invalid"),
++        }
++    }
++
++    fn label(self) -> &'static str {
++        match self {
++            Self::Split => "split",
++            Self::Tiled => "tile",
+@@ -615 +633 @@ impl SparseAttnRoute {
+-        match self {
++        let route = match self {
+@@ -617,0 +636,16 @@ impl SparseAttnRoute {
++        };
++        // model.rs consumes this exact return value in the immediately
++        // following Split/Tiled dispatch match. Capture only its first
++        // tile-sized sparse-prefill decision; the process route is immutable.
++        if rows >= QSA_TILE_BQ {
++            static RECORDED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
++            RECORDED.get_or_init(|| {
++                let (split_count, tiled_count) = match route {
++                    Self::Split => (1, 0),
++                    Self::Tiled => (0, 1),
++                };
++                eprintln!(
++                    "LILY_QSA_DISPATCH_METADATA sparse_prefill_rows={rows} route={} split_dispatch_count={split_count} tiled_dispatch_count={tiled_count}",
++                    route.label()
++                );
++            });
+@@ -618,0 +653,23 @@ impl SparseAttnRoute {
++        route
++    }
++}
++
++#[cfg(test)]
++mod selected_route_tests {
++    use super::{QSA_TILE_BQ, SparseAttnRoute};
++
++    #[test]
++    fn explicit_split_selects_split_for_batched_sparse_prefill() {
++        let (selected, requested) = SparseAttnRoute::from_value(Some("split"));
++        assert_eq!(selected, SparseAttnRoute::Split);
++        assert_eq!(requested, "split");
++        assert_eq!(selected.for_rows(QSA_TILE_BQ), SparseAttnRoute::Split);
++        assert_eq!(SparseAttnRoute::Tiled.for_rows(QSA_TILE_BQ - 1), SparseAttnRoute::Split);
++        assert_eq!(SparseAttnRoute::Tiled.for_rows(QSA_TILE_BQ), SparseAttnRoute::Tiled);
++    }
++
++    #[test]
++    fn invalid_route_remains_tiled_and_is_labeled_without_echoing_input() {
++        let (selected, requested) = SparseAttnRoute::from_value(Some("secret-or-typo"));
++        assert_eq!(selected, SparseAttnRoute::Tiled);
++        assert_eq!(requested, "invalid");

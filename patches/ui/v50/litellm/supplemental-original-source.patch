@@ -1,0 +1,240 @@
+--- a/ui/litellm-dashboard/next.config.mjs
++++ b/ui/litellm-dashboard/next.config.mjs
+@@ -23,7 +23,7 @@
+   trailingSlash: true,
+   turbopack: {
+     // Must be absolute; "." is no longer allowed
+-    root: __dirname,
++    root: path.resolve(__dirname, "../.."),
+   },
+ };
+ 
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatComposer.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatComposer.tsx
+@@ -44,7 +44,7 @@
+ 
+       <div className="w-full">
+         <InputGroup className={cn("h-auto min-h-[7.5rem] flex-col overflow-hidden rounded-2xl border border-border bg-card", "shadow-[0_1px_2px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.08)] ring-1 ring-black/5", "transition-[box-shadow,border-color,ring] duration-200", "has-[[data-slot=input-group-control]:focus-visible]:border-ring", "has-[[data-slot=input-group-control]:focus-visible]:shadow-[0_2px_8px_rgba(0,0,0,0.08),0_12px_32px_rgba(0,0,0,0.12)]", "has-[[data-slot=input-group-control]:focus-visible]:ring-2 has-[[data-slot=input-group-control]:focus-visible]:ring-ring/40")}>
+-          {body ? (<div className="max-h-48 min-h-24 w-full overflow-y-auto px-3 pt-3">{body}</div>) : (<InputGroupTextarea data-testid="chat-composer-input" value={value} disabled={disabled} placeholder={placeholder} rows={1} className="min-h-24 max-h-48 resize-none overflow-y-auto border-0 bg-transparent px-4 pt-3.5 pb-1.5 text-[13px] leading-relaxed shadow-none placeholder:text-muted-foreground/50 focus-visible:ring-0 [field-sizing:content]" onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown}/>)}
++          {body ? (<div className="max-h-48 min-h-24 w-full overflow-y-auto px-3 pt-3">{body}</div>) : (localizeProps(<InputGroupTextarea data-testid="chat-composer-input" value={value} disabled={disabled} placeholder={placeholder} rows={1} className="min-h-24 max-h-48 resize-none overflow-y-auto border-0 bg-transparent px-4 pt-3.5 pb-1.5 text-[13px] leading-relaxed shadow-none placeholder:text-muted-foreground/50 focus-visible:ring-0 [field-sizing:content]" onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown}/>, { "placeholder": { byValue: { "Type your message... (Shift+Enter for new line)": "ui.admin.display.type.your.message.shift.enter.582c1e80" } } }))}
+ 
+           <InputGroupAddon align="block-end" className="justify-between gap-2 px-3 pb-3 pt-1" onClick={(event) => {
+             if ((event.target as HTMLElement).closest("button")) {
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatImageUpload.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatImageUpload.tsx
+@@ -33,7 +33,7 @@
+         onImageUpload(file);
+     };
+     return (<>
+-      <input id={inputId} ref={inputRef} type="file" accept={CHAT_ATTACHMENT_ACCEPT} className="sr-only" tabIndex={-1} disabled={disabled} onChange={handleFileChange}/>
++      {localizeProps(<input id={inputId} ref={inputRef} type="file" aria-label="Attach image or PDF" accept={CHAT_ATTACHMENT_ACCEPT} className="sr-only" tabIndex={-1} disabled={disabled} onChange={handleFileChange}/>, { "aria-label": "ui.admin.display.attach.image.or.pdf.1084b61b" })}
+       <Tooltip>
+         <TooltipTrigger render={localizeProps(<Button type="button" variant="ghost" size="icon-sm" disabled={disabled} aria-label="Attach image or PDF" className="text-muted-foreground hover:text-foreground" onClick={() => inputRef.current?.click()}/>, { "aria-label": "ui.admin.display.attach.image.or.pdf.1084b61b" })}>
+           <Paperclip className="size-4"/>
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatMessageBubble.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatMessageBubble.tsx
+@@ -1,3 +1,4 @@
++import { LocalizedValue } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { Bot, User } from "lucide-react";
+ import React from "react";
+@@ -40,7 +41,7 @@
+           <div data-testid="message-avatar" className={`flex items-center justify-center w-6 h-6 rounded-full mr-1 ${isUser ? "bg-info/20" : "bg-muted"}`}>
+             {isUser ? (<User className="size-3 text-info" aria-hidden="true"/>) : (<Bot className="size-3 text-muted-foreground" aria-hidden="true"/>)}
+           </div>
+-          <strong className="text-sm capitalize">{message.role}</strong>
++          <strong className="text-sm capitalize"><LocalizedValue node={message.role} sourceDisplayChoices={{ user: "ui.admin.display.user.e06722a5", assistant: "ui.admin.display.assistant.47b9af26" }}/></strong>
+           {message.role === "assistant" && message.model && (<span className="max-w-48 truncate rounded-sm bg-muted px-2 py-0.5 text-xs font-normal text-muted-foreground sm:max-w-80">
+               {message.model}
+             </span>)}
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatUI.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatUI.tsx
+@@ -1071,7 +1071,7 @@
+                           <TooltipContent><LocalizedText id="ui.admin.display.advanced.parameters.are.only.supported.daeba25a"/></TooltipContent>
+                         </Tooltip>)}
+                     </div>
+-                    {localizeProps(<SearchSelect value={selectedModel} placeholder={isLoadingModels ? "Loading models..." : "Select a Model"} emptyText={modelEmptyText} disabled={isLoadingModels} onValueChange={onModelChange} options={[
++                    {localizeProps(<SearchSelect sourceOptionLabels={{ custom: { sourceLabel: "Enter custom model", key: "ui.admin.display.enter.custom.model.501a4664" } }} value={selectedModel} placeholder={isLoadingModels ? "Loading models..." : "Select a Model"} emptyText={modelEmptyText} disabled={isLoadingModels} onValueChange={onModelChange} options={[
+                         { value: "custom", label: "Enter custom model" },
+                         ...modelsForEndpoint.map((model) => ({
+                             value: model.model_group,
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ResponsesImageUpload.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ResponsesImageUpload.tsx
+@@ -33,7 +33,7 @@
+         onImageUpload(file);
+     };
+     return (<>
+-      <input id={inputId} ref={inputRef} type="file" accept={CHAT_ATTACHMENT_ACCEPT} className="sr-only" tabIndex={-1} disabled={disabled} onChange={handleFileChange}/>
++      {localizeProps(<input id={inputId} ref={inputRef} type="file" aria-label="Attach image or PDF" accept={CHAT_ATTACHMENT_ACCEPT} className="sr-only" tabIndex={-1} disabled={disabled} onChange={handleFileChange}/>, { "aria-label": "ui.admin.display.attach.image.or.pdf.1084b61b" })}
+       <Tooltip>
+         <TooltipTrigger render={localizeProps(<Button type="button" variant="ghost" size="icon-sm" disabled={disabled} aria-label="Attach image or PDF" className="text-muted-foreground hover:text-foreground" onClick={() => inputRef.current?.click()}/>, { "aria-label": "ui.admin.display.attach.image.or.pdf.1084b61b" })}>
+           <Paperclip className="size-4"/>
+--- a/ui/litellm-dashboard/src/components/shared/SearchSelect.tsx
++++ b/ui/litellm-dashboard/src/components/shared/SearchSelect.tsx
+@@ -1,6 +1,7 @@
+ "use client";
+ 
+ import React from "react";
++import { useTranslation } from "react-i18next";
+ import {
+   Combobox,
+   ComboboxContent,
+@@ -21,6 +22,7 @@
+ 
+ interface SearchSelectProps {
+   options: SearchSelectOption[];
++  sourceOptionLabels?: Record<string, { sourceLabel: string; key: string }>;
+   value?: string | null;
+   onValueChange: (value: string | null) => void;
+   placeholder?: string;
+@@ -40,6 +42,7 @@
+ 
+ export function SearchSelect({
+   options,
++  sourceOptionLabels,
+   value,
+   onValueChange,
+   placeholder = "Select…",
+@@ -50,6 +53,11 @@
+   allowClear = true,
+   "aria-label": ariaLabel,
+ }: SearchSelectProps) {
++  const { t } = useTranslation();
++  const displayLabel = (item: SearchSelectOption): string => {
++    const descriptor = sourceOptionLabels && Object.hasOwn(sourceOptionLabels, item.value) ? sourceOptionLabels[item.value] : undefined;
++    return descriptor && item.label === descriptor.sourceLabel ? t(descriptor.key) : item.label;
++  };
+   const selected =
+     value == null || value === "" ? null : options.find((option) => option.value === value) ?? { label: value, value };
+   const items =
+@@ -61,8 +69,8 @@
+       value={selected}
+       onValueChange={(item: SearchSelectOption | null) => onValueChange(item?.value ?? null)}
+       isItemEqualToValue={(a: SearchSelectOption, b: SearchSelectOption) => a.value === b.value}
+-      itemToStringLabel={(item: SearchSelectOption) => item.label}
+-      filter={matchesQuery}
++      itemToStringLabel={displayLabel}
++      filter={(item: SearchSelectOption, query: string) => matchesQuery(item, query) || displayLabel(item).toLowerCase().includes(query.trim().toLowerCase())}
+       disabled={disabled}
+     >
+       <ComboboxInput
+@@ -79,7 +87,7 @@
+             <ComboboxItem key={item.value} value={item}>
+               {item.icon}
+               <span className="flex min-w-0 flex-col">
+-                <span className="truncate">{item.label}</span>
++                <span className="truncate">{displayLabel(item)}</span>
+                 {item.sublabel != null && item.sublabel !== "" && (
+                   <span className="truncate text-xs text-muted-foreground">{item.sublabel}</span>
+                 )}
+--- a/ui/litellm-dashboard/src/components/templates/KeyInfoHeader.tsx
++++ b/ui/litellm-dashboard/src/components/templates/KeyInfoHeader.tsx
+@@ -125,7 +125,7 @@
+       <div style={{ marginBottom: 16 }}>
+         <Button variant="ghost" onClick={onBack}>
+           <ArrowLeft className="size-3.5"/>
+-          {backButtonText}
++          <LocalizedValue node={backButtonText} sourceDisplayChoices={{ "Back to Keys": "ui.browser.keyDetail.backToKeys" }}/>
+         </Button>
+       </div>
+ 
+--- a/ui/litellm-dashboard/src/components/templates/key_info_view.tsx
++++ b/ui/litellm-dashboard/src/components/templates/key_info_view.tsx
+@@ -1,4 +1,5 @@
+ import { noticeMessage } from "@/liliuxflow/NoticeMessage";
++import { useTranslation } from "react-i18next";
+ import { LocalizedDateValue } from "@/liliuxflow/LocalizedDateValue";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+@@ -77,6 +78,7 @@
+  */
+ export default function KeyInfoView({ onClose, keyData, teams, onKeyDataUpdate, onDelete, backButtonText = "Back to Keys", }: KeyInfoViewProps) {
+     const { accessToken, userId: userID, userRole, premiumUser } = useAuthorized();
++    const { t, i18n } = useTranslation();
+     const activityDateRange = useActivityDateRange();
+     const queryClient = useQueryClient();
+     const canEditGuardrails = premiumUser || (userRole != null && rolesWithWriteAccess.includes(userRole));
+@@ -381,6 +383,11 @@
+     // Update the formatTimestamp function to use the desired date format
+     const formatTimestamp = (timestamp: string | Date) => {
+         const date = new Date(timestamp);
++        // Format display only; Date parsing and the system time zone stay the same.
++        if (i18n.language !== "en" && Number.isFinite(date.getTime())) {
++            const locale = i18n.language === "ja" ? "ja-JP" : i18n.language === "zh-Hans" ? "zh-Hans" : "zh-Hant";
++            return new Intl.DateTimeFormat(locale, { year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
++        }
+         const dateStr = date.toLocaleDateString("en-US", {
+             year: "numeric",
+             month: "short",
+@@ -441,7 +448,7 @@
+     const orgId = currentKeyData.organization_id || currentKeyData.org_id || parentTeam?.organization_id || "";
+     const parentOrg = orgId ? organizations?.find((org) => org.organization_id === orgId) : null;
+     const hasOwnBudget = currentKeyData.max_budget !== null;
+-    const budgetDisplay = hasOwnBudget ? `$${formatNumberWithCommas(currentKeyData.max_budget, 2)}` : "Unlimited";
++    const budgetDisplay = hasOwnBudget ? `$${formatNumberWithCommas(currentKeyData.max_budget, 2)}` : t("ui.admin.display.unlimited.bd66930f");
+     const inheritedGates = hasOwnBudget ? [] : inheritedBudgetGates(parentTeam, parentOrg);
+     return (<div className="w-full h-full overflow-y-auto p-4">
+       <KeyInfoHeader data={{
+@@ -461,8 +468,8 @@
+             createdById: currentKeyData.created_by_user?.user_id || currentKeyData.created_by || "",
+             createdAt: currentKeyData.created_at ? formatTimestamp(currentKeyData.created_at) : "",
+             lastUpdated: lastConfiguredAt ? formatTimestamp(lastConfiguredAt) : "",
+-            lastActive: currentKeyData.last_active ? formatTimestamp(currentKeyData.last_active) : "Never",
+-            expires: currentKeyData.expires ? formatTimestamp(currentKeyData.expires) : "Never",
++            lastActive: currentKeyData.last_active ? formatTimestamp(currentKeyData.last_active) : t("ui.browser.keyDetail.neverActive"),
++            expires: currentKeyData.expires ? formatTimestamp(currentKeyData.expires) : t("ui.browser.keyDetail.neverExpires"),
+         }} onBack={onClose} onRegenerate={() => setIsRegenerateModalOpen(true)} onDelete={() => setIsDeleteModalOpen(true)} onResetSpend={canResetSpend ? () => setIsResetSpendModalOpen(true) : undefined} onToggleBlocked={canBlockKey ? () => setIsBlockModalOpen(true) : undefined} isBlocked={isBlocked} canModifyKey={canModifyKey} backButtonText={backButtonText} regenerateDisabled={!premiumUser} regenerateTooltip={!premiumUser ? "This is a LiteLLM Enterprise feature, and requires a valid key to use." : undefined}/>
+ 
+       {/* Add RegenerateKeyModal */}
+--- a/ui/litellm-dashboard/src/components/ui/combobox.tsx
++++ b/ui/litellm-dashboard/src/components/ui/combobox.tsx
+@@ -1,5 +1,6 @@
+ "use client";
+ import {localizeProps} from "@/liliuxflow/LocalizedProps";
++import { LocalizedComboboxInput, LocalizedComboboxPopup } from "@/liliuxflow/BaseUiComboboxDismiss";
+ 
+ 
+ import * as React from "react";
+@@ -61,7 +62,7 @@
+ }) {
+   return (
+     <InputGroup className={cn("w-auto", className)}>
+-      <ComboboxPrimitive.Input disabled={disabled} render={<InputGroupInput />} {...props} />
++      <ComboboxPrimitive.Input disabled={disabled} render={(renderProps, state) => <LocalizedComboboxInput {...renderProps} __liliuxflowOpen={state.open}/>} {...props} />
+       <InputGroupAddon align="inline-end">
+         {showTrigger && (
+           <InputGroupButton
+@@ -106,6 +107,7 @@
+         className="isolate z-popup"
+       >
+         <ComboboxPrimitive.Popup
++          render={(renderProps, state) => <LocalizedComboboxPopup {...renderProps} __liliuxflowOpen={state.open}/>}
+           data-slot="combobox-content"
+           data-chips={!!anchor}
+           className={cn(
+--- a/ui/litellm-dashboard/src/components/vector_store_management/VectorStoreSelector.tsx
++++ b/ui/litellm-dashboard/src/components/vector_store_management/VectorStoreSelector.tsx
+@@ -1,4 +1,5 @@
+ import React, { useEffect, useState } from "react";
++import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { VectorStore } from "./types";
+ import { vectorStoreListCall } from "../networking";
+ import { MultiSelect } from "@/components/shared/MultiSelect";
+@@ -44,7 +45,7 @@
+ 
+   return (
+     <div className="min-w-0">
+-      <MultiSelect
++      {localizeProps(<MultiSelect
+         placeholder={placeholder}
+         onValueChange={onChange}
+         value={value}
+@@ -56,7 +57,7 @@
+           value: store.vector_store_id,
+           description: store.vector_store_description || undefined,
+         }))}
+-      />
++      />, { "placeholder": { byValue: { "Select vector stores": "ui.admin.display.select.vector.stores.534986ae" }, sourceChoiceProvenance: "data" } })}
+     </div>
+   );
+ };

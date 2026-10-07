@@ -1,0 +1,54 @@
+{
+  "choices": {
+    "filterDefaults": {
+      "Filters": "ui.admin.display.filters.39b4d659",
+      "Apply Filters": "ui.finalCommon.09b2e220c665",
+      "Reset": "ui.admin.display.reset.8a4db006",
+      "Reset Filters": "ui.admin.display.reset.filters.0d23e550"
+    },
+    "sortLabels": {
+      "Spend": "ui.admin.display.spend.ee98e68d",
+      "Budget": "ui.admin.display.budget.f3a4cec0"
+    },
+    "keyStatus": {
+      "Active": "ui.manager.display.active.8096a470",
+      "Blocked": "ui.admin.display.blocked.b34a95b5",
+      "Expired": "ui.admin.display.expired.e9af4834"
+    },
+    "keyStatusTooltips": {
+      "Blocked by SCIM (external identity provider deactivated or deleted the owning user).": "ui.finalCommon.92ebc8655b73",
+      "Blocked. Requests using this key will be rejected with 401.": "ui.finalCommon.6a46af85b4fd",
+      "This key has passed its expiry date.": "ui.admin.display.this.key.has.passed.its.73b336ad",
+      "This key is not blocked and has not expired.": "ui.admin.display.this.key.is.not.blocked.00db2ece"
+    },
+    "keyHelp": {
+      "Displays the first available value: User Alias, User Email, or User ID.": "ui.admin.display.displays.the.first.available.value.c22af72a",
+      "This is a new field and is not backfilled. Only new key usage will update this value.": "ui.admin.display.this.is.a.new.field.a7101b8c"
+    },
+    "dateFallbacks": {
+      "Never": "ui.admin.display.never.fc2ad10f",
+      "Unknown": "ui.admin.dynamic.20e9ba68c6da"
+    },
+    "filterLabels": {
+      "Team": "ui.admin.display.team.e3be00b5",
+      "Organization": "ui.admin.display.organization.2725ef15",
+      "User ID": "shell.userId",
+      "Key ID": "ui.admin.display.key.id.5b867b28"
+    },
+    "search": {
+      "Search": "common.search",
+      "Search by key alias or ID…": "ui.finalCommon.6b0825136274"
+    }
+  },
+  "sortAsc": "ui.finalCommon.fb84b37f0df5",
+  "sortDesc": "ui.finalCommon.17e5a98b4cc3",
+  "sortOptions": "ui.admin.dynamic.ba1afe237764",
+  "fieldOr": "ui.finalCommon.e1a3e78cb5c8",
+  "budgetUnlimited": "ui.finalCommon.bbea0ad097b8",
+  "budgetOf": "ui.finalCommon.8330ca3d832a",
+  "budgetFraction": "ui.finalCommon.c5cc8d00fa22",
+  "removeFilter": "ui.admin.dynamic.768fab77956e",
+  "keyLoading": "ui.admin.display.loading.keys.b528ab4c",
+  "keyEmpty": "ui.admin.display.no.keys.found.107485f7",
+  "keySubtitle": "ui.finalCommon.5b030badd463"
+}

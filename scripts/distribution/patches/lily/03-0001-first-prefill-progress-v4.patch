@@ -1,0 +1,111 @@
+diff --git a/src/engine.rs b/src/engine.rs
+index e1470eb..18d75a3 100644
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -331,8 +331,9 @@ pub trait LanguageModel: Sized {
+         draw: Option<Draw<'_>>,
+         vision: Option<&crate::qwen4exp::VisionInput<'_>>,
+         cancelled: &mut dyn FnMut() -> bool,
++        on_completed_chunk: &mut dyn FnMut(usize, usize),
+     ) -> Result<PrefillProgress> {
+-        let _ = (ctx, state, scratch, tokens, draw, vision);
++        let _ = (ctx, state, scratch, tokens, draw, vision, on_completed_chunk);
+         if cancelled() {
+             return Ok(PrefillProgress { completed_chunks: 0, cancelled: true });
+         }
+diff --git a/src/qwen4exp/model.rs b/src/qwen4exp/model.rs
+index edf5345..4c1e83b 100644
+--- a/src/qwen4exp/model.rs
++++ b/src/qwen4exp/model.rs
+@@ -1830,8 +1830,9 @@ impl Qwen4ExpModel {
+         vision: Option<&VisionInput<'_>>,
+     ) -> Result<()> {
+         let mut never_cancel = || false;
++        let mut ignore_progress = |_: usize, _: usize| {};
+         let progress = self.prefill_with_vision_cancellable(
+-            ctx, state, s, tokens, draw, vision, &mut never_cancel,
++            ctx, state, s, tokens, draw, vision, &mut never_cancel, &mut ignore_progress,
+         )?;
+         ensure!(!progress.cancelled, "uncancellable prefill returned cancellation");
+         Ok(())
+@@ -1849,6 +1850,7 @@ impl Qwen4ExpModel {
+         draw: Option<Draw<'_>>,
+         vision: Option<&VisionInput<'_>>,
+         cancelled: &mut dyn FnMut() -> bool,
++        on_completed_chunk: &mut dyn FnMut(usize, usize),
+     ) -> Result<crate::engine::PrefillProgress> {
+         let mut completed_chunks = 0usize;
+         if cancelled() {
+@@ -1960,6 +1962,7 @@ impl Qwen4ExpModel {
+             // The chunk's recurrent kernels wrote the other window buffers.
+             state.conv_slot = 1 - state.conv_slot;
+             completed_chunks += 1;
++            on_completed_chunk(completed_chunks, state.pos);
+             if cancelled() {
+                 return Ok(crate::engine::PrefillProgress { completed_chunks, cancelled: true });
+             }
+@@ -3926,9 +3929,10 @@ impl LanguageModel for Qwen4ExpModel {
+         draw: Option<Draw<'_>>,
+         vision: Option<&VisionInput<'_>>,
+         cancelled: &mut dyn FnMut() -> bool,
++        on_completed_chunk: &mut dyn FnMut(usize, usize),
+     ) -> Result<crate::engine::PrefillProgress> {
+         Qwen4ExpModel::prefill_with_vision_cancellable(
+-            self, ctx, state, scratch, tokens, draw, vision, cancelled,
++            self, ctx, state, scratch, tokens, draw, vision, cancelled, on_completed_chunk,
+         )
+     }
+ 
+diff --git a/src/serve.rs b/src/serve.rs
+index 228486f..fcf36bf 100644
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -993,11 +993,24 @@ impl<M: LanguageModel> Engine<M> {
+             .disk()
+             .and_then(|_| boundary_position(agreement, reused, n, min_tokens));
+         let mut durable: Option<(usize, f64)> = None;
++        let prefill_progress_base = std::cell::Cell::new(prefill_chunks);
++        let mut prefill_progress_emitted = false;
++        let mut on_completed_chunk = |local_chunks: usize, position: usize| {
++            let completed_chunks = prefill_progress_base.get() + local_chunks;
++            if !prefill_progress_emitted && completed_chunks > 0 {
++                prefill_progress_emitted = true;
++                eprintln!(
++                    "[lily-meta] request_id={request_id} phase=prefill_progress completed_chunks={completed_chunks} prefilled_tokens={}",
++                    position.saturating_sub(reused)
++                );
++            }
++        };
+         let mut prefilled = reused;
+         if let Some(b) = boundary {
+             if prefilled < b {
+                 let at = session.state.pos();
+                 let progress = {
++                    prefill_progress_base.set(prefill_chunks);
+                     let mut is_cancelled = || sink.cancelled();
+                     model.prefill_with_vision_cancellable(
+                         ctx,
+@@ -1007,6 +1020,7 @@ impl<M: LanguageModel> Engine<M> {
+                         None,
+                         vision.as_ref(),
+                         &mut is_cancelled,
++                        &mut on_completed_chunk,
+                     )?
+                 };
+                 prefill_chunks += progress.completed_chunks;
+@@ -1084,6 +1098,7 @@ impl<M: LanguageModel> Engine<M> {
+         // identical or extended prompt can resume without re-feeding it.
+         if prefilled < n - 1 {
+             let progress = {
++                prefill_progress_base.set(prefill_chunks);
+                 let mut is_cancelled = || sink.cancelled();
+                 model.prefill_with_vision_cancellable(
+                     ctx,
+@@ -1093,6 +1108,7 @@ impl<M: LanguageModel> Engine<M> {
+                     None,
+                     vision.as_ref(),
+                     &mut is_cancelled,
++                    &mut on_completed_chunk,
+                 )?
+             };
+             prefill_chunks += progress.completed_chunks;

@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "default_profile_id": "ctx64k",
+  "pending_limit": 4,
+  "maximum_body_bytes": 8388608,
+  "total_disk_cache_cap_bytes": 68719476736,
+  "temporary_cache_reserve_bytes": 12884901888,
+  "maximum_added_cache_bytes": 34359738368,
+  "minimum_free_disk_bytes": 68719476736,
+  "shared": {
+    "runtime_model_id": "Qwen3.8-Flash-Next",
+    "model_repository": "fabiogreter/Qwen3.8-Flash-Next-lily-q4",
+    "model_revision": "afde8b8e824c57bfe264c2ef3f9396537249979f",
+    "model_format": "qwen4_exp-affine-v1",
+    "thinking": "checkpoint default high",
+    "qsa_route": "split",
+    "mtp_drafts": 0,
+    "pin_weights": "off",
+    "ngram_lock": "off",
+    "minimum_ram_headroom_gib": 15,
+    "target_ram_headroom_gib": 24
+  },
+  "profiles": [
+    {
+      "profile_id": "ctx64k",
+      "public_alias": "qwen3.8-flash-next-lily-q4-64k",
+      "context_tokens": 65536,
+      "default_output_tokens": 4096,
+      "total_deadline_seconds": 600,
+      "queue_wait_seconds": 300,
+      "idle_ttl_seconds": 1800,
+      "cache_bytes": 8589934592,
+      "max_sessions": 4,
+      "disk_cache_bytes": 34359738368,
+      "cache_namespace": "lily-safe64k",
+      "production_enabled": true,
+      "validation_only": false,
+      "minimum_ram_headroom_gib": 15
+    },
+    {
+      "profile_id": "ctx128k",
+      "public_alias": "qwen3.8-flash-next-lily-q4-128k",
+      "context_tokens": 131072,
+      "default_output_tokens": 4096,
+      "total_deadline_seconds": 1200,
+      "queue_wait_seconds": 600,
+      "idle_ttl_seconds": 1800,
+      "cache_bytes": 8589934592,
+      "max_sessions": 2,
+      "disk_cache_bytes": 10737418240,
+      "cache_namespace": "lily-q4-afde8b8e-db3f8a7c-split-mtp0-ctx128k",
+      "production_enabled": true,
+      "validation_only": false,
+      "minimum_ram_headroom_gib": 15
+    },
+    {
+      "profile_id": "ctx262k",
+      "public_alias": "qwen3.8-flash-next-lily-q4-262k",
+      "context_tokens": 262144,
+      "default_output_tokens": 4096,
+      "total_deadline_seconds": 1800,
+      "queue_wait_seconds": 900,
+      "idle_ttl_seconds": 1800,
+      "cache_bytes": 8589934592,
+      "max_sessions": 1,
+      "disk_cache_bytes": 10737418240,
+      "cache_namespace": "lily-q4-afde8b8e-db3f8a7c-split-mtp0-ctx262k",
+      "production_enabled": true,
+      "validation_only": false,
+      "minimum_ram_headroom_gib": 13
+    }
+  ]
+}

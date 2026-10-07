@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "optional_models": {
+    "qwen3.8-flash-next-lily-q4": {
+      "kind": "huggingface-model",
+      "repository": "fabiogreter/Qwen3.8-Flash-Next-lily-q4",
+      "revision": "afde8b8e824c57bfe264c2ef3f9396537249979f",
+      "inventory": "manifests/distribution/checkpoint-files.json",
+      "format": "qwen4_exp-affine-v1",
+      "engine": "lily",
+      "install_by_default": false,
+      "homepage": "https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4",
+      "license_name": "Qwen Community License 1.0",
+      "license_file": "docs/productization/MODEL_LICENSE.txt",
+      "redistribute_payload": false
+    }
+  },
+  "lily": {
+    "repository": "fabiogreter/lily-qwen3.8-flash-next",
+    "commit": "db3f8a7cdb33f1e88b68c6889331abd31098c923",
+    "archive_sha256": "fb2a1029a17d499ab051763a124ee8cbcd8ada133f6273527ed3cb03a41c6e10",
+    "patches": [
+      {
+        "path": "scripts/distribution/patches/lily/01-0001-redact-durable-prefix-divergence.patch",
+        "sha256": "4cfb566f90713aeeb72d038d197fd4bbf60d210f4ea19152bf5c7f51eed3907c",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily/02-0001-lily-queue-prefill-early-cancel-v3.patch",
+        "sha256": "73ba2ca4aa004129326ac06ba425bf488c484525351cdb052e0aafcd866272d2",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily/03-0001-first-prefill-progress-v4.patch",
+        "sha256": "2d163b80ca184533699fc9c31a6006b4e41046143941391760db7bdcb8cdce86",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily/04-0005-r1-effective-qsa-dispatch.patch",
+        "sha256": "81537b21925971475ca1d7449bcf57cf71b4907235452dd7a8b21d2df877087a",
+        "unidiff_zero": true
+      },
+      {
+        "path": "scripts/distribution/patches/lily/05-cancelled-session-no-lru-release.patch",
+        "sha256": "298e454fc2cee655f80451ed3260b8702ecc70f62e86f3ce185d46959311a260",
+        "unidiff_zero": true
+      }
+    ]
+  },
+  "llama_swap": {
+    "repository": "mostlygeek/llama-swap",
+    "commit": "fcefa7b7bebc326790937bbebc32ae87a958747c",
+    "archive_sha256": "7d4d0695a38e958faec2c022763e624372cc996d48c06ce8517a2ac9ab0830e5",
+    "patches": [
+      {
+        "path": "scripts/distribution/patches/llama-swap/01-manager47-reported-token-metrics.patch",
+        "sha256": "cbb83b81c9634113b9c6634f5d7b210bfec78eceb397bc52d10d0492ed449f9b",
+        "strip": 1
+      }
+    ],
+    "patched_source_files": [
+      {
+        "path": "internal/server/metrics.go",
+        "sha256": "b6b7b5792014cea0f489846c2cc57dce3693646116c92a852dc2ad27f9ac2d88"
+      },
+      {
+        "path": "internal/store/activity.go",
+        "sha256": "6e4d0931583b76af8e9905787bf8334e73f1feb76c52f45a85dc18aa5a4e8f82"
+      },
+      {
+        "path": "internal/store/sqlite/activity.go",
+        "sha256": "9873d30275a4aaba3133a09700cfff517e5c450d07b29163e711b72c9eb6c751"
+      }
+    ],
+    "source_files_before_patch": [
+      {
+        "path": "internal/server/metrics.go",
+        "sha256": "5e352f5537be33eec9d946ef236f8bb510105882c0235e5334faec733219842a"
+      },
+      {
+        "path": "internal/store/activity.go",
+        "sha256": "90e0e9fafe76ee2d18754a5657e0b0f3735c18010c83a4c5d4008a00203c8e6f"
+      },
+      {
+        "path": "internal/store/sqlite/activity.go",
+        "sha256": "957765118d57d8ba75783052ede64d07081990f1374c9c4606709b239f9de4af"
+      }
+    ]
+  },
+  "litellm": {
+    "repository": "BerriAI/litellm",
+    "commit": "d09bbae1c6df463e425558f60d460437193635da",
+    "archive_sha256": "cd5dfb9f53d4d7f91c443ed78b4609f8fea4854a7f5683c5b8eefec53bb582e3"
+  },
+  "toolchains": {
+    "rust": "1.97.0",
+    "go": "1.27.1",
+    "python": "3.12",
+    "uv": "0.12.19",
+    "postgresql_major": 17,
+    "node_min": "24.14.1",
+    "npm_min": "11.10.0"
+  },
+  "project_toolchains": {
+    "go": {
+      "url": "https://go.dev/dl/go1.27.1.darwin-arm64.tar.gz",
+      "sha256": "ee215d57e0ec269c60cc9ceca68e6bda321ba9ee5afe24f4b0988703c2d87d12",
+      "archive_prefix": "go",
+      "executable": "bin/go"
+    },
+    "node": {
+      "url": "https://nodejs.org/dist/v24.19.0/node-v24.19.0-darwin-arm64.tar.gz",
+      "sha256": "8294b7aa9b03997481c06babf1e8b270c859358f27da57a11509afe537ac381d",
+      "archive_prefix": "node-v24.19.0-darwin-arm64",
+      "executable": "bin/node",
+      "npm_cli": "lib/node_modules/npm/bin/npm-cli.js"
+    }
+  }
+}

@@ -1,0 +1,145 @@
+--- a/ui/litellm-dashboard/src/components/common_components/KeyLifecycleSettings.tsx
++++ b/ui/litellm-dashboard/src/components/common_components/KeyLifecycleSettings.tsx
+@@ -1,6 +1,7 @@
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import React, { useState } from "react";
++import { useTranslation } from "react-i18next";
+ import { CircleHelp } from "lucide-react";
+ import { Checkbox } from "@/components/ui/checkbox";
+ import { Input } from "@/components/ui/input";
+@@ -29,10 +30,17 @@
+     onNeverExpireChange?: (checked: boolean) => void;
+     id?: string;
+ }
+-const hintIcon = (hint: string): React.ReactNode => (<Tooltip>
+-    <TooltipTrigger render={<CircleHelp className="size-3.5 shrink-0 cursor-help text-muted-foreground"/>} aria-label={hint}/>
+-    <TooltipContent>{hint}</TooltipContent>
+-  </Tooltip>);
++const SOURCE_HINT_KEYS: Record<string, string> = {"Set when this key should expire. Format: 30s (seconds), 30m (minutes), 30h (hours), 30d (days). Leave empty to keep the current expiry unchanged.": "ui.keyLifecycle.expiryHint", "Key will automatically regenerate at the specified interval for enhanced security.": "ui.keyLifecycle.autoRotationHint", "How often the key should be automatically rotated. Choose the interval that best fits your security requirements.": "ui.keyLifecycle.rotationIntervalHint"};
++function LocalizedKeyHint({ hint }: { hint: string }) {
++    const { t } = useTranslation();
++    const key = Object.hasOwn(SOURCE_HINT_KEYS, hint) ? SOURCE_HINT_KEYS[hint] : undefined;
++    const label = key ? t(key) : hint;
++    return (<Tooltip>
++      <TooltipTrigger render={<CircleHelp className="size-3.5 shrink-0 cursor-help text-muted-foreground"/>} aria-label={label}/>
++      <TooltipContent>{label}</TooltipContent>
++    </Tooltip>);
++}
++const hintIcon = (hint: string): React.ReactNode => <LocalizedKeyHint hint={hint}/>;
+ const KeyLifecycleSettings: React.FC<KeyLifecycleSettingsProps> = ({ value, onChange, autoRotationEnabled, onAutoRotationChange, rotationInterval, onRotationIntervalChange, isCreateMode = false, neverExpire = false, onNeverExpireChange, id, }) => {
+     const isCustomInterval = Boolean(rotationInterval) && !PREDEFINED_INTERVALS.includes(rotationInterval as never);
+     const [showCustomInput, setShowCustomInput] = useState(isCustomInterval);
+--- a/ui/litellm-dashboard/src/components/common_components/OrganizationDropdown.tsx
++++ b/ui/litellm-dashboard/src/components/common_components/OrganizationDropdown.tsx
+@@ -1,4 +1,5 @@
+ import React from "react";
++import { useTranslation } from "react-i18next";
+ import { SearchSelect } from "@/components/shared/SearchSelect";
+ import { Organization } from "../networking";
+ 
+@@ -23,6 +24,7 @@
+   placeholder = "All Organizations",
+   id,
+ }) => {
++  const { t } = useTranslation();
+   return (
+     <div style={{ minWidth: 280, ...style }}>
+       <SearchSelect
+@@ -33,8 +35,8 @@
+         }))}
+         value={value}
+         onValueChange={(organizationId) => onChange?.(organizationId)}
+-        placeholder={placeholder}
+-        emptyText={loading ? "Loading organizations…" : "No organizations found"}
++        placeholder={placeholder === "All Organizations" ? t("ui.organizationDropdown.allOrganizations") : placeholder}
++        emptyText={loading ? t("ui.displayContract.c924ecff75c1") : t("ui.organizationDropdown.noOrganizationsFound")}
+         disabled={disabled}
+         inputId={id}
+       />
+--- a/ui/litellm-dashboard/src/components/organisms/create_key_button.tsx
++++ b/ui/litellm-dashboard/src/components/organisms/create_key_button.tsx
+@@ -674,7 +674,7 @@
+                         </SimpleTooltip>, { "content": "ui.admin.tooltip.a98a5d0d80ff" }) }}/></span>} name="models" help={keyType === "management" || keyType === "read_only"
+                 ? "Models field is disabled for this key type"
+                 : "optional - leave empty to allow access to all models"} className="mt-4">
+-                    {(control) => (localizeProps(<MultiSelect id={control.id} options={modelOptions} value={(control.value as string[] | undefined) ?? []} placeholder="Select models" disabled={keyType === "management" || keyType === "read_only"} onValueChange={(values) => {
++                    {(control) => (localizeProps(<MultiSelect id={control.id} options={modelOptions} sourceOptionLabels={{ "all-proxy-models": { sourceLabel: "All Proxy Models", key: "ui.admin.display.all.proxy.models.fb5c2ab2" }, "all-team-models": { sourceLabel: "All Team Models", key: "ui.admin.display.all.team.models.423eddb7" } }} value={(control.value as string[] | undefined) ?? []} placeholder="Select models" disabled={keyType === "management" || keyType === "read_only"} onValueChange={(values) => {
+                     control.onChange(values);
+                     if (values.includes("all-team-models")) {
+                         form.setValue("models", ["all-team-models"]);
+--- a/ui/litellm-dashboard/src/components/shared/MultiSelect.tsx
++++ b/ui/litellm-dashboard/src/components/shared/MultiSelect.tsx
+@@ -1,6 +1,7 @@
+ "use client";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { useState } from "react";
++import { useTranslation } from "react-i18next";
+ import { Combobox, ComboboxChip, ComboboxClear, ComboboxChips, ComboboxChipsInput, ComboboxContent, ComboboxEmpty, ComboboxItem, ComboboxList, ComboboxValue, useComboboxAnchor, } from "@/components/ui/combobox";
+ export interface MultiSelectOption {
+     label: string;
+@@ -11,6 +12,7 @@
+ interface MultiSelectProps {
+     id?: string;
+     options: MultiSelectOption[];
++    sourceOptionLabels?: Record<string, { sourceLabel: string; key: string }>;
+     value?: string[];
+     onValueChange: (value: string[]) => void;
+     placeholder?: string;
+@@ -31,7 +33,12 @@
+         option.value.toLowerCase().includes(normalizedQuery) ||
+         (option.description?.toLowerCase().includes(normalizedQuery) ?? false));
+ };
+-export function MultiSelect({ id, options, value = [], onValueChange, placeholder = "Select options", emptyText = "No options found", disabled = false, loading = false, allowCustomValues = false, className, }: MultiSelectProps) {
++export function MultiSelect({ id, options, sourceOptionLabels, value = [], onValueChange, placeholder = "Select options", emptyText = "No options found", disabled = false, loading = false, allowCustomValues = false, className, }: MultiSelectProps) {
++    const { t } = useTranslation();
++    const displayLabel = (option: MultiSelectOption): string => {
++        const descriptor = sourceOptionLabels && Object.hasOwn(sourceOptionLabels, option.value) ? sourceOptionLabels[option.value] : undefined;
++        return descriptor && option.label === descriptor.sourceLabel ? t(descriptor.key) : option.label;
++    };
+     const anchor = useComboboxAnchor();
+     const [query, setQuery] = useState("");
+     const safeOptions = options.filter((option): option is MultiSelectOption => option != null && typeof option.value === "string" && option.value.length > 0);
+@@ -54,12 +61,12 @@
+         onValueChange(Array.from(new Set(next)));
+         setQuery("");
+     };
+-    return (<Combobox multiple items={items} value={selectedOptions} onValueChange={handleValueChange} inputValue={query} onInputValueChange={setQuery} isItemEqualToValue={(option: MultiSelectOption, selected: MultiSelectOption) => option.value === selected.value} itemToStringLabel={(option: MultiSelectOption) => option.label} filter={matchesQuery} disabled={disabled || loading}>
++    return (<Combobox multiple items={items} value={selectedOptions} onValueChange={handleValueChange} inputValue={query} onInputValueChange={setQuery} isItemEqualToValue={(option: MultiSelectOption, selected: MultiSelectOption) => option.value === selected.value} itemToStringLabel={displayLabel} filter={(option: MultiSelectOption, query: string) => matchesQuery(option, query) || displayLabel(option).toLowerCase().includes(query.trim().toLowerCase())} disabled={disabled || loading}>
+       <ComboboxChips render={<div ref={anchor}/>} className={`min-h-8 py-1 text-sm ${className ?? ""}`}>
+         <ComboboxValue>
+           {(selected: MultiSelectOption[]) => (<>
+-              {selected.map((option) => (<ComboboxChip key={option.value} aria-label={option.label}>
+-                  {option.label}
++              {selected.map((option) => (<ComboboxChip key={option.value} aria-label={displayLabel(option)}>
++                  {displayLabel(option)}
+                 </ComboboxChip>))}
+               {localizeProps(<ComboboxChipsInput id={id} placeholder={loading ? "Loading..." : placeholder} className="min-w-24" aria-label={placeholder || undefined}/>, { "placeholder": { byValue: { "Loading...": "ui.admin.dynamic.1a418b5f8515" } } })}
+               {canClear(selected) && localizeProps(<ComboboxClear className="ml-auto self-center" aria-label="Clear all"/>, { "aria-label": "ui.admin.display.clear.all.2fc9417a" })}
+@@ -71,7 +78,7 @@
+         <ComboboxList>
+           {(option: MultiSelectOption) => (<ComboboxItem key={option.value} value={option} disabled={option.disabled}>
+               <span className="min-w-0">
+-                <span className="block truncate">{option.label}</span>
++                <span className="block truncate">{displayLabel(option)}</span>
+                 {option.description && (<span className="block truncate text-xs text-muted-foreground">{option.description}</span>)}
+               </span>
+             </ComboboxItem>)}
+--- a/ui/litellm-dashboard/src/components/ui/combobox.tsx
++++ b/ui/litellm-dashboard/src/components/ui/combobox.tsx
+@@ -1,6 +1,6 @@
+ "use client";
+ import {localizeProps} from "@/liliuxflow/LocalizedProps";
+-import { LocalizedComboboxInput, LocalizedComboboxPopup } from "@/liliuxflow/BaseUiComboboxDismiss";
++import { LocalizedComboboxInput, LocalizedComboboxPopup, LocalizedComboboxChipsInput } from "@/liliuxflow/BaseUiComboboxDismiss";
+ 
+ 
+ import * as React from "react";
+@@ -245,6 +245,7 @@
+ function ComboboxChipsInput({ className, ...props }: ComboboxPrimitive.Input.Props) {
+   return (
+     <ComboboxPrimitive.Input
++      render={(renderProps, state) => <LocalizedComboboxChipsInput {...renderProps} __liliuxflowOpen={state.open}/>}
+       data-slot="combobox-chip-input"
+       className={cn("min-w-16 flex-1 outline-none", className)}
+       {...props}

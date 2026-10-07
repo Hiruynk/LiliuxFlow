@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "public_alias": "qwen3.8-flash-next-lily-q4-64k",
+  "runtime_model_id": "Qwen3.8-Flash-Next",
+  "context_tokens": 65536,
+  "thinking": "checkpoint default high",
+  "qsa_route": "split",
+  "mtp_drafts": 0,
+  "pin_weights": "off",
+  "ngram_lock": "off",
+  "long128k_enabled": false,
+  "minimum_ram_headroom_gib": 15,
+  "target_ram_headroom_gib": 24,
+  "model_repository": "fabiogreter/Qwen3.8-Flash-Next-lily-q4",
+  "model_revision": "afde8b8e824c57bfe264c2ef3f9396537249979f",
+  "model_format": "qwen4_exp-affine-v1",
+  "default_output_tokens": 4096,
+  "idle_ttl_seconds": 1800
+}

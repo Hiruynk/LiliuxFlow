@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "helper": {
+    "path": "patches/litellm-welcome/runtime.py",
+    "sha256": "d2f16d8f256dad4e8ff61ae90c612b89d8f3f61692cfe8f7d99dacd2dfb47470"
+  },
+  "assets": [
+    {
+      "path": "assets/welcome/favicon.svg",
+      "sha256": "351bd95c66cb03d4325d889971186bfbc27b7c03040b82f31cf305331fe83344",
+      "bytes": 507
+    },
+    {
+      "path": "assets/welcome/fonts/InstrumentSans-latin-variable.woff2",
+      "sha256": "2ee17598a98d8a59e4df8152d015bec9ab8e4d5672cc0ab42bef806b568e3971",
+      "bytes": 30092
+    },
+    {
+      "path": "assets/welcome/fonts/OFL.txt",
+      "sha256": "9e27a72ed30eb49a08678f6a5d6ed98ec7ba5368f541637ee0683ec9134ef966",
+      "bytes": 4403
+    },
+    {
+      "path": "assets/welcome/fonts/provenance.json",
+      "sha256": "db03e9fc054c083ed50e4c2670c27533a65376355efb5fd5cb529c857f3c8cd0",
+      "bytes": 2340
+    },
+    {
+      "path": "assets/welcome/index.html",
+      "sha256": "93e1b432acc90c4a6c60c92bbc8e3b572dbacda5a9d3f1f86d1fb2c830f66fdf",
+      "bytes": 18981
+    },
+    {
+      "path": "assets/welcome/welcome-polish.css",
+      "sha256": "109aa3f77b38d95d16640ab7d1482f14c11d55f6545be696956608207041db8a",
+      "bytes": 20373
+    },
+    {
+      "path": "assets/welcome/welcome-polish.js",
+      "sha256": "fcb93288e93ac1f9fc06a77cd8e7f83468e961196dd4c6d13076423b1d64a220",
+      "bytes": 15339
+    },
+    {
+      "path": "assets/welcome/welcome.css",
+      "sha256": "c5019bffb9c5200ea335b1202b023e080d273e2ef656fc7545ca8ba085922ebc",
+      "bytes": 30314
+    },
+    {
+      "path": "assets/welcome/welcome.js",
+      "sha256": "e077933dd70d7758da3194164f1e505d063c34eea33ce805cc153f506a0aaa31",
+      "bytes": 37297
+    }
+  ]
+}

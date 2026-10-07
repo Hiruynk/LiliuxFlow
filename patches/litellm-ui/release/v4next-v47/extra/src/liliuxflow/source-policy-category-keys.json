@@ -1,0 +1,21 @@
+{
+  "Australia": "ui.policyTemplateCategory.australia",
+  "Aviation": "ui.policyTemplateCategory.aviation",
+  "Brand Protection": "ui.policyTemplateCategory.brandProtection",
+  "Canada": "ui.policyTemplateCategory.canada",
+  "Claims": "ui.policyTemplateCategory.claims",
+  "Content Safety": "ui.policyTemplateCategory.contentSafety",
+  "EU": "ui.policyTemplateCategory.eu",
+  "FIPPA": "ui.policyTemplateCategory.fippa",
+  "Financial Services": "ui.policyTemplateCategory.financialServices",
+  "Healthcare": "ui.policyTemplateCategory.healthcare",
+  "Injection Protection": "ui.policyTemplateCategory.injectionProtection",
+  "PII Protection": "ui.policyTemplateCategory.piiProtection",
+  "PIPEDA": "ui.policyTemplateCategory.pipeda",
+  "Regulatory": "ui.policyTemplateCategory.regulatory",
+  "Security": "ui.policyTemplateCategory.security",
+  "Singapore": "ui.policyTemplateCategory.singapore",
+  "Topic Control": "ui.policyTemplateCategory.topicControl",
+  "Topic Restriction": "ui.policyTemplateCategory.topicRestriction",
+  "UAE": "ui.policyTemplateCategory.uae"
+}

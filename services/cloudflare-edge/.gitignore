@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+public/
+.public.edge-build.json
+dist/
+wrangler.local.json
+wrangler.*.local.json
+.dev.vars*
+.env*

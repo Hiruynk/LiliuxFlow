@@ -1,0 +1,1262 @@
+{
+  "version": "LiteLLM 1.102.1 / B1candidate-v61",
+  "evidence": "Installed compiled UI + matching UI HTTP-call sites + registered backend FastAPI routes. Source evidence only; no credentials, response payloads or runtime acceptance claim.",
+  "routes": [
+    {
+      "method": "POST",
+      "path": "/a2a/{agent_id}"
+    },
+    {
+      "method": "POST",
+      "path": "/a2a/{agent_id}/message/send"
+    },
+    {
+      "method": "GET",
+      "path": "/access_group/list"
+    },
+    {
+      "method": "DELETE",
+      "path": "/access_group/{access_group}/budget"
+    },
+    {
+      "method": "GET",
+      "path": "/access_group/{access_group}/budget"
+    },
+    {
+      "method": "PUT",
+      "path": "/access_group/{access_group}/budget"
+    },
+    {
+      "method": "POST",
+      "path": "/add/allowed_ip"
+    },
+    {
+      "method": "GET",
+      "path": "/agent/daily/activity"
+    },
+    {
+      "method": "GET",
+      "path": "/alerting/settings"
+    },
+    {
+      "method": "GET",
+      "path": "/api/plugins"
+    },
+    {
+      "method": "GET",
+      "path": "/api/plugins/auth-token"
+    },
+    {
+      "method": "GET",
+      "path": "/authorize/flow"
+    },
+    {
+      "method": "GET",
+      "path": "/auto_router/classifier/default_prompt"
+    },
+    {
+      "method": "POST",
+      "path": "/auto_router/classifier/default_prompt"
+    },
+    {
+      "method": "POST",
+      "path": "/auto_router/shadow_eval/start"
+    },
+    {
+      "method": "POST",
+      "path": "/auto_router/shadow_eval/{job_id}/stop"
+    },
+    {
+      "method": "POST",
+      "path": "/auto_router/test_routing"
+    },
+    {
+      "method": "POST",
+      "path": "/auto_router/validate_complexity_router_config"
+    },
+    {
+      "method": "POST",
+      "path": "/budget/delete"
+    },
+    {
+      "method": "POST",
+      "path": "/budget/info"
+    },
+    {
+      "method": "POST",
+      "path": "/budget/new"
+    },
+    {
+      "method": "POST",
+      "path": "/budget/update"
+    },
+    {
+      "method": "GET",
+      "path": "/cache/settings"
+    },
+    {
+      "method": "POST",
+      "path": "/cache/settings"
+    },
+    {
+      "method": "POST",
+      "path": "/cache/settings/test"
+    },
+    {
+      "method": "GET",
+      "path": "/callbacks/configs"
+    },
+    {
+      "method": "GET",
+      "path": "/claude-code/marketplace.json"
+    },
+    {
+      "method": "GET",
+      "path": "/claude-code/plugins"
+    },
+    {
+      "method": "POST",
+      "path": "/claude-code/plugins"
+    },
+    {
+      "method": "DELETE",
+      "path": "/claude-code/plugins/{plugin_name}"
+    },
+    {
+      "method": "GET",
+      "path": "/claude-code/plugins/{plugin_name}"
+    },
+    {
+      "method": "PUT",
+      "path": "/claude-code/plugins/{plugin_name}"
+    },
+    {
+      "method": "POST",
+      "path": "/claude-code/plugins/{plugin_name}/disable"
+    },
+    {
+      "method": "POST",
+      "path": "/claude-code/plugins/{plugin_name}/enable"
+    },
+    {
+      "method": "DELETE",
+      "path": "/cloudzero/delete"
+    },
+    {
+      "method": "POST",
+      "path": "/cloudzero/dry-run"
+    },
+    {
+      "method": "POST",
+      "path": "/cloudzero/export"
+    },
+    {
+      "method": "POST",
+      "path": "/cloudzero/init"
+    },
+    {
+      "method": "GET",
+      "path": "/cloudzero/settings"
+    },
+    {
+      "method": "PUT",
+      "path": "/cloudzero/settings"
+    },
+    {
+      "method": "POST",
+      "path": "/compliance/eu-ai-act"
+    },
+    {
+      "method": "POST",
+      "path": "/compliance/gdpr"
+    },
+    {
+      "method": "GET",
+      "path": "/config/block_requests_for_models_without_pricing"
+    },
+    {
+      "method": "PATCH",
+      "path": "/config/block_requests_for_models_without_pricing"
+    },
+    {
+      "method": "POST",
+      "path": "/config/callback/delete"
+    },
+    {
+      "method": "GET",
+      "path": "/config/cost_discount_config"
+    },
+    {
+      "method": "PATCH",
+      "path": "/config/cost_discount_config"
+    },
+    {
+      "method": "GET",
+      "path": "/config/cost_margin_config"
+    },
+    {
+      "method": "PATCH",
+      "path": "/config/cost_margin_config"
+    },
+    {
+      "method": "POST",
+      "path": "/config/field/delete"
+    },
+    {
+      "method": "GET",
+      "path": "/config/field/info"
+    },
+    {
+      "method": "POST",
+      "path": "/config/field/update"
+    },
+    {
+      "method": "GET",
+      "path": "/config/list"
+    },
+    {
+      "method": "DELETE",
+      "path": "/config/pass_through_endpoint"
+    },
+    {
+      "method": "GET",
+      "path": "/config/pass_through_endpoint"
+    },
+    {
+      "method": "POST",
+      "path": "/config/pass_through_endpoint"
+    },
+    {
+      "method": "POST",
+      "path": "/config/pass_through_endpoint/{endpoint_id}"
+    },
+    {
+      "method": "POST",
+      "path": "/config/update"
+    },
+    {
+      "method": "DELETE",
+      "path": "/config_overrides/cyberark"
+    },
+    {
+      "method": "GET",
+      "path": "/config_overrides/cyberark"
+    },
+    {
+      "method": "POST",
+      "path": "/config_overrides/cyberark"
+    },
+    {
+      "method": "POST",
+      "path": "/config_overrides/cyberark/test_connection"
+    },
+    {
+      "method": "DELETE",
+      "path": "/config_overrides/hashicorp_vault"
+    },
+    {
+      "method": "GET",
+      "path": "/config_overrides/hashicorp_vault"
+    },
+    {
+      "method": "POST",
+      "path": "/config_overrides/hashicorp_vault"
+    },
+    {
+      "method": "POST",
+      "path": "/config_overrides/hashicorp_vault/test_connection"
+    },
+    {
+      "method": "GET",
+      "path": "/coordination_redis/settings"
+    },
+    {
+      "method": "POST",
+      "path": "/coordination_redis/settings"
+    },
+    {
+      "method": "POST",
+      "path": "/coordination_redis/settings/test"
+    },
+    {
+      "method": "POST",
+      "path": "/cost/estimate"
+    },
+    {
+      "method": "GET",
+      "path": "/credentials"
+    },
+    {
+      "method": "POST",
+      "path": "/credentials"
+    },
+    {
+      "method": "DELETE",
+      "path": "/credentials/{credential_name:path}"
+    },
+    {
+      "method": "PATCH",
+      "path": "/credentials/{credential_name:path}"
+    },
+    {
+      "method": "GET",
+      "path": "/customer/daily/activity"
+    },
+    {
+      "method": "GET",
+      "path": "/customer/list"
+    },
+    {
+      "method": "POST",
+      "path": "/delete/allowed_ip"
+    },
+    {
+      "method": "POST",
+      "path": "/embeddings"
+    },
+    {
+      "method": "GET",
+      "path": "/gateway/daily/activity"
+    },
+    {
+      "method": "GET",
+      "path": "/get/allowed_ips"
+    },
+    {
+      "method": "GET",
+      "path": "/get/config/callbacks"
+    },
+    {
+      "method": "GET",
+      "path": "/get/default_team_settings"
+    },
+    {
+      "method": "GET",
+      "path": "/get/internal_user_settings"
+    },
+    {
+      "method": "GET",
+      "path": "/get/mcp_semantic_filter_settings"
+    },
+    {
+      "method": "GET",
+      "path": "/get/mcp_tool_search_settings"
+    },
+    {
+      "method": "GET",
+      "path": "/get/sso_settings"
+    },
+    {
+      "method": "GET",
+      "path": "/get/ui_settings"
+    },
+    {
+      "method": "GET",
+      "path": "/get/ui_theme_settings"
+    },
+    {
+      "method": "GET",
+      "path": "/get/user_banner"
+    },
+    {
+      "method": "GET",
+      "path": "/global/activity"
+    },
+    {
+      "method": "GET",
+      "path": "/global/activity/model"
+    },
+    {
+      "method": "GET",
+      "path": "/global/spend/all_tag_names"
+    },
+    {
+      "method": "POST",
+      "path": "/global/spend/end_users"
+    },
+    {
+      "method": "GET",
+      "path": "/global/spend/keys"
+    },
+    {
+      "method": "GET",
+      "path": "/global/spend/logs"
+    },
+    {
+      "method": "GET",
+      "path": "/global/spend/models"
+    },
+    {
+      "method": "GET",
+      "path": "/global/spend/provider"
+    },
+    {
+      "method": "GET",
+      "path": "/global/spend/teams"
+    },
+    {
+      "method": "POST",
+      "path": "/guardrails"
+    },
+    {
+      "method": "POST",
+      "path": "/guardrails/apply_guardrail"
+    },
+    {
+      "method": "GET",
+      "path": "/guardrails/list"
+    },
+    {
+      "method": "POST",
+      "path": "/guardrails/register"
+    },
+    {
+      "method": "GET",
+      "path": "/guardrails/submissions"
+    },
+    {
+      "method": "POST",
+      "path": "/guardrails/submissions/{guardrail_id}/approve"
+    },
+    {
+      "method": "POST",
+      "path": "/guardrails/submissions/{guardrail_id}/reject"
+    },
+    {
+      "method": "POST",
+      "path": "/guardrails/test_custom_code"
+    },
+    {
+      "method": "GET",
+      "path": "/guardrails/ui/add_guardrail_settings"
+    },
+    {
+      "method": "GET",
+      "path": "/guardrails/ui/category_yaml/{category_name}"
+    },
+    {
+      "method": "GET",
+      "path": "/guardrails/ui/major_airlines"
+    },
+    {
+      "method": "GET",
+      "path": "/guardrails/ui/provider_specific_params"
+    },
+    {
+      "method": "GET",
+      "path": "/guardrails/usage/logs"
+    },
+    {
+      "method": "POST",
+      "path": "/guardrails/validate_blocked_words_file"
+    },
+    {
+      "method": "DELETE",
+      "path": "/guardrails/{guardrail_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/guardrails/{guardrail_id}"
+    },
+    {
+      "method": "PATCH",
+      "path": "/guardrails/{guardrail_id}"
+    },
+    {
+      "method": "PUT",
+      "path": "/guardrails/{guardrail_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/guardrails/{guardrail_id}/info"
+    },
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "GET",
+      "path": "/health/latest"
+    },
+    {
+      "method": "GET",
+      "path": "/health/license"
+    },
+    {
+      "method": "GET",
+      "path": "/health/readiness/details"
+    },
+    {
+      "method": "GET",
+      "path": "/health/services"
+    },
+    {
+      "method": "POST",
+      "path": "/health/test_connection"
+    },
+    {
+      "method": "POST",
+      "path": "/invitation/new"
+    },
+    {
+      "method": "GET",
+      "path": "/key/aliases"
+    },
+    {
+      "method": "POST",
+      "path": "/key/block"
+    },
+    {
+      "method": "POST",
+      "path": "/key/delete"
+    },
+    {
+      "method": "POST",
+      "path": "/key/generate"
+    },
+    {
+      "method": "GET",
+      "path": "/key/info"
+    },
+    {
+      "method": "GET",
+      "path": "/key/list"
+    },
+    {
+      "method": "POST",
+      "path": "/key/service-account/generate"
+    },
+    {
+      "method": "POST",
+      "path": "/key/unblock"
+    },
+    {
+      "method": "POST",
+      "path": "/key/update"
+    },
+    {
+      "method": "POST",
+      "path": "/key/{key:path}/regenerate"
+    },
+    {
+      "method": "GET",
+      "path": "/litellm/.well-known/litellm-ui-config"
+    },
+    {
+      "method": "GET",
+      "path": "/model/cost_map/source"
+    },
+    {
+      "method": "POST",
+      "path": "/model/delete"
+    },
+    {
+      "method": "POST",
+      "path": "/model/new"
+    },
+    {
+      "method": "PATCH",
+      "path": "/model/{model_id}/update"
+    },
+    {
+      "method": "GET",
+      "path": "/model_group/info"
+    },
+    {
+      "method": "POST",
+      "path": "/model_group/make_public"
+    },
+    {
+      "method": "POST",
+      "path": "/model_hub/update_useful_links"
+    },
+    {
+      "method": "GET",
+      "path": "/models"
+    },
+    {
+      "method": "POST",
+      "path": "/onboarding/claim_token"
+    },
+    {
+      "method": "GET",
+      "path": "/onboarding/get_token"
+    },
+    {
+      "method": "GET",
+      "path": "/organization/daily/activity"
+    },
+    {
+      "method": "DELETE",
+      "path": "/organization/delete"
+    },
+    {
+      "method": "GET",
+      "path": "/organization/info"
+    },
+    {
+      "method": "POST",
+      "path": "/organization/info"
+    },
+    {
+      "method": "GET",
+      "path": "/organization/list"
+    },
+    {
+      "method": "POST",
+      "path": "/organization/member_add"
+    },
+    {
+      "method": "DELETE",
+      "path": "/organization/member_delete"
+    },
+    {
+      "method": "PATCH",
+      "path": "/organization/member_update"
+    },
+    {
+      "method": "POST",
+      "path": "/organization/new"
+    },
+    {
+      "method": "POST",
+      "path": "/policies"
+    },
+    {
+      "method": "POST",
+      "path": "/policies/attachments"
+    },
+    {
+      "method": "POST",
+      "path": "/policies/attachments/estimate-impact"
+    },
+    {
+      "method": "GET",
+      "path": "/policies/attachments/list"
+    },
+    {
+      "method": "DELETE",
+      "path": "/policies/attachments/{attachment_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/policies/attachments/{attachment_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/policies/list"
+    },
+    {
+      "method": "GET",
+      "path": "/policies/name/{policy_name}/versions"
+    },
+    {
+      "method": "POST",
+      "path": "/policies/name/{policy_name}/versions"
+    },
+    {
+      "method": "POST",
+      "path": "/policies/resolve"
+    },
+    {
+      "method": "POST",
+      "path": "/policies/test-pipeline"
+    },
+    {
+      "method": "DELETE",
+      "path": "/policies/{policy_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/policies/{policy_id}"
+    },
+    {
+      "method": "PUT",
+      "path": "/policies/{policy_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/policies/{policy_id}/resolved-guardrails"
+    },
+    {
+      "method": "PUT",
+      "path": "/policies/{policy_id}/status"
+    },
+    {
+      "method": "GET",
+      "path": "/policy/info/{policy_name}"
+    },
+    {
+      "method": "GET",
+      "path": "/policy/templates"
+    },
+    {
+      "method": "POST",
+      "path": "/policy/templates/enrich"
+    },
+    {
+      "method": "POST",
+      "path": "/policy/templates/enrich/stream"
+    },
+    {
+      "method": "POST",
+      "path": "/policy/templates/suggest"
+    },
+    {
+      "method": "POST",
+      "path": "/policy/templates/test"
+    },
+    {
+      "method": "POST",
+      "path": "/prompts"
+    },
+    {
+      "method": "GET",
+      "path": "/prompts/list"
+    },
+    {
+      "method": "POST",
+      "path": "/prompts/test"
+    },
+    {
+      "method": "DELETE",
+      "path": "/prompts/{prompt_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/prompts/{prompt_id}"
+    },
+    {
+      "method": "PATCH",
+      "path": "/prompts/{prompt_id}"
+    },
+    {
+      "method": "PUT",
+      "path": "/prompts/{prompt_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/prompts/{prompt_id}/info"
+    },
+    {
+      "method": "GET",
+      "path": "/prompts/{prompt_id}/versions"
+    },
+    {
+      "method": "GET",
+      "path": "/public/agent_hub"
+    },
+    {
+      "method": "GET",
+      "path": "/public/agents/fields"
+    },
+    {
+      "method": "GET",
+      "path": "/public/autorouter_presets"
+    },
+    {
+      "method": "GET",
+      "path": "/public/complexity_router/scorer_defaults"
+    },
+    {
+      "method": "GET",
+      "path": "/public/litellm_blog_posts"
+    },
+    {
+      "method": "GET",
+      "path": "/public/litellm_model_cost_map"
+    },
+    {
+      "method": "GET",
+      "path": "/public/mcp_hub"
+    },
+    {
+      "method": "GET",
+      "path": "/public/model_hub"
+    },
+    {
+      "method": "GET",
+      "path": "/public/model_hub/info"
+    },
+    {
+      "method": "GET",
+      "path": "/public/providers/fields"
+    },
+    {
+      "method": "GET",
+      "path": "/public/skill_hub"
+    },
+    {
+      "method": "POST",
+      "path": "/rag/ingest"
+    },
+    {
+      "method": "POST",
+      "path": "/reload/model_cost_map"
+    },
+    {
+      "method": "GET",
+      "path": "/router/fields"
+    },
+    {
+      "method": "GET",
+      "path": "/router/settings"
+    },
+    {
+      "method": "DELETE",
+      "path": "/schedule/model_cost_map_reload"
+    },
+    {
+      "method": "POST",
+      "path": "/schedule/model_cost_map_reload"
+    },
+    {
+      "method": "GET",
+      "path": "/schedule/model_cost_map_reload/status"
+    },
+    {
+      "method": "POST",
+      "path": "/search_tools"
+    },
+    {
+      "method": "GET",
+      "path": "/search_tools/list"
+    },
+    {
+      "method": "POST",
+      "path": "/search_tools/test_connection"
+    },
+    {
+      "method": "GET",
+      "path": "/search_tools/ui/available_providers"
+    },
+    {
+      "method": "DELETE",
+      "path": "/search_tools/{search_tool_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/search_tools/{search_tool_id}"
+    },
+    {
+      "method": "PUT",
+      "path": "/search_tools/{search_tool_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/spend/logs/session/ui"
+    },
+    {
+      "method": "GET",
+      "path": "/spend/logs/ui"
+    },
+    {
+      "method": "GET",
+      "path": "/spend/logs/ui/{request_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/sso/get/ui_settings"
+    },
+    {
+      "method": "GET",
+      "path": "/tag/daily/activity"
+    },
+    {
+      "method": "GET",
+      "path": "/tag/dau"
+    },
+    {
+      "method": "POST",
+      "path": "/tag/delete"
+    },
+    {
+      "method": "GET",
+      "path": "/tag/distinct"
+    },
+    {
+      "method": "POST",
+      "path": "/tag/info"
+    },
+    {
+      "method": "GET",
+      "path": "/tag/list"
+    },
+    {
+      "method": "GET",
+      "path": "/tag/mau"
+    },
+    {
+      "method": "POST",
+      "path": "/tag/new"
+    },
+    {
+      "method": "GET",
+      "path": "/tag/summary"
+    },
+    {
+      "method": "POST",
+      "path": "/tag/update"
+    },
+    {
+      "method": "GET",
+      "path": "/tag/user-agent/per-user-analytics"
+    },
+    {
+      "method": "GET",
+      "path": "/tag/wau"
+    },
+    {
+      "method": "GET",
+      "path": "/team/available"
+    },
+    {
+      "method": "POST",
+      "path": "/team/bulk_member_add"
+    },
+    {
+      "method": "GET",
+      "path": "/team/daily/activity"
+    },
+    {
+      "method": "GET",
+      "path": "/team/daily/activity/aggregated"
+    },
+    {
+      "method": "POST",
+      "path": "/team/delete"
+    },
+    {
+      "method": "GET",
+      "path": "/team/info"
+    },
+    {
+      "method": "GET",
+      "path": "/team/list"
+    },
+    {
+      "method": "POST",
+      "path": "/team/member_add"
+    },
+    {
+      "method": "POST",
+      "path": "/team/member_delete"
+    },
+    {
+      "method": "POST",
+      "path": "/team/member_update"
+    },
+    {
+      "method": "GET",
+      "path": "/team/metadata_schema"
+    },
+    {
+      "method": "POST",
+      "path": "/team/new"
+    },
+    {
+      "method": "GET",
+      "path": "/team/permissions_list"
+    },
+    {
+      "method": "POST",
+      "path": "/team/permissions_update"
+    },
+    {
+      "method": "GET",
+      "path": "/team/spend/by_user"
+    },
+    {
+      "method": "POST",
+      "path": "/team/update"
+    },
+    {
+      "method": "GET",
+      "path": "/team/{team_id}/members/me"
+    },
+    {
+      "method": "PATCH",
+      "path": "/update/default_team_settings"
+    },
+    {
+      "method": "PATCH",
+      "path": "/update/internal_user_settings"
+    },
+    {
+      "method": "PATCH",
+      "path": "/update/mcp_semantic_filter_settings"
+    },
+    {
+      "method": "PATCH",
+      "path": "/update/mcp_tool_search_settings"
+    },
+    {
+      "method": "PATCH",
+      "path": "/update/sso_settings"
+    },
+    {
+      "method": "PATCH",
+      "path": "/update/ui_settings"
+    },
+    {
+      "method": "PATCH",
+      "path": "/update/ui_theme_settings"
+    },
+    {
+      "method": "PATCH",
+      "path": "/update/user_banner"
+    },
+    {
+      "method": "POST",
+      "path": "/usage/ai/chat"
+    },
+    {
+      "method": "GET",
+      "path": "/user/available_roles"
+    },
+    {
+      "method": "POST",
+      "path": "/user/bulk_update"
+    },
+    {
+      "method": "GET",
+      "path": "/user/daily/activity"
+    },
+    {
+      "method": "GET",
+      "path": "/user/daily/activity/aggregated"
+    },
+    {
+      "method": "POST",
+      "path": "/user/delete"
+    },
+    {
+      "method": "GET",
+      "path": "/user/filter/ui"
+    },
+    {
+      "method": "GET",
+      "path": "/user/list"
+    },
+    {
+      "method": "POST",
+      "path": "/user/new"
+    },
+    {
+      "method": "POST",
+      "path": "/user/update"
+    },
+    {
+      "method": "POST",
+      "path": "/utils/dotprompt_json_converter"
+    },
+    {
+      "method": "POST",
+      "path": "/utils/test_policies_and_guardrails"
+    },
+    {
+      "method": "POST",
+      "path": "/utils/transform_request"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/a2a/discover"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/access_group"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/access_group"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/access_group/{access_group_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/access_group/{access_group_id}"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/access_group/{access_group_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/agents"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/agents"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/agents/make_public"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/agents/{agent_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/agents/{agent_id}"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/agents/{agent_id}"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/agents/{agent_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/indexes"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/indexes"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/memory"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/memory"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/memory/{key:path}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/memory/{key:path}"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/memory/{key:path}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/model/info"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/search/{search_tool_name}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tool/list"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tool/policy"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tool/policy/options"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tool/spend"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tool/{tool_name:path}/detail"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tool/{tool_name:path}/logs"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/vector_stores/{vector_store_id:path}/search"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/workflows/runs"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workflows/runs"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/workflows/runs/{run_id}/events"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workflows/runs/{run_id}/events"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/workflows/runs/{run_id}/messages"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workflows/runs/{run_id}/messages"
+    },
+    {
+      "method": "POST",
+      "path": "/v1beta/interactions"
+    },
+    {
+      "method": "GET",
+      "path": "/v2/guardrails/list"
+    },
+    {
+      "method": "POST",
+      "path": "/v2/login"
+    },
+    {
+      "method": "GET",
+      "path": "/v2/model/info"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v2/organization/{organization_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/v2/team/list"
+    },
+    {
+      "method": "GET",
+      "path": "/v2/user/info"
+    },
+    {
+      "method": "POST",
+      "path": "/v3/login"
+    },
+    {
+      "method": "POST",
+      "path": "/v3/login/exchange"
+    },
+    {
+      "method": "POST",
+      "path": "/vector_store/delete"
+    },
+    {
+      "method": "POST",
+      "path": "/vector_store/info"
+    },
+    {
+      "method": "GET",
+      "path": "/vector_store/list"
+    },
+    {
+      "method": "POST",
+      "path": "/vector_store/new"
+    },
+    {
+      "method": "POST",
+      "path": "/vector_store/update"
+    }
+  ]
+}

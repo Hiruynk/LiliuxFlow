@@ -1,0 +1,7 @@
+{
+  "bind_host": "127.0.0.1",
+  "ports": {"litellm": 4000, "compat": 8001, "guard": 8080, "manager": 8081, "postgresql": 15432},
+  "profile": "safe64k",
+  "credentials": "generated in each installation's private data directory",
+  "weights": "external read-only path supplied to setup; never downloaded by setup"
+}

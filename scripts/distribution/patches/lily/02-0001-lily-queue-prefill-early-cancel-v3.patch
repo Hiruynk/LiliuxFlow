@@ -1,0 +1,901 @@
+diff --git a/src/engine.rs b/src/engine.rs
+index 6f0935e..e1470eb 100644
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -206,6 +206,12 @@ pub struct Draw<'p> {
+     pub step: usize,
+ }
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct PrefillProgress {
++    pub completed_chunks: usize,
++    pub cancelled: bool,
++}
++
+ pub trait LanguageModel: Sized {
+     /// The expert cache's counters, when the model serves its experts from
+     /// one (`LoadOptions::expert_slots`).
+@@ -313,6 +319,26 @@ pub trait LanguageModel: Sized {
+         }
+     }
+ 
++    /// Feeds prompt chunks and waits at each model-defined safe boundary.
++    /// Returns `None` after a completed boundary when cancellation is seen;
++    /// the caller owns disposal of the now-coherent partial state.
++    fn prefill_with_vision_cancellable(
++        &self,
++        ctx: &MetalContext,
++        state: &mut Self::State,
++        scratch: &mut Self::Scratch,
++        tokens: &[u32],
++        draw: Option<Draw<'_>>,
++        vision: Option<&crate::qwen4exp::VisionInput<'_>>,
++        cancelled: &mut dyn FnMut() -> bool,
++    ) -> Result<PrefillProgress> {
++        let _ = (ctx, state, scratch, tokens, draw, vision);
++        if cancelled() {
++            return Ok(PrefillProgress { completed_chunks: 0, cancelled: true });
++        }
++        anyhow::bail!("this model does not expose chunk-safe prefill cancellation")
++    }
++
+     /// Runs the vision tower over one preprocessed image
+     /// (`[grid_h * grid_w, patch_dim]` f32 rows in block-major patch order,
+     /// [`crate::qwen4exp::image::preprocess`]) and returns its merged rows
+diff --git a/src/qwen4exp/model.rs b/src/qwen4exp/model.rs
+index 408a687..edf5345 100644
+--- a/src/qwen4exp/model.rs
++++ b/src/qwen4exp/model.rs
+@@ -1829,6 +1829,31 @@ impl Qwen4ExpModel {
+         draw: Option<Draw<'_>>,
+         vision: Option<&VisionInput<'_>>,
+     ) -> Result<()> {
++        let mut never_cancel = || false;
++        let progress = self.prefill_with_vision_cancellable(
++            ctx, state, s, tokens, draw, vision, &mut never_cancel,
++        )?;
++        ensure!(!progress.cancelled, "uncancellable prefill returned cancellation");
++        Ok(())
++    }
++
++    /// Cancellable form of [`Self::prefill_with_vision`]. Each poll after a
++    /// submitted chunk occurs only after its command buffer completed and the
++    /// recurrent position, PLE history, and convolution slot advanced.
++    pub fn prefill_with_vision_cancellable(
++        &self,
++        ctx: &MetalContext,
++        state: &mut DecodeState,
++        s: &mut Scratch,
++        tokens: &[u32],
++        draw: Option<Draw<'_>>,
++        vision: Option<&VisionInput<'_>>,
++        cancelled: &mut dyn FnMut() -> bool,
++    ) -> Result<crate::engine::PrefillProgress> {
++        let mut completed_chunks = 0usize;
++        if cancelled() {
++            return Ok(crate::engine::PrefillProgress { completed_chunks, cancelled: true });
++        }
+         ensure!(!tokens.is_empty(), "empty prompt");
+         ensure!(state.spec.is_none(), "prefill during a pending speculative step");
+         let h = self.config.hidden_size;
+@@ -1859,8 +1884,17 @@ impl Qwen4ExpModel {
+             }
+             state.rope_delta = v.positions.rope_delta;
+         }
++        if cancelled() {
++            return Ok(crate::engine::PrefillProgress { completed_chunks, cancelled: true });
++        }
+         state.ensure_capacity(ctx, state.pos + tokens.len())?;
++        if cancelled() {
++            return Ok(crate::engine::PrefillProgress { completed_chunks, cancelled: true });
++        }
+         self.ensure_prefill_scratch(ctx, s, tokens.len())?;
++        if cancelled() {
++            return Ok(crate::engine::PrefillProgress { completed_chunks, cancelled: true });
++        }
+         let s = &*s;
+         let capacity = s
+             .prefill
+@@ -1871,6 +1905,9 @@ impl Qwen4ExpModel {
+         let mut remaining = tokens.len();
+         let profile = std::env::var_os("LILY_PROFILE").is_some();
+         for chunk in tokens.chunks(self.prefill_chunk) {
++            if cancelled() {
++                return Ok(crate::engine::PrefillProgress { completed_chunks, cancelled: true });
++            }
+             let ps = capacity.chunk(chunk)?;
+             if let (Some(w), Some(p), Some(pst)) = (ple_w, &ps.ple, &state.ple) {
+                 self.stage_ngram(w, p, chunk, pst.hist)?;
+@@ -1899,6 +1936,9 @@ impl Qwen4ExpModel {
+             let started = std::time::Instant::now();
+             let encoded = self.encode_batch(ctx, state, s, &ps, mode)?;
+             let encoded_at = std::time::Instant::now();
++            if cancelled() {
++                return Ok(crate::engine::PrefillProgress { completed_chunks, cancelled: true });
++            }
+             let completed = encoded.commit()?.wait_retain()?;
+             if profile {
+                 let gpu = completed
+@@ -1919,8 +1959,12 @@ impl Qwen4ExpModel {
+             }
+             // The chunk's recurrent kernels wrote the other window buffers.
+             state.conv_slot = 1 - state.conv_slot;
++            completed_chunks += 1;
++            if cancelled() {
++                return Ok(crate::engine::PrefillProgress { completed_chunks, cancelled: true });
++            }
+         }
+-        Ok(())
++        Ok(crate::engine::PrefillProgress { completed_chunks, cancelled: false })
+     }
+ 
+     // --- prefill ------------------------------------------------------------
+@@ -3873,6 +3917,21 @@ impl LanguageModel for Qwen4ExpModel {
+         )
+     }
+ 
++    fn prefill_with_vision_cancellable(
++        &self,
++        ctx: &MetalContext,
++        state: &mut DecodeState,
++        scratch: &mut Scratch,
++        tokens: &[u32],
++        draw: Option<Draw<'_>>,
++        vision: Option<&VisionInput<'_>>,
++        cancelled: &mut dyn FnMut() -> bool,
++    ) -> Result<crate::engine::PrefillProgress> {
++        Qwen4ExpModel::prefill_with_vision_cancellable(
++            self, ctx, state, scratch, tokens, draw, vision, cancelled,
++        )
++    }
++
+     fn encode_image(
+         &self,
+         ctx: &MetalContext,
+diff --git a/src/serve.rs b/src/serve.rs
+index 37b0cd1..228486f 100644
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -35,8 +35,8 @@ use std::net::{
+     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+ };
+ use std::path::Path;
+-use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::mpsc::{
+     self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
+ };
+@@ -446,7 +446,7 @@ impl Sink {
+     }
+ 
+     fn cancelled(&self) -> bool {
+-        self.cancelled.load(Ordering::Relaxed)
++        self.cancelled.load(Ordering::Acquire)
+     }
+ 
+     fn end(&self) {
+@@ -455,12 +455,18 @@ impl Sink {
+ }
+ 
+ struct Job {
++    request_id: String,
++    queue_event: Arc<Mutex<()>>,
+     prepared: Prepared,
+     sink: Sink,
+     queued_at: Instant,
+ }
+ 
+ impl Job {
++    fn finish_without_response(&self) {
++        self.sink.end();
++    }
++
+     /// Answers the request without running it.
+     fn reject(self, status: u16, message: &str) {
+         let mut sink = self.sink;
+@@ -480,10 +486,22 @@ enum Cmd {
+ /// Relays one request's output from the engine to the client on the
+ /// connection's own thread; a failed write or the client's EOF flags
+ /// cancellation for the engine.
+-fn relay(stream: TcpStream, rx: Receiver<Out>, cancelled: Arc<AtomicBool>) {
++fn relay(
++    stream: TcpStream,
++    rx: Receiver<Out>,
++    cancelled: Arc<AtomicBool>,
++    mut watcher: http::DisconnectWatcher,
++    request_id: String,
++    queued_at: Instant,
++) {
+     let (status, content_type) = match rx.recv() {
+         Ok(Out::Start { status, content_type }) => (status, content_type),
++        Ok(Out::End) => {
++            watcher.stop();
++            return;
++        }
+         _ => {
++            watcher.stop();
+             send_error(stream, 500, "server_error", "internal server error");
+             return;
+         }
+@@ -494,9 +512,16 @@ fn relay(stream: TcpStream, rx: Receiver<Out>, cancelled: Arc<AtomicBool>) {
+         content_type,
+         cancelled.clone(),
+     ) {
+-        Ok(response) => response,
++        Ok(response) => {
++            eprintln!(
++                "[lily-meta] request_id={request_id} phase=first_header status={status} since_queue_enter_ms={}",
++                queued_at.elapsed().as_millis(),
++            );
++            response
++        }
+         Err(_) => {
+-            cancelled.store(true, Ordering::Relaxed);
++            cancelled.store(true, Ordering::Release);
++            watcher.stop();
+             return;
+         }
+     };
+@@ -506,6 +531,7 @@ fn relay(stream: TcpStream, rx: Receiver<Out>, cancelled: Arc<AtomicBool>) {
+                 if response.write_chunk(&bytes).is_err() {
+                     // Keep draining so the engine's sends never block.
+                     for _ in rx.iter() {}
++                    watcher.stop();
+                     return;
+                 }
+             }
+@@ -513,7 +539,8 @@ fn relay(stream: TcpStream, rx: Receiver<Out>, cancelled: Arc<AtomicBool>) {
+             Out::Start { .. } => {}
+         }
+     }
+-    if cancelled.load(Ordering::Relaxed) {
++    watcher.stop();
++    if cancelled.load(Ordering::Acquire) {
+         return;
+     }
+     if let Err(error) = response.finish() {
+@@ -789,12 +816,16 @@ impl<M: LanguageModel> Engine<M> {
+     /// Runs one request and answers it. Returns the GPU fault the context
+     /// recorded, if any: the engine is then unusable and must be replaced,
+     /// even when this request happened to finish before the feedback arrived.
+-    fn serve(&mut self, job: Job) -> Option<String> {
++    fn serve(&mut self, job: Job, queue_wait_ms: u128) -> Option<String> {
++        let request_id = job.request_id.clone();
+         let mut sink = job.sink;
+         let stream = job.prepared.stream;
+         let kind = job.prepared.kind;
+-        let queued = job.queued_at.elapsed();
+-        let result = self.run(job.prepared, &mut sink);
++        let lane_started = Instant::now();
++        eprintln!(
++            "[lily-meta] request_id={request_id} phase=lane_acquired queue_wait_ms={queue_wait_ms}"
++        );
++        let result = self.run(job.prepared, &mut sink, &request_id);
+         let fault = self.ctx.fault();
+         if let Err(error) = result {
+             let (status, message) = match &fault {
+@@ -825,14 +856,22 @@ impl<M: LanguageModel> Engine<M> {
+             }
+         }
+         sink.end();
+-        let _ = (kind, queued);
++        eprintln!(
++            "[lily-meta] request_id={request_id} phase=lane_released cancelled={} lane_ms={}",
++            sink.cancelled(),
++            lane_started.elapsed().as_millis(),
++        );
++        let _ = kind;
+         fault
+     }
+ 
+-    fn run(&mut self, p: Prepared, sink: &mut Sink) -> Result<()> {
++    fn run(&mut self, p: Prepared, sink: &mut Sink, request_id: &str) -> Result<()> {
+         // Work on the user's behalf for as long as the request runs.
+         let _activity = crate::activity::Activity::begin("lily: serving a request");
+         if sink.cancelled() {
++            eprintln!(
++                "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=before_session_acquire completed_chunks=0 prefilled_tokens=0"
++            );
+             return Ok(());
+         }
+         let Engine {
+@@ -859,12 +898,26 @@ impl<M: LanguageModel> Engine<M> {
+             p.images.iter().map(|i| CachedImage::new(i.span, i.digest)).collect();
+         let image_tokens: usize = p.images.iter().map(|i| i.span.len).sum();
+         let started = Instant::now();
++        if sink.cancelled() {
++            eprintln!(
++                "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=before_session_acquire completed_chunks=0 prefilled_tokens=0"
++            );
++            return Ok(());
++        }
+         let acquired =
+             sessions.acquire(ctx, model, &p.prompt, &images, p.cache_key.as_deref())?;
+         let mut session = acquired.session;
+         let reused = acquired.reused;
+         let agreement = acquired.agreement;
+         ensure!(reused < n, "session cache returned the whole prompt");
++        let mut prefill_chunks = 0usize;
++        if sink.cancelled() {
++            eprintln!(
++                "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=after_session_acquire completed_chunks=0 prefilled_tokens=0 session_disposition=dropped"
++            );
++            drop(session);
++            return Ok(());
++        }
+         ensure!(
+             reused <= agreement,
+             "session cache resumed at {reused} past the agreement {agreement}"
+@@ -889,6 +942,14 @@ impl<M: LanguageModel> Engine<M> {
+         let mut encoded: Vec<(usize, crate::tensor::Tensor)> = Vec::new();
+         for (k, image) in p.images.iter().enumerate() {
+             if image.span.end() > reused {
++                if sink.cancelled() {
++                    eprintln!(
++                        "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=before_vision_image completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped",
++                        session.state.pos().saturating_sub(reused)
++                    );
++                    drop(session);
++                    return Ok(());
++                }
+                 let rows = model
+                     .encode_image(
+                         ctx,
+@@ -899,6 +960,14 @@ impl<M: LanguageModel> Engine<M> {
+                     )
+                     .with_context(|| format!("vision tower over image {}", k + 1))?;
+                 encoded.push((k, rows));
++                if sink.cancelled() {
++                    eprintln!(
++                        "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=after_vision_image completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped image_work_completed=true",
++                        session.state.pos().saturating_sub(reused)
++                    );
++                    drop(session);
++                    return Ok(());
++                }
+             }
+         }
+         let vision_secs = vision_started.elapsed().as_secs_f64();
+@@ -927,18 +996,62 @@ impl<M: LanguageModel> Engine<M> {
+         let mut prefilled = reused;
+         if let Some(b) = boundary {
+             if prefilled < b {
+-                model.prefill_with_vision(
+-                    ctx,
+-                    &mut session.state,
+-                    scratch,
+-                    &p.prompt[prefilled..b],
+-                    None,
+-                    vision.as_ref(),
+-                )?;
++                let at = session.state.pos();
++                let progress = {
++                    let mut is_cancelled = || sink.cancelled();
++                    model.prefill_with_vision_cancellable(
++                        ctx,
++                        &mut session.state,
++                        scratch,
++                        &p.prompt[prefilled..b],
++                        None,
++                        vision.as_ref(),
++                        &mut is_cancelled,
++                    )?
++                };
++                prefill_chunks += progress.completed_chunks;
++                if progress.cancelled {
++                    eprintln!(
++                        "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=prefill_chunk completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped",
++                        session.state.pos().saturating_sub(reused)
++                    );
++                    drop(session);
++                    return Ok(());
++                }
++                if sink.cancelled() {
++                    eprintln!(
++                        "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=after_prefill_call completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped",
++                        session.state.pos().saturating_sub(reused)
++                    );
++                    drop(session);
++                    return Ok(());
++                }
++                ensure!(
++                    session.state.pos() == b && session.state.pos() >= at,
++                    "prefill stopped at {}, expected durable boundary {b}",
++                    session.state.pos()
++                );
+                 prefilled = b;
+             }
++            if sink.cancelled() {
++                eprintln!(
++                    "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=before_durable_snapshot completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped",
++                    session.state.pos().saturating_sub(reused)
++                );
++                drop(session);
++                return Ok(());
++            }
+             let write_started = Instant::now();
+             let snapshot = session.state.snapshot(ctx)?;
++            if sink.cancelled() {
++                eprintln!(
++                    "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=after_durable_snapshot completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped",
++                    session.state.pos().saturating_sub(reused)
++                );
++                drop(snapshot);
++                drop(session);
++                return Ok(());
++            }
+             match sessions.store_durable(
+                 &p.prompt[..b],
+                 &images,
+@@ -957,19 +1070,48 @@ impl<M: LanguageModel> Engine<M> {
+                 ),
+             }
+             drop(snapshot);
++            if sink.cancelled() {
++                eprintln!(
++                    "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=after_durable_store completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped",
++                    session.state.pos().saturating_sub(reused)
++                );
++                drop(session);
++                return Ok(());
++            }
+         }
+ 
+         // Prefix up to the last prompt token, then checkpoint there so an
+         // identical or extended prompt can resume without re-feeding it.
+         if prefilled < n - 1 {
+-            model.prefill_with_vision(
+-                ctx,
+-                &mut session.state,
+-                scratch,
+-                &p.prompt[prefilled..n - 1],
+-                None,
+-                vision.as_ref(),
+-            )?;
++            let progress = {
++                let mut is_cancelled = || sink.cancelled();
++                model.prefill_with_vision_cancellable(
++                    ctx,
++                    &mut session.state,
++                    scratch,
++                    &p.prompt[prefilled..n - 1],
++                    None,
++                    vision.as_ref(),
++                    &mut is_cancelled,
++                )?
++            };
++            prefill_chunks += progress.completed_chunks;
++            if progress.cancelled {
++                eprintln!(
++                    "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=prefill_chunk completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped",
++                    session.state.pos().saturating_sub(reused)
++                );
++                drop(session);
++                return Ok(());
++            }
++        }
++        if sink.cancelled() {
++            eprintln!(
++                "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=before_session_checkpoint completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped",
++                session.state.pos().saturating_sub(reused)
++            );
++            drop(session);
++            return Ok(());
+         }
+         // The last prompt token is fed by the generator through the text
+         // prefill: it is text after every image, and the state's rope delta
+@@ -1017,6 +1159,14 @@ impl<M: LanguageModel> Engine<M> {
+                 raw: p.kind == Kind::Completion,
+             },
+         );
++        if sink.cancelled() {
++            eprintln!(
++                "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=before_first_token completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped",
++                session.state.pos().saturating_sub(reused)
++            );
++            drop(session);
++            return Ok(());
++        }
+         let mut collected = Collected::default();
+         let mut tool_index = 0usize;
+         if p.stream {
+@@ -1095,6 +1245,15 @@ impl<M: LanguageModel> Engine<M> {
+             drafts: *drafts,
+         };
+         let decode_started = Instant::now();
++        if sink.cancelled() {
++            eprintln!(
++                "[lily-meta] request_id={request_id} phase=prefill_cancelled stage=before_last_prompt_token completed_chunks={prefill_chunks} prefilled_tokens={} session_disposition=dropped",
++                session.state.pos().saturating_sub(reused)
++            );
++            drop(session);
++            return Ok(());
++        }
++        let mut callback_tokens = 0usize;
+         let generation = generator.generate(
+             ctx,
+             model,
+@@ -1103,9 +1262,16 @@ impl<M: LanguageModel> Engine<M> {
+             &p.prompt[n - 1..],
+             &options,
+             &mut |token| {
++                callback_tokens += 1;
+                 let events = parser.push(token)?;
+                 deliver(events, sink);
+-                Ok(!sink.cancelled() && !parser.stopped && !shutdown.cancel())
++                if sink.cancelled() {
++                    eprintln!(
++                        "[lily-meta] request_id={request_id} phase=decode_cancel_callback generated_callbacks={callback_tokens}"
++                    );
++                    return Ok(false);
++                }
++                Ok(!parser.stopped && !shutdown.cancel())
+             },
+         )?;
+         let final_events = parser.finish();
+@@ -1606,6 +1772,9 @@ struct Front {
+     /// Connection threads still running (the listener waits for them a
+     /// little at shutdown so responses in flight get written).
+     connections: Arc<AtomicUsize>,
++    request_sequence: AtomicU64,
++    active_watchers: Arc<AtomicUsize>,
++    watcher_limit: usize,
+     model_id: &'static str,
+     idle_unload_secs: u64,
+ }
+@@ -1673,6 +1842,22 @@ fn engine_loop<M: LanguageModel>(
+         };
+         match cmd {
+             Ok(Cmd::Job(job)) => {
++                let queue_event_guard = job.queue_event.lock().unwrap_or_else(|error| error.into_inner());
++                let queue_wait_ms = job.queued_at.elapsed().as_millis();
++                let engine_was_unloaded = engine.is_none();
++                if job.sink.cancelled() {
++                    eprintln!(
++                        "[lily-meta] request_id={} phase=queue_cancelled queue_wait_ms={} queue_slot_released=true",
++                        job.request_id, queue_wait_ms
++                    );
++                    job.finish_without_response();
++                    continue;
++                }
++                eprintln!(
++                    "[lily-meta] request_id={} phase=queue_dequeued queue_wait_ms={}",
++                    job.request_id, queue_wait_ms
++                );
++                drop(queue_event_guard);
+                 if shutdown.requested() {
+                     job.reject(503, "the server is shutting down");
+                     break;
+@@ -1696,6 +1881,15 @@ fn engine_loop<M: LanguageModel>(
+                         }
+                     }
+                 }
++                if job.sink.cancelled() {
++                    eprintln!(
++                        "[lily-meta] request_id={} phase=cancelled_after_engine_ready queue_wait_ms={} engine_loaded_for_cancelled_request={} model_load_aborted=false",
++                        job.request_id, queue_wait_ms, engine_was_unloaded
++                    );
++                    job.finish_without_response();
++                    idle.touch(Instant::now());
++                    continue;
++                }
+                 served += 1;
+                 if inject_fault_at.take_if(|at| *at == served).is_some() {
+                     eprintln!(
+@@ -1703,7 +1897,7 @@ fn engine_loop<M: LanguageModel>(
+                     );
+                     engine.as_ref().expect("engine loaded").inject_fault();
+                 }
+-                let fault = engine.as_mut().expect("engine loaded").serve(*job);
++                let fault = engine.as_mut().expect("engine loaded").serve(*job, queue_wait_ms);
+                 idle.touch(Instant::now());
+                 if let Some(fault) = fault {
+                     let faulted = engine.take().expect("engine loaded");
+@@ -1911,6 +2105,9 @@ fn run_with<M: LanguageModel + 'static>(
+         jobs,
+         lifecycle,
+         connections: connections.clone(),
++        request_sequence: AtomicU64::new(1),
++        active_watchers: Arc::new(AtomicUsize::new(0)),
++        watcher_limit: options.queue.saturating_add(1).max(1),
+         model_id: M::MODEL_ID,
+         idle_unload_secs: options.idle_unload_secs,
+     });
+@@ -2002,6 +2199,28 @@ fn handle(front: &Front, mut stream: TcpStream) {
+             }),
+         ),
+         ("POST", "/v1/chat/completions" | "/v1/completions") => {
++            let sequence = front.request_sequence.fetch_add(1, Ordering::Relaxed);
++            let request_id = format!("req-{}-{sequence}", now());
++            let cancelled = Arc::new(AtomicBool::new(false));
++            let mut watcher = match http::DisconnectWatcher::start(
++                &stream,
++                request_id.clone(),
++                cancelled.clone(),
++                front.active_watchers.clone(),
++                front.watcher_limit,
++            ) {
++                Ok(watcher) => watcher,
++                Err(_) => {
++                    refuse(
++                        stream,
++                        &what,
++                        503,
++                        "server_error",
++                        "cannot reserve a request disconnect watcher",
++                    );
++                    return;
++                }
++            };
+             let prepared = if path == "/v1/chat/completions" {
+                 serde_json::from_slice::<api::ChatRequest>(&request.body)
+                     .context("parsing the chat request")
+@@ -2029,6 +2248,14 @@ fn handle(front: &Front, mut stream: TcpStream) {
+             let prepared = match prepared {
+                 Ok(p) => p,
+                 Err(error) => {
++                    if cancelled.load(Ordering::Acquire) {
++                        eprintln!(
++                            "[lily-meta] request_id={request_id} phase=cancelled_during_prepare"
++                        );
++                        watcher.stop();
++                        return;
++                    }
++                    watcher.stop();
+                     refuse(
+                         stream,
+                         &what,
+@@ -2039,6 +2266,13 @@ fn handle(front: &Front, mut stream: TcpStream) {
+                     return;
+                 }
+             };
++            if cancelled.load(Ordering::Acquire) {
++                eprintln!(
++                    "[lily-meta] request_id={request_id} phase=cancelled_before_enqueue"
++                );
++                watcher.stop();
++                return;
++            }
+             if let Some(asked) = prepared.clamped_from {
+                 eprintln!(
+                     "warning: {what}: max_tokens {asked} clamped to {} (the prompt has {} tokens, the server context \
+@@ -2050,6 +2284,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
+             }
+             match state {
+                 State::Stopping => {
++                    watcher.stop();
+                     refuse(
+                         stream,
+                         &what,
+@@ -2060,6 +2295,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
+                     return;
+                 }
+                 State::Loading => {
++                    watcher.stop();
+                     refuse(
+                         stream,
+                         &what,
+@@ -2072,15 +2308,26 @@ fn handle(front: &Front, mut stream: TcpStream) {
+                 State::Ready | State::Idle | State::Reloading | State::Recovering => {}
+             }
+             let (tx, rx) = mpsc::channel();
+-            let cancelled = Arc::new(AtomicBool::new(false));
++            let queued_at = Instant::now();
++            let queue_event = Arc::new(Mutex::new(()));
++            let queue_event_guard = queue_event.lock().unwrap_or_else(|error| error.into_inner());
+             let job = Job {
++                request_id: request_id.clone(),
++                queue_event: queue_event.clone(),
+                 prepared,
+                 sink: Sink { tx, cancelled: cancelled.clone(), started: false },
+-                queued_at: Instant::now(),
++                queued_at,
+             };
+             match front.jobs.try_send(Cmd::Job(Box::new(job))) {
+-                Ok(()) => relay(stream, rx, cancelled),
++                Ok(()) => {
++                    eprintln!("[lily-meta] request_id={request_id} phase=queue_enter");
++                    drop(queue_event_guard);
++                    relay(stream, rx, cancelled, watcher, request_id, queued_at)
++                }
+                 Err(TrySendError::Full(_)) => {
++                    drop(queue_event_guard);
++                    watcher.stop();
++                    eprintln!("[lily-meta] request_id={request_id} phase=queue_rejected status=503");
+                     refuse(
+                         stream,
+                         &what,
+@@ -2090,6 +2337,9 @@ fn handle(front: &Front, mut stream: TcpStream) {
+                     );
+                 }
+                 Err(TrySendError::Disconnected(_)) => {
++                    drop(queue_event_guard);
++                    watcher.stop();
++                    eprintln!("[lily-meta] request_id={request_id} phase=queue_rejected status=500");
+                     refuse(stream, &what, 500, "server_error", "engine stopped");
+                 }
+             }
+diff --git a/src/serve/http.rs b/src/serve/http.rs
+index d7c6865..a388af1 100644
+--- a/src/serve/http.rs
++++ b/src/serve/http.rs
+@@ -2,15 +2,15 @@
+ //! `Content-Length` bodies, fixed or chunked responses, one connection per
+ //! thread, `Connection: close` after every response.
+ //!
+-//! Owning the socket is the point: a client that goes away is noticed the
+-//! moment a write fails or its read side hits EOF, which is what lets the
+-//! engine stop generating for a departed client. General-purpose crates hide
+-//! that behind buffering and background writers.
++//! Owning the socket is the point: this new gateway profile treats a
++//! pre-response read-side FIN as request cancellation. Clients must keep the
++//! HTTP/1.1 request write side open until response completion; write-half-close
++//! is outside this profile's compatibility contract.
+ 
+ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+ use std::net::{Shutdown, TcpStream};
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::time::Duration;
+ 
+ use anyhow::{Context as _, Result, bail, ensure};
+@@ -141,6 +141,119 @@ pub fn respond(
+     Ok(())
+ }
+ 
++struct WatcherPermit(Arc<AtomicUsize>);
++
++impl WatcherPermit {
++    fn acquire(active: Arc<AtomicUsize>, limit: usize) -> Result<Self> {
++        active
++            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
++                (count < limit).then(|| count + 1)
++            })
++            .map_err(|_| anyhow::anyhow!("disconnect watcher admission is full"))?;
++        Ok(Self(active))
++    }
++}
++
++impl Drop for WatcherPermit {
++    fn drop(&mut self) {
++        self.0.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++
++/// Bounded observer for this gateway profile. A pre-response FIN and a reset
++/// cancel the request. Clients that write-half-close while awaiting a response
++/// are unsupported by the declared transport contract.
++pub struct DisconnectWatcher {
++    stop: Arc<AtomicBool>,
++    thread: Option<std::thread::JoinHandle<()>>,
++    _permit: WatcherPermit,
++}
++
++impl DisconnectWatcher {
++    pub fn start(
++        stream: &TcpStream,
++        request_id: String,
++        cancelled: Arc<AtomicBool>,
++        active: Arc<AtomicUsize>,
++        limit: usize,
++    ) -> Result<Self> {
++        let permit = WatcherPermit::acquire(active, limit)?;
++        let mut watcher = stream.try_clone().context("cloning request socket")?;
++        watcher
++            .set_read_timeout(Some(Duration::from_millis(100)))
++            .context("setting disconnect watcher timeout")?;
++        let stop = Arc::new(AtomicBool::new(false));
++        let thread_stop = stop.clone();
++        let thread = std::thread::Builder::new()
++            .name("lily-watch".into())
++            .spawn(move || {
++                let mut scratch = [0u8; 256];
++                loop {
++                    match watcher.read(&mut scratch) {
++                        // The approved gateway profile excludes write-half-close.
++                        // Under that contract, a pre-response FIN is cancellation.
++                        Ok(0) => {
++                            if !thread_stop.load(Ordering::Acquire) {
++                                cancelled.store(true, Ordering::Release);
++                                eprintln!(
++                                    "[lily-meta] request_id={request_id} phase=client_fin_cancelled"
++                                );
++                            }
++                            break;
++                        }
++                        Ok(_) => {
++                            if thread_stop.load(Ordering::Acquire) {
++                                break;
++                            }
++                        }
++                        Err(error)
++                            if matches!(
++                                error.kind(),
++                                std::io::ErrorKind::WouldBlock
++                                    | std::io::ErrorKind::TimedOut
++                            ) =>
++                        {
++                            if thread_stop.load(Ordering::Acquire) {
++                                break;
++                            }
++                        }
++                        Err(error)
++                            if matches!(
++                                error.kind(),
++                                std::io::ErrorKind::ConnectionReset
++                                    | std::io::ErrorKind::ConnectionAborted
++                            ) =>
++                        {
++                            if !thread_stop.load(Ordering::Acquire) {
++                                cancelled.store(true, Ordering::Release);
++                                eprintln!(
++                                    "[lily-meta] request_id={request_id} phase=client_reset"
++                                );
++                            }
++                            break;
++                        }
++                        Err(_) => break,
++                    }
++                }
++            })
++            .context("spawning disconnect watcher")?;
++        Ok(Self { stop, thread: Some(thread), _permit: permit })
++    }
++
++    pub fn stop(&mut self) {
++        self.stop.store(true, Ordering::Release);
++        if let Some(thread) = self.thread.take() {
++            let _ = thread.join();
++        }
++    }
++}
++
++impl Drop for DisconnectWatcher {
++    fn drop(&mut self) {
++        self.stop();
++    }
++}
++
+ /// A chunked response in progress. Dropping it without [`Self::finish`]
+ /// closes the connection mid-body, which clients report as an error.
+ pub struct ChunkedResponse {
+@@ -149,8 +262,8 @@ pub struct ChunkedResponse {
+ }
+ 
+ impl ChunkedResponse {
+-    /// Writes the head. `cancelled` is set as soon as a write fails or the
+-    /// client's read side reaches EOF (watched by a helper thread).
++    /// Writes the head. `cancelled` is set by the request-scoped watcher on
++    /// pre-response FIN/reset or when a response write fails.
+     pub fn start(
+         stream: TcpStream,
+         status: u16,
+@@ -169,25 +282,6 @@ impl ChunkedResponse {
+             &[("Transfer-Encoding", "chunked")]
+         };
+         write_head(&mut stream, status, content_type, extra)?;
+-        // With `Connection: close` the client sends nothing more on this
+-        // socket, so any read completion means it went away.
+-        if let Ok(mut watcher) = stream.try_clone() {
+-            let flag = cancelled.clone();
+-            std::thread::Builder::new()
+-                .name("lily-watch".into())
+-                .spawn(move || {
+-                    watcher.set_read_timeout(None).ok();
+-                    let mut scratch = [0u8; 256];
+-                    loop {
+-                        match watcher.read(&mut scratch) {
+-                            Ok(0) | Err(_) => break,
+-                            Ok(_) => continue,
+-                        }
+-                    }
+-                    flag.store(true, Ordering::Relaxed);
+-                })
+-                .ok();
+-        }
+         Ok(Self { stream, cancelled })
+     }
+ 

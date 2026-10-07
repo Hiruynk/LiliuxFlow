@@ -1,0 +1,114 @@
+--- a/ui/litellm-dashboard/src/app/(dashboard)/prompts/_components/prompt_editor_view/PromptEditorHeader.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/prompts/_components/prompt_editor_view/PromptEditorHeader.tsx
+@@ -1,3 +1,4 @@
++import { sourceSelectDisplay } from "@/liliuxflow/SourceSelectDisplay";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { LocalizedRichText } from "@/liliuxflow/LocalizedText";
+@@ -37,15 +38,15 @@
+     return (<div className="bg-background border-b border-border px-6 py-3 flex items-center justify-between">
+       <div className="flex items-center space-x-3">
+         <Button variant="ghost" onClick={onBack} size="sm"><LocalizedRichText id="ui.admin.rich.529a68f91083" components={{ "value0": <ArrowLeftIcon /> }}/></Button>
+-        {localizeProps(<Input aria-label="Prompt name" value={promptName} onChange={(e) => onNameChange(e.target.value)} className="text-base font-medium border-none shadow-none" style={{ width: "200px" }}/>, { "aria-label": "ui.admin.display.prompt.name.5d64bd1e" })}
++        {localizeProps(<Input aria-label="Prompt name" placeholder="New prompt" value={promptName} onChange={(e) => onNameChange(e.target.value)} className="text-base font-medium border-none shadow-none" style={{ width: "200px" }}/>, { "aria-label": "ui.admin.display.prompt.name.5d64bd1e", "placeholder": "ui.promptEditor.newNameHint" })}
+         {version && <Badge>{version}</Badge>}
+         <Select items={ENVIRONMENT_ITEMS} value={environment} onValueChange={(value) => onEnvironmentChange(String(value))}>
+           {localizeProps(<SelectTrigger size="sm" className="w-[140px]" aria-label="Environment">
+-            <SelectValue />
++            {sourceSelectDisplay(<SelectValue />, ENVIRONMENT_ITEMS, {"development": "ui.admin.display.development.3ea10019", "staging": "ui.admin.display.staging.97b44141", "production": "ui.admin.display.production.85b66c93"}, ["development", "staging", "production"])}
+           </SelectTrigger>, { "aria-label": "ui.admin.display.environment.bed23195" })}
+           <SelectContent>
+             {ENVIRONMENT_ITEMS.map((item) => (<SelectItem key={item.value} value={item.value}>
+-                {item.label}
++                {<LocalizedValue node={item.label} sourceDisplayChoices={{"Development": "ui.admin.display.development.3ea10019", "Staging": "ui.admin.display.staging.97b44141", "Production": "ui.admin.display.production.85b66c93"}} sourceChoiceProvenance="ui-producer"/>}
+               </SelectItem>))}
+           </SelectContent>
+         </Select>
+--- a/ui/litellm-dashboard/src/app/(dashboard)/prompts/_components/prompt_editor_view/PromptMessagesCard.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/prompts/_components/prompt_editor_view/PromptMessagesCard.tsx
+@@ -1,3 +1,4 @@
++import { sourceSelectDisplay } from "@/liliuxflow/SourceSelectDisplay";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { localizeGeneratedProps } from "@/liliuxflow/LocalizedProps";
+@@ -54,11 +55,11 @@
+             <div className="bg-muted px-2 py-1.5 border-b border-border flex items-center justify-between">
+               <ShadcnSelect items={ROLE_ITEMS} value={message.role} onValueChange={(value) => onUpdateMessage(index, "role", String(value))}>
+                 {localizeGeneratedProps(__liliuxflowCapture => <SelectTrigger size="sm" className="w-[110px] border-0 shadow-none" aria-label={__liliuxflowCapture("aria-label", "ui.admin.dynamic.050f85624cbd", ["Message ", " role"], [`${index + 1}`])}>
+-                  <SelectValue />
++                  {sourceSelectDisplay(<SelectValue />, ROLE_ITEMS, {"user": "ui.admin.display.user.e06722a5", "assistant": "ui.admin.display.assistant.47b9af26", "system": "ui.admin.display.system.b91aa114"}, ["user", "assistant", "system"])}
+                 </SelectTrigger>, {})}
+                 <SelectContent>
+                   {ROLE_ITEMS.map((item) => (<SelectItem key={item.value} value={item.value}>
+-                      {item.label}
++                      {<LocalizedValue node={item.label} sourceDisplayChoices={{"User": "ui.admin.display.user.e06722a5", "Assistant": "ui.admin.display.assistant.47b9af26", "System": "ui.admin.display.system.b91aa114"}} sourceChoiceProvenance="ui-producer"/>}
+                     </SelectItem>))}
+                 </SelectContent>
+               </ShadcnSelect>
+@@ -72,7 +73,7 @@
+               </div>
+             </div>
+             <div className="p-2">
+-              {localizeProps(<VariableTextArea value={message.content} onChange={(value) => onUpdateMessage(index, "content", value)} rows={3} placeholder="Enter prompt content..."/>, { "placeholder": "ui.admin.display.enter.prompt.content.43d76a94" })}
++              {localizeProps(<VariableTextArea value={message.content} onChange={(value) => onUpdateMessage(index, "content", value)} rows={3} placeholder="Enter task specifics. Use {{template_variables}} for dynamic inputs"/>, { "placeholder": { key: "ui.promptEditor.newMessageHint", values: { variablesLiteral: "{{template_variables}}" } } })}
+             </div>
+           </div>))}
+       </div>
+--- a/ui/litellm-dashboard/src/components/common_components/ModelSelector.tsx
++++ b/ui/litellm-dashboard/src/components/common_components/ModelSelector.tsx
+@@ -69,7 +69,7 @@
+                 label: model_group,
+             })),
+             { value: "custom", label: "Enter custom model" },
+-        ]} value={selectedModel} placeholder={placeholder} onValueChange={onModelChange} disabled={disabled}/>, {placeholder:{byValue:{"Select a Model":"ui.admin.dynamic.2486e494754d"}}})}
++        ]} sourceOptionLabels={{ custom: { sourceLabel: "Enter custom model", key: "ui.admin.display.enter.custom.model.501a4664" } }} value={selectedModel} placeholder={placeholder} onValueChange={onModelChange} disabled={disabled}/>, {placeholder:{byValue:{"Select a Model":"ui.admin.dynamic.2486e494754d"}}})}
+       </div>
+       {showCustomModelInput && (localizeProps(<Input className="mt-2" placeholder="Enter custom model name" onChange={(e) => debouncedSelect(e.target.value)} disabled={disabled}/>, { "placeholder": "ui.admin.display.enter.custom.model.name.d6e45da5" }))}
+     </div>);
+--- a/ui/litellm-dashboard/src/app/(dashboard)/prompts/_components/prompt_editor_view/index.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/prompts/_components/prompt_editor_view/index.tsx
+@@ -27,7 +27,7 @@
+             }
+         }
+         return {
+-            name: "New prompt",
++            name: "",
+             model: "gpt-4o",
+             config: {
+                 temperature: 1,
+@@ -38,7 +38,7 @@
+             messages: [
+                 {
+                     role: "user",
+-                    content: "Enter task specifics. Use {{template_variables}} for dynamic inputs",
++                    content: "",
+                 },
+             ],
+             environment: "development",
+--- a/ui/litellm-dashboard/src/app/(dashboard)/budgets/_components/BudgetTable.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/budgets/_components/BudgetTable.tsx
+@@ -140,7 +140,7 @@
+     const hasQuery = list.searchValue.trim() !== "" || list.columnFilters.length > 0;
+     const emptyMessage = list.error === null ? <EmptyState hasQuery={hasQuery}/> : <ErrorState error={list.error}/>;
+     return (localizeProps(<DataTable data={list.rows} columns={columns} getRowId={(budget, index) => budget.budget_id || String(index)} defaultColumnVisibility={BUDGET_TABLE_HIDDEN_COLUMNS} fillHeight sortingMode="server" sorting={list.sorting} onSortingChange={list.onSortingChange} paginationMode="server" pagination={list.pagination} onPaginationChange={list.onPaginationChange} rowCount={list.rowCount} pageSizeOptions={PAGE_SIZE_OPTIONS} filterMode="server" columnFilters={list.columnFilters} onColumnFiltersChange={list.onColumnFiltersChange} isLoading={list.isLoading} loadingMessage="Loading budgets…" noDataMessage={emptyMessage} size="compact" toolbar={(table) => (<>
+-          <DataTableToolbar table={table} searchValue={list.searchValue} onSearchChange={list.onSearchChange} searchPlaceholder="Search by budget ID…" onOpenFilters={() => setFiltersOpen(true)} onRefresh={list.refetch} isRefreshing={list.isFetching} filterLabels={FILTER_LABELS} formatFilterValue={formatFilterValue}/>
++          {localizeProps(<DataTableToolbar table={table} searchValue={list.searchValue} onSearchChange={list.onSearchChange} searchPlaceholder="Search by budget ID…" onOpenFilters={() => setFiltersOpen(true)} onRefresh={list.refetch} isRefreshing={list.isFetching} filterLabels={FILTER_LABELS} formatFilterValue={formatFilterValue}/>, { searchPlaceholder: "ui.budgets.searchByBudgetId" })}
+           {localizeProps(<DataTableFilterDrawer table={table} open={filtersOpen} onOpenChange={setFiltersOpen} title="Filters" description="Narrow down your budgets">
+             {(draft) => <BudgetFilterFields {...draft}/>}
+           </DataTableFilterDrawer>, { "title": "ui.admin.display.filters.39b4d659", "description": "ui.admin.display.narrow.down.your.budgets.2f809446" })}
+--- a/ui/litellm-dashboard/src/app/(dashboard)/search-tools/_components/SearchToolTable.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/search-tools/_components/SearchToolTable.tsx
+@@ -1,4 +1,5 @@
+ "use client";
++import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { SortingState } from "@tanstack/react-table";
+ import { Inbox } from "lucide-react";
+@@ -30,6 +31,6 @@
+         const deps = { availableProviders, onView, onEdit, onDelete };
+         return getSearchToolTableColumns(deps);
+     }, [availableProviders, onView, onEdit, onDelete]);
+-    return (<DataTable data={searchTools} paginationMode="client" columns={columns} getRowId={(tool, index) => searchToolKey(tool) || String(index)} sortingMode="client" sorting={sorting} onSortingChange={setSorting} isLoading={isLoading} loadingMessage="Loading search tools…" noDataMessage={<EmptyState />} size="compact"/>);
++    return (localizeProps(<DataTable data={searchTools} paginationMode="client" columns={columns} getRowId={(tool, index) => searchToolKey(tool) || String(index)} sortingMode="client" sorting={sorting} onSortingChange={setSorting} isLoading={isLoading} loadingMessage="Loading search tools…" noDataMessage={<EmptyState />} size="compact"/>, { loadingMessage: "ui.admin.dynamic.bb6df63e48d9" }));
+ };
+ export default SearchToolTable;

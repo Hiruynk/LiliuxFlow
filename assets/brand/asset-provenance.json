@@ -1,0 +1,25 @@
+{
+  "status": "ORIGINAL_ARTWORK",
+  "date": "2026-10-01",
+  "tool": "original hand-authored SVG paths, no image generation",
+  "font": "system-ui reference only; no font files redistributed",
+  "artwork_license": "Apache-2.0",
+  "artwork_license_adoption": {
+    "date": "2026-10-05",
+    "scope": "Original LiliuxFlow brand artwork; external assets retain their original terms",
+    "project_license_path": "LICENSE"
+  },
+  "private_assets_included": false,
+  "trademark_global_uniqueness": null,
+  "files": {
+    "mark.svg": "e327c304c43e6033322f3f902358b1ad5b0729deac215a1abf909daf144c345c",
+    "logo-light.svg": "436263a7bff9521bc25bfcca899658fedf12c450a9b3355573dbf2e738ae9485",
+    "logo-dark.svg": "012d0550d17f467902fac776110cdb01a8d88a06eac1f6eb0afb289af6b66305",
+    "favicon.svg": "101774c68a6e15f5836f8dab735b8a784e0d7b1ca9c6a5b27cc261bd02590cda",
+    "favicon-32.png": "16dfeaf73547e69c37a4a02072e7162419f46944c6da78c517e4d92b8152f515",
+    "mark-dark.svg": "cfb150e17080f08a78d985c2a3dd44ef7f1ea3492ddf5f3c4d439257d946c221"
+  },
+  "refinement": "Five outward petals with recurved lower lips and an open central throat; source original",
+  "faviconTheme": "SVG prefers-color-scheme media: light #293a33, dark #ecf4ed; no script or remote resource",
+  "readme_mark_variant": "Same original lily mark paths; dark-mode color variant, without wordmark."
+}

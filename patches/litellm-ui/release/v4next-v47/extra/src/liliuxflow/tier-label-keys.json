@@ -1,0 +1,17 @@
+{
+  "labels": {
+    "Simple": "ui.admin.owner.tierLabel.3fee95da",
+    "Medium": "ui.admin.owner.tierLabel.8e588cd1",
+    "Complex": "ui.admin.owner.tierLabel.cd75063b",
+    "Reasoning": "ui.admin.owner.tierLabel.d8211e24",
+    "Non-reasoning": "ui.admin.owner.tierLabel.17441e57",
+    "New": "ui.admin.owner.tierLabel.18fdd549"
+  },
+  "tiers": {
+    "SIMPLE": "ui.admin.owner.tierLabel.3fee95da",
+    "MEDIUM": "ui.admin.owner.tierLabel.8e588cd1",
+    "COMPLEX": "ui.admin.owner.tierLabel.cd75063b",
+    "REASONING": "ui.admin.owner.tierLabel.d8211e24",
+    "NON_REASONING": "ui.admin.owner.tierLabel.17441e57"
+  }
+}

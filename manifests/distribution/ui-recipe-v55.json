@@ -1,0 +1,561 @@
+{
+  "schema_version": 1,
+  "state": "READY_FOR_REVIEW",
+  "coverage_state": "SOURCE_COMPLETE_BROWSER_PENDING",
+  "ui_accepted": false,
+  "next_env_policy": "Explicit Next ambient references only; generated build-directory imports excluded",
+  "apps": {
+    "litellm": {
+      "upstream_commit": "d09bbae1c6df463e425558f60d460437193635da",
+      "archive_sha256": "cd5dfb9f53d4d7f91c443ed78b4609f8fea4854a7f5683c5b8eefec53bb582e3",
+      "patches": [
+        {
+          "path": "patches/litellm-ui/release/v4next-v47/localized-source.patch",
+          "sha256": "a1f47a9506cefef8b87049725e9e044a55901ee7e765fc5b190e7f35be8135d2",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v50/litellm/supplemental-original-source.patch",
+          "sha256": "9103ec91489a23a1eb868c30700b40dff7ba3af5bf2c7396acd6be4f099c7157",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v51/litellm/supplemental-original-source.patch",
+          "sha256": "efdf06903826b330f7bf88d283c3fdba3d46c5d41e6e8030117316f39e6eae72",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v52b/litellm/supplemental-original-source.patch",
+          "sha256": "b9a437a56a9e2561949b24ebfaeddeb2729f9da838a5513c6c9f5a32718f1ac1",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v53/litellm/supplemental-original-source.patch",
+          "sha256": "8c3b4c53f954344b53bd8065ec0c19d1b553f97ebdf63a0a1c63371df7ea875c",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v54/litellm/supplemental-original-source.patch",
+          "sha256": "9a09dcab4830250b487dfaf08a790d6f0666a7ce69a259204687e0f5b53cfd6d",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v55/litellm/supplemental-original-source.patch",
+          "sha256": "0a13a82fe58bd2cf09199aa0046785fdf521d23c68e59a531947a2d835495a29",
+          "strip": 1
+        }
+      ],
+      "extra_files": [
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/next-env.d.ts",
+          "target": "ui/litellm-dashboard/next-env.d.ts",
+          "sha256": "879741880b6ab48da99dcc06dcc674d381c9826137b0496bf7bb368f302de9fc",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/public/liliuxflow-favicon.svg",
+          "target": "ui/litellm-dashboard/public/liliuxflow-favicon.svg",
+          "sha256": "101774c68a6e15f5836f8dab735b8a784e0d7b1ca9c6a5b27cc261bd02590cda",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/public/liliuxflow-logo-dark.svg",
+          "target": "ui/litellm-dashboard/public/liliuxflow-logo-dark.svg",
+          "sha256": "012d0550d17f467902fac776110cdb01a8d88a06eac1f6eb0afb289af6b66305",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/public/liliuxflow-logo-light.svg",
+          "target": "ui/litellm-dashboard/public/liliuxflow-logo-light.svg",
+          "sha256": "436263a7bff9521bc25bfcca899658fedf12c450a9b3355573dbf2e738ae9485",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/public/liliuxflow-mark.svg",
+          "target": "ui/litellm-dashboard/public/liliuxflow-mark.svg",
+          "sha256": "e327c304c43e6033322f3f902358b1ad5b0729deac215a1abf909daf144c345c",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/app/not-found.tsx",
+          "target": "ui/litellm-dashboard/src/app/not-found.tsx",
+          "sha256": "a76bceb19f8afea7cb07d9ad4da1a6b62d578bc77cb761581a9bdf29ad055789",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/BrandAttribution.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/BrandAttribution.tsx",
+          "sha256": "71b201675075a9945521bac6a6395495cefa9ee500c140b15b727907d9d7d8ed",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/ColumnLocale.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/ColumnLocale.tsx",
+          "sha256": "a7081c213b952c851f6df0eeb3118527f5ace3301f970b9598d628d03ad9e8be",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/CommonDisplay.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/CommonDisplay.tsx",
+          "sha256": "87aadec1d83423fdbcaf0eddbb8e28bd71e121db52a89fac8b711b77ad11c851",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/LanguageSelector.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/LanguageSelector.tsx",
+          "sha256": "2776045cdb1e713ace2324e3d3042a457dde15061cf113fdd1ebed3ab2e4957e",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/LocaleProvider.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/LocaleProvider.tsx",
+          "sha256": "95fac93222ea4fc2c687d072fa18523c81d1a7e2dbc24cd627868d79fcfd216e",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/LocalizedDateValue.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/LocalizedDateValue.tsx",
+          "sha256": "3534d3330e246a20b8761e0f5a28ffdd32f6a6772dd531da8663a70aa1335a7a",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v53/litellm/extra/src/liliuxflow/LocalizedProps.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/LocalizedProps.tsx",
+          "sha256": "da8603ec8289df597450269fdf3dcadf6ea2dc08fc2e9b465966c665b4f0df84",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/LocalizedText.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/LocalizedText.tsx",
+          "sha256": "187209bba41fb363e4b756f63b43c157b0925aef83e1fb3ad13229d6e66e0235",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/LoginFailureText.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/LoginFailureText.tsx",
+          "sha256": "59ab7d562d5109fea9d519d1c853dc473b5cce3c22ffd709b1840c65b512aa6f",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/NavDisplay.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/NavDisplay.tsx",
+          "sha256": "569b14e23c83ff482c8e4d6bbff2694a8e8c202c6f9c2be4f057a77d3ea83088",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/NoticeBody.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/NoticeBody.tsx",
+          "sha256": "814cc3b9abde73b4fa3250f65ddc0980a737030d782b9b4574a79470ab949447",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/NoticeMessage.ts",
+          "target": "ui/litellm-dashboard/src/liliuxflow/NoticeMessage.ts",
+          "sha256": "95054746d6f255974bbb48c71e938ba292d2a9da40443e0b2cfcada71435f015",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/NoticeText.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/NoticeText.tsx",
+          "sha256": "7d9405e2ac3336e6e21226d152ff82ca4bccc4d5575762d1d716208bd52625af",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/SourceChartDisplay.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/SourceChartDisplay.tsx",
+          "sha256": "284b9a95dfd3315521a32f4af8aeeda7dcc09ddedd65a0aa1e0d2cdb814c22e3",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/SourceDisplayText.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/SourceDisplayText.tsx",
+          "sha256": "cf4f55dd908d1fb83c17a9593292186266e0f41502caf729d99f048cc1ff5e42",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/SourcePolicyDisplay.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/SourcePolicyDisplay.tsx",
+          "sha256": "22a12e3a4800773d0b4429a1503fd4892587a9e3c03ae1dafcc2a846b6493b3b",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/SourceSelectDisplay.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/SourceSelectDisplay.tsx",
+          "sha256": "567f29b326dd445aaf9d3449a5671b4392d0fa1897ae4add08dc5bc750aeab7f",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/TierLabelValue.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/TierLabelValue.tsx",
+          "sha256": "5c108e477bc9f405ccc39d39c0315c9f9713758f305a96fb6faf8514105736c1",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/account-menu-copy.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/account-menu-copy.json",
+          "sha256": "e6711be7f351348d20145e1a3664a2af25223d792ba6034c810f16aa126b6452",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v55/litellm/extra/src/liliuxflow/catalogs/en.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/catalogs/en.json",
+          "sha256": "7439b6898fd354f541070e66807dc2889914cf7248dae9b47ed4246d0ccdd363",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v55/litellm/extra/src/liliuxflow/catalogs/ja.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/catalogs/ja.json",
+          "sha256": "ece1d274d23da2390c3ce7d4dec6d7cf86acc0221b008a889bbf09300992399a",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v55/litellm/extra/src/liliuxflow/catalogs/zh-Hans.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/catalogs/zh-Hans.json",
+          "sha256": "0c4b008dc0170c0cec08db1fb00cb9ce44c1becf123451668aba3537960e9f5b",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v55/litellm/extra/src/liliuxflow/catalogs/zh-Hant.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/catalogs/zh-Hant.json",
+          "sha256": "0e71449ec046190ac20cdbe8de5af0fbeb67c02e9b4a42cebeea77c2adee9fd3",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/core.mjs",
+          "target": "ui/litellm-dashboard/src/liliuxflow/core.mjs",
+          "sha256": "5b11fc07d75a7bd97b9d0fb1a2a823bb17985e08a83ae0fbae2c61bbe4f7d8bb",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/final-common-display-map.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/final-common-display-map.json",
+          "sha256": "eb0da313907a1cd64fbc4dfd6cefc5e3570d187c7355c4cb713f557a5610410b",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/final-nav-display-map.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/final-nav-display-map.json",
+          "sha256": "f51d0b42094ad5f05f866db35a7fdef171f115e83c44ddef81e316bb967e1866",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/moment-display.d.ts",
+          "target": "ui/litellm-dashboard/src/liliuxflow/moment-display.d.ts",
+          "sha256": "6576afcaede33be072ff5c467309f8c9521cc5e550fa016b19543094e19cc74f",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/notice-display-policies.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/notice-display-policies.json",
+          "sha256": "ff7e0443b19477fa803662d99f9b37659cbc752ba1d2f2375545e3455b6e4838",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/notice-source-map.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/notice-source-map.json",
+          "sha256": "5fa8cae7ac508bfa2b21f8367f03dfa95b828cc65732acb49903639ed9f89a42",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/runtime.ts",
+          "target": "ui/litellm-dashboard/src/liliuxflow/runtime.ts",
+          "sha256": "ae777354114a9a6f5e95573e95e2bc85b73970f93af1d876ef2a769913254ebf",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/source-display-field-map.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/source-display-field-map.json",
+          "sha256": "fb92c495ef91e0c80a51f3ac15bcbeccea2212112a7d96d338e0deb2921c535c",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/source-message-keys.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/source-message-keys.json",
+          "sha256": "32406836977e0df63aba91be91a98bc2662b4f9b27143a75b87b5f89859665f2",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/source-policy-category-keys.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/source-policy-category-keys.json",
+          "sha256": "8eb2411cf5aec63dc84f64ffb0c2bf801c7bd25dfe6d63eaec53f09def31cf3b",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/source-policy-rows.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/source-policy-rows.json",
+          "sha256": "b27a8c1ecad1cdee491af07b91955a5445c2a82433dd7526829e41cf1a6f8ec5",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/svelte.mjs",
+          "target": "ui/litellm-dashboard/src/liliuxflow/svelte.mjs",
+          "sha256": "fe17365cbe07c58eb52baba88a34b30d83f5b5e86ba58fd7706e4730613a4072",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/litellm-ui/release/v4next-v47/extra/src/liliuxflow/tier-label-keys.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/tier-label-keys.json",
+          "sha256": "baf20e8e0eec95a5693cf14ce4fa877b80ee060805dd29b7afa71253edf875e9",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v52b/litellm/extra/src/liliuxflow/BaseUiComboboxDismiss.tsx",
+          "target": "ui/litellm-dashboard/src/liliuxflow/BaseUiComboboxDismiss.tsx",
+          "sha256": "1d9f01a74062ae566841a280eb03e9f3c731882175a1d7f589e85fb5e7a93c02",
+          "before_sha256": null
+        }
+      ],
+      "lockfiles": [
+        {
+          "path": "ui/litellm-dashboard/package-lock.json",
+          "sha256": "7bda495a7979c8fe7f9580241a9291bda9871be8480a1b181ec06488930c3294"
+        }
+      ],
+      "source_tree_sha256": "cda4f89eca6ce55342eac1e6464290d3c32fa30784094aa1c02367e8ab4a89fc",
+      "ui_accepted": false,
+      "supported_locales": [
+        "en",
+        "zh-Hant",
+        "zh-Hans",
+        "ja"
+      ],
+      "runtime_catalogs": [
+        {
+          "locale": "en",
+          "path": "patches/ui/v51/litellm/extra/src/liliuxflow/catalogs/en.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/catalogs/en.json",
+          "sha256": "8220a7a843ba9fb8eebbd0b4bad7ffead62bad91067bd97d9448a8a0c7668b55",
+          "key_count": 8080
+        },
+        {
+          "locale": "zh-Hant",
+          "path": "patches/ui/v51/litellm/extra/src/liliuxflow/catalogs/zh-Hant.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/catalogs/zh-Hant.json",
+          "sha256": "7c89fac31271c562040aaccbda109305ac6bb97933ba91fce1354d5e0ce9f8ee",
+          "key_count": 8080
+        },
+        {
+          "locale": "zh-Hans",
+          "path": "patches/ui/v51/litellm/extra/src/liliuxflow/catalogs/zh-Hans.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/catalogs/zh-Hans.json",
+          "sha256": "8e402089905c874e4c064f8729cdd9fd8d2c59320d55946abccdef5a55850c78",
+          "key_count": 8080
+        },
+        {
+          "locale": "ja",
+          "path": "patches/ui/v51/litellm/extra/src/liliuxflow/catalogs/ja.json",
+          "target": "ui/litellm-dashboard/src/liliuxflow/catalogs/ja.json",
+          "sha256": "02f0020598e1c9aba6d1cad1f39b84a73e11e27fa96dd254c7e30afdad70d986",
+          "key_count": 8080
+        }
+      ],
+      "english_resource_policy": {
+        "runtime_resource": true,
+        "fallbackLng": false,
+        "direct_resource_completeness_required": true
+      }
+    },
+    "llama-swap": {
+      "upstream_commit": "fcefa7b7bebc326790937bbebc32ae87a958747c",
+      "archive_sha256": "7d4d0695a38e958faec2c022763e624372cc996d48c06ce8517a2ac9ab0830e5",
+      "patches": [
+        {
+          "path": "patches/llama-swap-ui/release/v4next-v47/localized-source.patch",
+          "sha256": "0bc8d7f271d0c00da431e03b3543d040667d90c08bc7e103f397c9c07146785a",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v50/llama-swap/supplemental-original-source.patch",
+          "sha256": "bc099a5c00d62bc9e7d3296163125f4e1f66ca79389362faa51a3fcc701d676f",
+          "strip": 1
+        }
+      ],
+      "extra_files": [
+        {
+          "source": "patches/llama-swap-ui/release/v4next-v47/extra/public/favicon-32.png",
+          "target": "ui/public/favicon-32.png",
+          "sha256": "16dfeaf73547e69c37a4a02072e7162419f46944c6da78c517e4d92b8152f515",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/llama-swap-ui/release/v4next-v47/extra/public/mark.svg",
+          "target": "ui/public/mark.svg",
+          "sha256": "e327c304c43e6033322f3f902358b1ad5b0729deac215a1abf909daf144c345c",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/llama-swap-ui/release/v4next-v47/extra/src/liliuxflow/LanguageSelector.svelte",
+          "target": "ui/src/liliuxflow/LanguageSelector.svelte",
+          "sha256": "7113314887559edc4df76dcc7ba4aae51980c23d28a08c55ccdb4bffb0f08e7b",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/llama-swap-ui/release/v4next-v47/extra/src/liliuxflow/ModelActionNotice.svelte",
+          "target": "ui/src/liliuxflow/ModelActionNotice.svelte",
+          "sha256": "5e8da6d63da0d1838e527f7aaa6add6b0641b4208adfd8df52582546fa429727",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v50/llama-swap/extra/src/liliuxflow/catalogs/en.json",
+          "target": "ui/src/liliuxflow/catalogs/en.json",
+          "sha256": "f82363a562a7b1ca03ce54e4d76d46f6cdf53d32556d81147ab26ecfd83e0da4",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v50/llama-swap/extra/src/liliuxflow/catalogs/ja.json",
+          "target": "ui/src/liliuxflow/catalogs/ja.json",
+          "sha256": "93a7c158740bdb727a9163be427cfe4ba23e4b7fddbae461672605b84d16c35c",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v50/llama-swap/extra/src/liliuxflow/catalogs/zh-Hans.json",
+          "target": "ui/src/liliuxflow/catalogs/zh-Hans.json",
+          "sha256": "4bd8c6ead4b401afac406ca391b9f97c8cbfc6a8319c3b4d7ea7085087fecc1d",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v50/llama-swap/extra/src/liliuxflow/catalogs/zh-Hant.json",
+          "target": "ui/src/liliuxflow/catalogs/zh-Hant.json",
+          "sha256": "4ef1e5766a0433f5b3de2bcd5b875beaa1f255674f4a37894119f8cda22df1d2",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/llama-swap-ui/release/v4next-v47/extra/src/liliuxflow/core.mjs",
+          "target": "ui/src/liliuxflow/core.mjs",
+          "sha256": "5b11fc07d75a7bd97b9d0fb1a2a823bb17985e08a83ae0fbae2c61bbe4f7d8bb",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/llama-swap-ui/release/v4next-v47/extra/src/liliuxflow/display.ts",
+          "target": "ui/src/liliuxflow/display.ts",
+          "sha256": "e1272c50b70b6c00deb3375f1496d5246529e216d60d7a0ca54ac2bc32f36654",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/llama-swap-ui/release/v4next-v47/extra/src/liliuxflow/runtime.ts",
+          "target": "ui/src/liliuxflow/runtime.ts",
+          "sha256": "9d921193dc59f096c7416331f25dfd0ab2d027e208c4429a93c5bd357df242bf",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/llama-swap-ui/release/v4next-v47/extra/src/liliuxflow/source-message-keys.json",
+          "target": "ui/src/liliuxflow/source-message-keys.json",
+          "sha256": "6d3f1149ae9905d5d899c1c1bc1ebc9cdbf86a0f883361556c40d6bf567851a1",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/llama-swap-ui/release/v4next-v47/extra/src/liliuxflow/stats.ts",
+          "target": "ui/src/liliuxflow/stats.ts",
+          "sha256": "cd659d7b5f6cd4d2998f5220ddc3e0172f1661d067c7aaf543262ff0379b11e1",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/llama-swap-ui/release/v4next-v47/extra/src/liliuxflow/svelte.mjs",
+          "target": "ui/src/liliuxflow/svelte.mjs",
+          "sha256": "fe17365cbe07c58eb52baba88a34b30d83f5b5e86ba58fd7706e4730613a4072",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v50/llama-swap/extra/src/liliuxflow/LocalizedRelativeTime.svelte",
+          "target": "ui/src/liliuxflow/LocalizedRelativeTime.svelte",
+          "sha256": "24d37b3a67ac1159ca61ac77500b9727786d9eeb7c2347097b17511b6bc3fb73",
+          "before_sha256": null
+        },
+        {
+          "source": "patches/ui/v50/llama-swap/extra/src/liliuxflow/timeDisplay.ts",
+          "target": "ui/src/liliuxflow/timeDisplay.ts",
+          "sha256": "de84e9a49388ca87e5e51b47b5fc5d7b1748ea80ab1a46c657d684876058d881",
+          "before_sha256": null
+        }
+      ],
+      "lockfiles": [
+        {
+          "path": "ui/package-lock.json",
+          "sha256": "3b7f9a19a6b4935729f520c7f4f86e617a9e0762b429149aeed9f11fe679a8e8"
+        }
+      ],
+      "source_tree_sha256": "078c14cba253135398d69cd15e0dfb733162babe71d1bf1fc8d907f300a4b662",
+      "ui_accepted": false,
+      "supported_locales": [
+        "en",
+        "zh-Hant",
+        "zh-Hans",
+        "ja"
+      ],
+      "runtime_catalogs": [
+        {
+          "locale": "en",
+          "path": "patches/ui/v50/llama-swap/extra/src/liliuxflow/catalogs/en.json",
+          "target": "ui/src/liliuxflow/catalogs/en.json",
+          "sha256": "f82363a562a7b1ca03ce54e4d76d46f6cdf53d32556d81147ab26ecfd83e0da4",
+          "key_count": 8001
+        },
+        {
+          "locale": "zh-Hant",
+          "path": "patches/ui/v50/llama-swap/extra/src/liliuxflow/catalogs/zh-Hant.json",
+          "target": "ui/src/liliuxflow/catalogs/zh-Hant.json",
+          "sha256": "4ef1e5766a0433f5b3de2bcd5b875beaa1f255674f4a37894119f8cda22df1d2",
+          "key_count": 8001
+        },
+        {
+          "locale": "zh-Hans",
+          "path": "patches/ui/v50/llama-swap/extra/src/liliuxflow/catalogs/zh-Hans.json",
+          "target": "ui/src/liliuxflow/catalogs/zh-Hans.json",
+          "sha256": "4bd8c6ead4b401afac406ca391b9f97c8cbfc6a8319c3b4d7ea7085087fecc1d",
+          "key_count": 8001
+        },
+        {
+          "locale": "ja",
+          "path": "patches/ui/v50/llama-swap/extra/src/liliuxflow/catalogs/ja.json",
+          "target": "ui/src/liliuxflow/catalogs/ja.json",
+          "sha256": "93a7c158740bdb727a9163be427cfe4ba23e4b7fddbae461672605b84d16c35c",
+          "key_count": 8001
+        }
+      ],
+      "english_resource_policy": {
+        "runtime_resource": true,
+        "fallbackLng": false,
+        "direct_resource_completeness_required": true
+      }
+    }
+  },
+  "supported_locales": [
+    "en",
+    "zh-Hant",
+    "zh-Hans",
+    "ja"
+  ],
+  "runtime_catalog_policy": "Four direct resources per app; no Hant fallback for English",
+  "manager_source_tree_sha256": "078c14cba253135398d69cd15e0dfb733162babe71d1bf1fc8d907f300a4b662",
+  "manager_native_binary_sha256": "8a232f64cce59f5542822765fc80f78f352275d4412c16f3fa89935c2f302b94",
+  "browser_locales": [
+    "en",
+    "zh-Hant",
+    "zh-Hans",
+    "ja"
+  ],
+  "four_locale_browser_accepted": false,
+  "ui_language_source_accepted": false,
+  "full_GUI_functional_acceptance": false,
+  "samearchive_native_acceptance": false,
+  "historical_v47_language_source_review": {
+    "reviewer": "master",
+    "reviewed_date": "2026-10-02",
+    "timezone": "Asia/Hong_Kong",
+    "scope": "Exact v47 sources/resources and actual English/Hant/Hans/Japanese browser language observations in both UIs; not complete GUI workflow acceptance",
+    "GUI_create_revoke_stream_mutation_tests": "NOT_COMPLETED",
+    "current_candidate_public_screenshot_export": "BLOCKED_MAC_LOCKED_NO_WORKAROUND",
+    "fresh_30_min_same_candidate_soak": "PASS",
+    "same_immutable_archive_native_build_Q4": "NOT_RUN"
+  },
+  "source_candidate_versions": {
+    "litellm_ui": "v55",
+    "manager_ui": "v49",
+    "manager_native": "manager47"
+  },
+  "historical_source_native_reference": {
+    "source_commit": "04a43efe2c1e42caa135f88ba17c40f3627313a8",
+    "archive_sha256": "ba3e3454ece75805d60be2347980cbbe75175b3c7be702c2471a9c03139b876c",
+    "scope": "Same immutable UI50/manager47 source-candidate archive actual native build, full67payload verification and three own-caller Q4 API smoke passed. Original before-model failed-start receipt preserved; later retry passed. Version-bound reference, not new UI51 archive acceptance."
+  }
+}

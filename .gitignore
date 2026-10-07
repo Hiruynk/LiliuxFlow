@@ -1,0 +1,67 @@
+# Local credentials and machine state
+.env
+*.env
+*.key
+*.pem
+*.p12
+*.sqlite*
+*.log
+*.pid
+.DS_Store
+**/.DS_Store
+__MACOSX/
+**/__MACOSX/
+._*
+**/._*
+__pycache__/
+.pytest_cache/
+.venv/
+**/.venv/
+# Large checkpoints, binaries and generated runtime data
+models/
+runtime/
+var/
+vendor/
+*.safetensors
+*.gguf
+*.bin
+# Private run evidence, diagnostics and screenshots
+artifacts/**/raw/
+artifacts/**/runs/
+artifacts/**/ui/
+
+# Local instructions, planning, operator records and development tooling
+**/AGENTS.md
+/AGENTS*.md
+/mac_studio_llm_codex_pack/
+/llm_recovery_codex_pack/
+/liliuxflow_codex_execution_pack/
+/artifacts/
+/deployment/
+/contracts/proposals/
+/scripts/ops/
+/scripts/lily/
+/scripts/review_*.py
+/tools/qa/
+/tools/download/
+/tools/lily-a5-tokenizer/
+/config/launchd/
+/config/lily/
+/config/litellm/
+/config/llama-swap/
+
+# Retained local-only dependency closure; product directories remain available
+/contracts/*
+!/contracts/legacy-contract.md
+/scripts/*
+!/scripts/distribution/
+/tools/
+/config/*
+!/config/examples/
+/docs/productization/LICENSE_PROPOSAL.md
+/docs/productization/PRIVATE_SOURCE_FREEZE.md
+/docs/productization/STARTUP_RECOVERY.zh-Hant.md
+/services/compat/src/compat_api/main.py
+
+# Rebuildable Cloudflare edge source; runtime data remains excluded
+!/scripts/cloudflare-edge/

@@ -1,0 +1,23 @@
+{
+  "roles": {
+    "Admin": "ui.account.role.c1c224b0",
+    "Admin Viewer": "ui.account.role.fa769b18",
+    "Org Admin": "ui.account.role.1eef9046",
+    "Internal User": "ui.account.role.4a5a8d12",
+    "Internal Viewer": "ui.account.role.fbaff5b3",
+    "Internal User Viewer": "ui.account.role.2e9b2996",
+    "App Owner": "ui.account.role.8a474392",
+    "Unknown role": "ui.account.role.1db2d66a",
+    "Undefined Role": "ui.account.role.986b8f45"
+  },
+  "copy": {
+    "Hide New Feature Indicators": "ui.account.copy.48f75644",
+    "Toggle hide new feature indicators": "ui.account.copy.2f952a08",
+    "Hide All Prompts": "ui.account.copy.f5be3ed6",
+    "Toggle hide all prompts": "ui.account.copy.4296b188",
+    "Hide Blog Posts": "ui.account.copy.e53bc193",
+    "Toggle hide blog posts": "ui.account.copy.65aebd40",
+    "Hide Bouncing Icon": "ui.account.copy.af83f908",
+    "Toggle hide bouncing icon": "ui.account.copy.a78ae5e9"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "liliuxflow-edge",
+  "private": true,
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "config:check": "node scripts/config.mjs --check",
+    "config:sync": "node scripts/config.mjs --write",
+    "build:assets": "uv run --no-project --python 3.12 python ../../scripts/cloudflare-edge/static-build.py --out public --replace",
+    "build": "npm run config:check && npm run build:assets && wrangler deploy --dry-run --config wrangler.json --outdir dist",
+    "dev": "npm run config:check && wrangler dev --local --config wrangler.json",
+    "deploy": "node scripts/deployment.mjs deploy",
+    "upload": "node scripts/deployment.mjs upload",
+    "promote": "node scripts/deployment.mjs promote",
+    "config:deployment:check": "node scripts/config.mjs --deployment-check",
+    "dev:remote": "node scripts/deployment.mjs dev"
+  },
+  "devDependencies": {
+    "wrangler": "4.147.0"
+  }
+}

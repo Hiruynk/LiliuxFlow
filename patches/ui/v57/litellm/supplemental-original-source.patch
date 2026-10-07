@@ -1,0 +1,169 @@
+--- a/ui/litellm-dashboard/src/app/(dashboard)/memory/_components/MemoryEditModal.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/memory/_components/MemoryEditModal.tsx
+@@ -22,10 +22,10 @@
+ });
+ type MemoryFormValues = z.output<typeof memorySchema>;
+ const labelWithHint = (label: React.ReactNode, hint: string): React.ReactNode => (<>
+-    {label}
++    <LocalizedValue node={label} sourceDisplayChoices={{"Key": "ui.nested.source.99a52df3ff3d", "Value": "ui.admin.display.value.1320c723"}}/>
+     <Tooltip>
+       <TooltipTrigger render={<CircleHelp className="size-3.5 shrink-0 cursor-help text-muted-foreground"/>}/>
+-      <TooltipContent>{hint}</TooltipContent>
++      <TooltipContent><LocalizedValue node={hint} sourceDisplayChoices={{"Globally unique \u2014 two memories cannot share a key. Namespace your own keys if you need per-user isolation (e.g. user:123:notes).": "ui.nested.source.66fff2f932c3", "Markdown/text injected into LLM context. Plain strings are fine.": "ui.nested.source.bf663fc54135", "Optional structured metadata \u2014 must be valid JSON if provided.": "ui.nested.source.1f04aba0e3d0"}}/></TooltipContent>
+     </Tooltip>
+   </>);
+ const EMPTY_MEMORY: MemoryFormValues = { key: "", value: "", metadata: "" };
+@@ -74,11 +74,11 @@
+         <form onSubmit={(event) => event.preventDefault()} noValidate>
+           <TooltipProvider>
+             <FieldGroup>
+-              <FormField control={form.control} name="key" label={labelWithHint("Key", "Globally unique — two memories cannot share a key. Namespace your own keys if you need per-user isolation (e.g. user:123:notes).")}>
++              <FormField control={form.control} name="key" validationUiScope="memory" label={labelWithHint("Key", "Globally unique — two memories cannot share a key. Namespace your own keys if you need per-user isolation (e.g. user:123:notes).")}>
+                 {({ ref, ...field }) => (localizeProps(<Input {...field} ref={ref} placeholder="e.g. user_role" disabled={mode === "edit"}/>, { "placeholder": "ui.admin.display.e.g.user.role.04d33673" }))}
+               </FormField>
+ 
+-              <FormField control={form.control} name="value" label={labelWithHint("Value", "Markdown/text injected into LLM context. Plain strings are fine.")}>
++              <FormField control={form.control} name="value" validationUiScope="memory" label={labelWithHint("Value", "Markdown/text injected into LLM context. Plain strings are fine.")}>
+                 {({ ref, ...field }) => (localizeProps(<Textarea {...field} ref={ref} rows={8} placeholder="What the agent should remember…"/>, { "placeholder": "ui.admin.display.what.the.agent.should.remember.49e69ca8" }))}
+               </FormField>
+ 
+--- a/ui/litellm-dashboard/src/components/shared/form/FormField.tsx
++++ b/ui/litellm-dashboard/src/components/shared/form/FormField.tsx
+@@ -24,7 +24,7 @@
+ 
+ export interface FormFieldProps<TFieldValues extends FieldValues, TName extends FieldPath<TFieldValues>> {
+   control: Control<TFieldValues>;
+-  validationUiScope?: "required" | "login";
++  validationUiScope?: "required" | "login" | "memory" | "team-create";
+   name: TName;
+   label?: React.ReactNode;
+   description?: React.ReactNode;
+--- a/ui/litellm-dashboard/src/app/(dashboard)/memory/_components/MemoryView.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/memory/_components/MemoryView.tsx
+@@ -198,7 +198,7 @@
+         }} onSave={handleSave}/>
+ 
+       {/* Delete confirmation modal */}
+-      {localizeProps(<DeleteResourceModal isOpen={!!deleteRow} title="Delete memory" message="This action cannot be undone." resourceInformationTitle="Memory" resourceInformation={deleteRow
++      {localizeProps(<DeleteResourceModal isOpen={!!deleteRow} title="Delete memory" sourceDisplayChoices={{"message": {"This action cannot be undone.": "ui.admin.display.this.action.cannot.be.undone.ca8ee951"}, "resourceInformationTitle": {"Memory": "ui.admin.owner.page.c3963aed"}, "informationLabels": {"Key": "ui.nested.source.99a52df3ff3d", "Memory ID": "ui.admin.display.memory.id.f159dee1", "User ID": "ui.admin.display.user.id.3f8de0b3", "Team ID": "ui.admin.display.team.id.8c861169"}}} message="This action cannot be undone." resourceInformationTitle="Memory" resourceInformation={deleteRow
+                 ? [
+                     { label: "Key", value: deleteRow.key, code: true },
+                     { label: "Memory ID", value: deleteRow.memory_id, code: true },
+--- a/ui/litellm-dashboard/src/components/Teams.tsx
++++ b/ui/litellm-dashboard/src/components/Teams.tsx
+@@ -1,4 +1,5 @@
+ import { noticeMessage } from "@/liliuxflow/NoticeMessage";
++import { useTranslation } from "react-i18next";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { LocalizedRichText } from "@/liliuxflow/LocalizedText";
+@@ -17,7 +18,7 @@
+ import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
+ import { FormField } from "@/components/shared/form/FormField";
+ import { SearchSelect } from "@/components/shared/SearchSelect";
+-import { labelWithDocsHint, labelWithHint } from "@/components/shared/form/LabelWithHint";
++import { labelWithDocsHint as sourceLabelWithDocsHint, labelWithHint as sourceLabelWithHint } from "@/components/shared/form/LabelWithHint";
+ import { useZodForm } from "@/lib/forms/useZodForm";
+ import { TagsInput } from "@/app/(dashboard)/guardrails/_components/content_filter/TagsInput";
+ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+@@ -177,7 +178,12 @@
+     return [];
+ };
+ // @deprecated
++const teamCreateDisplayChoices={"Organization": "ui.admin.flow.entity.d764d42592", "Organizations can have multiple teams. Learn more about the user management hierarchy": "ui.nested.source.ba0ca0ec7767", "Models": "navigation.models", "These are the models that your selected team has access to. Leave empty to grant no models directly, e.g. when the team gets its models from access groups": "ui.nested.source.9b5a98604a4c", "Team Member Budget (USD)": "ui.admin.display.team.member.budget.usd.75b066ff", "This is the individual budget for a user in the team.": "ui.nested.source.c73ad26342bc", "Team Member Key Duration (eg: 1d, 1mo)": "ui.nested.source.5af38b06be56", "Set a limit to the duration of a team member's key. Format: 30s (seconds), 30m (minutes), 30h (hours), 30d (days), 1mo (month)": "ui.nested.source.b6d8d92cddcc", "Team Member RPM Limit": "ui.nested.source.0772eaccce44", "The RPM (Requests Per Minute) limit for individual team members": "ui.nested.source.1893542b58e3", "Team Member TPM Limit": "ui.nested.source.5d1b0669e869", "The TPM (Tokens Per Minute) limit for individual team members": "ui.nested.source.1b28275f13dc", "Guardrails": "navigation.guardrails", "Setup your first guardrail": "ui.nested.source.f95ef3027666", "Disable Global Guardrails": "ui.admin.display.disable.global.guardrails.218af842", "When enabled, this team will bypass any guardrails configured to run on every request (global guardrails)": "ui.nested.source.97868ad403ca", "Policies": "navigation.policies", "Apply policies to this team to control guardrails and other settings": "ui.nested.source.d71aaad52f52", "Access Groups": "navigation.accessGroups", "Assign access groups to this team. Access groups control which models, MCP servers, and agents this team can use": "ui.nested.source.d7636ac48e4b", "Allowed Vector Stores": "ui.admin.display.allowed.vector.stores.ee4da764", "Select which vector stores this team can access by default. Leave empty for access to all vector stores": "ui.nested.source.a36098ef226e", "Allowed Pass Through Routes": "ui.admin.dynamic.7db99c7cd1b3", "Premium feature - Upgrade to set allowed pass through routes": "ui.nested.source.d9e0d7a63683", "Only proxy admins can set allowed pass through routes": "ui.nested.source.a709f0cd9204", "Allowed MCP Servers": "ui.admin.display.allowed.mcp.servers.163270cd", "Select which MCP servers or access groups this team can access": "ui.nested.source.0bdbe3d29b7b", "Allowed Agents": "ui.admin.display.allowed.agents.32316c8a", "Select which agents or access groups this team can access": "ui.nested.source.51eafccd46c1", "Allowed Search Tools": "ui.nested.source.5553766d81cc", "Select which search tools this team can access. Leave empty to allow all search tools.": "ui.nested.source.2ed67540e8bf", "Allowed Skills": "ui.nested.source.595339ca7659", "Enabled skills are visible to every team. Grant disabled (private) Claude Code plugins to this team here.": "ui.nested.source.3946ff7a8465"};
++const teamCreateDisplay=(node:React.ReactNode)=><LocalizedValue node={node} sourceDisplayChoices={teamCreateDisplayChoices}/>;
++const labelWithHint=(label:React.ReactNode,hint:React.ReactNode)=>sourceLabelWithHint(teamCreateDisplay(label),teamCreateDisplay(hint));
++const labelWithDocsHint=(label:React.ReactNode,hint:React.ReactNode,href:string)=>sourceLabelWithDocsHint(teamCreateDisplay(label),teamCreateDisplay(hint),href);
+ const Teams: React.FC<TeamProps> = ({ accessToken, userID, userRole, premiumUser = false }) => {
++    const { t } = useTranslation();
+     const { data: organizationsData } = useOrganizations();
+     const organizations = organizationsData ?? null;
+     const { data: teamMetadataSchemaFields = [], isLoading: isTeamMetadataSchemaLoading } = useTeamMetadataSchema();
+@@ -240,8 +246,8 @@
+     });
+     const defaultBudgetDuration: string | undefined = defaultTeamSettings?.values?.budget_duration ?? undefined;
+     const budgetDurationPlaceholder = defaultBudgetDuration
+-        ? `Default: ${getBudgetDurationLabel(defaultBudgetDuration)} (${defaultBudgetDuration})`
+-        : "n/a";
++        ? t("ui.nested.source.0c7b2ca48714", { label: t(({ "1h": "ui.admin.display.hourly.2dd4c1b3", "24h": "ui.admin.display.daily.f4b51989", "7d": "ui.admin.display.weekly.9f20496c", "30d": "ui.admin.display.monthly.6d322f1f" } as Record<string,string>)[defaultBudgetDuration] ?? getBudgetDurationLabel(defaultBudgetDuration)), value: defaultBudgetDuration, interpolation: {escapeValue:false} })
++        : t("ui.admin.dynamic.e1bf1cc7439c");
+     // Add this useEffect to fetch guardrails
+     useEffect(() => {
+         const fetchGuardrails = async () => {
+@@ -580,7 +586,7 @@
+             <TooltipProvider>
+               <form onSubmit={form.handleSubmit(onCreateSubmit)}>
+                 <FieldGroup>
+-                  {localizeProps(<FormField control={form.control} name="team_alias" label="Team Name">
++                  {localizeProps(<FormField control={form.control} name="team_alias" validationUiScope="team-create" label="Team Name">
+                     {({ ref, value, ...field }) => (<UIInput {...field} ref={ref} value={value ?? ""} data-testid="team-name-input"/>)}
+                   </FormField>, { "label": "ui.admin.display.team.name.4b746b0b" })}
+                   {(() => {
+--- a/ui/litellm-dashboard/src/components/shared/numerical_input.tsx
++++ b/ui/litellm-dashboard/src/components/shared/numerical_input.tsx
+@@ -1,4 +1,5 @@
+ import React from "react";
++import { useTranslation } from "react-i18next";
+ import { Input } from "@/components/ui/input";
+ 
+ interface NumericalInputProps {
+@@ -24,22 +25,25 @@
+  */
+ const NumericalInput = React.forwardRef<HTMLInputElement, NumericalInputProps>(
+   (
+-    { step = 0.01, style = { width: "100%" }, placeholder = "Enter a numerical value", min, max, onChange, ...rest },
++    { step = 0.01, style = { width: "100%" }, placeholder, min, max, onChange, ...rest },
+     ref,
+-  ) => (
++  ) => {
++    const { t } = useTranslation();
++    return (
+     <Input
+       ref={ref}
+       type="number"
+       onWheel={(event) => event.currentTarget.blur()}
+       step={step}
+       style={style}
+-      placeholder={placeholder}
++      placeholder={placeholder ?? t("ui.admin.display.enter.a.numerical.value.3ef0b58e")}
+       min={min}
+       max={max}
+       onChange={onChange}
+       {...rest}
+     />
+-  ),
++  );
++  },
+ );
+ NumericalInput.displayName = "NumericalInput";
+ 
+--- a/ui/litellm-dashboard/src/components/common_components/budget_duration_dropdown.tsx
++++ b/ui/litellm-dashboard/src/components/common_components/budget_duration_dropdown.tsx
+@@ -1,5 +1,6 @@
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import React from "react";
++import {useTranslation} from "react-i18next";
+ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+ export const NEVER_RESETS_BUDGET_DURATION = "none";
+ const DURATION_LABELS: Record<string, string> = {
+@@ -18,13 +19,16 @@
+     placeholder?: string;
+     showNeverResets?: boolean;
+ }
+-const BudgetDurationDropdown: React.FC<BudgetDurationDropdownProps> = ({ id, value, onChange, className = "", style = {}, placeholder = "n/a", showNeverResets = false, }) => {
+-    return (<Select items={DURATION_LABELS} value={value || null} onValueChange={onChange}>
++const BudgetDurationDropdown: React.FC<BudgetDurationDropdownProps> = ({ id, value, onChange, className = "", style = {}, placeholder, showNeverResets = false, }) => {
++    const {t}=useTranslation();
++    const displayPlaceholder=placeholder ?? t("ui.admin.dynamic.e1bf1cc7439c");
++    const displayItems=Object.fromEntries(Object.entries({"none": "ui.admin.display.never.resets.cea90693", "1h": "ui.admin.display.hourly.2dd4c1b3", "24h": "ui.admin.display.daily.f4b51989", "7d": "ui.admin.display.weekly.9f20496c", "30d": "ui.admin.display.monthly.6d322f1f"}).map(([value,key])=>[value,t(key)]));
++    return (<Select items={displayItems} value={value || null} onValueChange={onChange}>
+       <SelectTrigger id={id} className={`w-full ${className}`} style={style}>
+-        <SelectValue placeholder={placeholder}/>
++        <SelectValue placeholder={displayPlaceholder}/>
+       </SelectTrigger>
+       <SelectContent>
+-        <SelectItem value={null}>{placeholder}</SelectItem>
++        <SelectItem value={null}>{displayPlaceholder}</SelectItem>
+         {showNeverResets ? <SelectItem value={NEVER_RESETS_BUDGET_DURATION}><LocalizedText id="ui.admin.display.never.resets.cea90693"/></SelectItem> : null}
+         <SelectItem value="1h"><LocalizedText id="ui.admin.display.hourly.2dd4c1b3"/></SelectItem>
+         <SelectItem value="24h"><LocalizedText id="ui.admin.display.daily.f4b51989"/></SelectItem>

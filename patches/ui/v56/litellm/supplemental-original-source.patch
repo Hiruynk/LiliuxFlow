@@ -1,0 +1,21 @@
+--- a/ui/litellm-dashboard/src/app/(dashboard)/memory/_components/MemoryTable.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/memory/_components/MemoryTable.tsx
+@@ -1,4 +1,5 @@
+ "use client";
++import { useTranslation } from "react-i18next";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { OnChangeFn, PaginationState } from "@tanstack/react-table";
+@@ -39,10 +40,11 @@
+     </div>);
+ }
+ export function MemoryTable({ data, isLoading, rowCount, pagination, onPaginationChange, searchValue, onSearchChange, isRefreshing, onRefresh, hasActiveSearch, onViewClick, onEditClick, onDeleteClick, }: MemoryTableProps) {
++    const { t } = useTranslation();
+     const columns = useMemo(() => {
+         const columnDeps = { onViewClick, onEditClick, onDeleteClick };
+         return getMemoryTableColumns(columnDeps);
+     }, [onViewClick, onEditClick, onDeleteClick]);
+-    return (localizeProps(<DataTable data={data} columns={columns} getRowId={(row) => row.memory_id} paginationMode="server" pagination={pagination} onPaginationChange={onPaginationChange} rowCount={rowCount} isLoading={isLoading} loadingMessage="Loading memories…" noDataMessage={<MemoryEmptyState hasActiveSearch={hasActiveSearch}/>} size="compact" toolbar={(table) => (<DataTableToolbar table={table} searchValue={searchValue} onSearchChange={onSearchChange} searchPlaceholder="Search by key prefix or memory ID…" onRefresh={onRefresh} isRefreshing={isRefreshing} showViewOptions={false}/>)}/>, { "loadingMessage": "ui.displayContract.bf187332928a" }));
++    return (localizeProps(<DataTable data={data} columns={columns} getRowId={(row) => row.memory_id} paginationMode="server" pagination={pagination} onPaginationChange={onPaginationChange} rowCount={rowCount} isLoading={isLoading} loadingMessage="Loading memories…" noDataMessage={<MemoryEmptyState hasActiveSearch={hasActiveSearch}/>} size="compact" toolbar={(table) => (<DataTableToolbar table={table} searchValue={searchValue} onSearchChange={onSearchChange} searchPlaceholder={t("ui.memory.searchPlaceholder")} onRefresh={onRefresh} isRefreshing={isRefreshing} showViewOptions={false}/>)}/>, { "loadingMessage": "ui.displayContract.bf187332928a" }));
+ }
+ export default MemoryTable;

@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "first_party_license": "Apache-2.0",
+  "first_party_license_adopted": true,
+  "new_third_party_terms_accepted": false,
+  "first_party_license_file": {
+    "path": "LICENSE",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "bytes": 11358,
+    "source_url": "https://www.apache.org/licenses/LICENSE-2.0.txt"
+  },
+  "first_party_notice_file": {
+    "path": "NOTICE",
+    "sha256": "26d3c166a3446254b39332b1baaee64d9be5a0a13bf01ee46db22c20c4ace90e",
+    "bytes": 4047
+  },
+  "files": [
+    {
+      "component": "lily",
+      "path": "docs/productization/licenses/lily/LICENSE",
+      "sha256": "b9e2b50a48a09fb39dafa71ab1a11a6e87389addda17faa99d55f5f74a0001ac",
+      "bytes": 11350,
+      "upstream_path": "LICENSE",
+      "source_identity": {
+        "repository": "fabiogreter/lily-qwen3.8-flash-next",
+        "commit": "db3f8a7cdb33f1e88b68c6889331abd31098c923",
+        "archive_sha256": "fb2a1029a17d499ab051763a124ee8cbcd8ada133f6273527ed3cb03a41c6e10"
+      }
+    },
+    {
+      "component": "lily",
+      "path": "docs/productization/licenses/lily/NOTICE",
+      "sha256": "7a01e666044fb8aca1fd88c636bca43bcc95b8b1fecbe101dce4c7c80fbb5759",
+      "bytes": 2543,
+      "upstream_path": "NOTICE",
+      "source_identity": {
+        "repository": "fabiogreter/lily-qwen3.8-flash-next",
+        "commit": "db3f8a7cdb33f1e88b68c6889331abd31098c923",
+        "archive_sha256": "fb2a1029a17d499ab051763a124ee8cbcd8ada133f6273527ed3cb03a41c6e10"
+      }
+    },
+    {
+      "component": "litellm",
+      "path": "docs/productization/licenses/litellm/LICENSE",
+      "sha256": "b170d6bf8e8835dd357e011681db028f4d51e2fb0ea892058f56e01fb39b8273",
+      "bytes": 1419,
+      "upstream_path": "LICENSE",
+      "source_identity": {
+        "repository": "BerriAI/litellm",
+        "commit": "d09bbae1c6df463e425558f60d460437193635da",
+        "archive_sha256": "cd5dfb9f53d4d7f91c443ed78b4609f8fea4854a7f5683c5b8eefec53bb582e3"
+      }
+    },
+    {
+      "component": "llama_swap",
+      "path": "docs/productization/licenses/llama_swap/LICENSE.md",
+      "sha256": "59dd69286f9e933cb08e043b903f41cec7e4e66c1a9e502d3c9f7c2481b46cd2",
+      "bytes": 1075,
+      "upstream_path": "LICENSE.md",
+      "source_identity": {
+        "repository": "mostlygeek/llama-swap",
+        "commit": "fcefa7b7bebc326790937bbebc32ae87a958747c",
+        "archive_sha256": "7d4d0695a38e958faec2c022763e624372cc996d48c06ce8517a2ac9ab0830e5"
+      }
+    },
+    {
+      "component": "i18next",
+      "path": "docs/productization/licenses/i18next/LICENSE",
+      "sha256": "1cd0a2b02a6cc40ef8ee16310d13eeffdd7b5de4a562fd3ee7c921d8eb54f60a",
+      "bytes": 1082,
+      "upstream_path": "LICENSE",
+      "source_identity": {
+        "version": "26.4.2",
+        "npm_integrity": "sha512-RX+R0VLg13IbvRuJSxnqykUFS9vQZTl8wYpWPCIUDWVrSGjsQywB5Y+pjzrkboxGAuYfJZVH1InFTdgBdxq6ug==",
+        "artifact": "existing npm-ci installation from exact lock; no new dependency install"
+      }
+    },
+    {
+      "component": "react-i18next",
+      "path": "docs/productization/licenses/react-i18next/LICENSE",
+      "sha256": "29b8ae456ef442e53a98df183ad088cf98c2ece73aa84c462330c43e665b8ab2",
+      "bytes": 1083,
+      "upstream_path": "LICENSE",
+      "source_identity": {
+        "version": "17.0.15",
+        "npm_integrity": "sha512-7uYpx/oBkesLto7cOzOmfITlUBaXHCAcFahmgETMfWr8nbbWRRnVGvz8wsH/xpbNcyoH+NpCcnOQEqWPMO6/hw==",
+        "artifact": "existing npm-ci installation from exact lock; no new dependency install"
+      }
+    },
+    {
+      "component": "moment",
+      "path": "docs/productization/licenses/moment/LICENSE",
+      "sha256": "8f38f320bbf5eb84c08e08676f7ee1d2204ebe5797f6a090d077329cf212fca3",
+      "bytes": 1075,
+      "upstream_path": "LICENSE",
+      "source_identity": {
+        "version": "2.30.1",
+        "npm_integrity": "sha512-uEmtNhbDOrWPFS+hdjFCBfy9f2YoyzRpwcl+DqpC6taX21FzsTLQVbMV/W7PzNSX6x/bhC1zA3c2UQ5NzH6how==",
+        "artifact": "existing npm-ci installation from exact lock; no new dependency install"
+      }
+    },
+    {
+      "component": "gitleaks",
+      "path": "docs/productization/licenses/gitleaks/LICENSE",
+      "sha256": "e3884b252b3bfc045e55be43a34d1e80da070bc6f804ac95bf4660e97d62ebc6",
+      "bytes": 1069,
+      "upstream_path": "LICENSE",
+      "source_identity": {
+        "version": "8.30.1",
+        "archive_sha256": "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5"
+      }
+    },
+    {
+      "component": "syft",
+      "path": "docs/productization/licenses/syft/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "bytes": 11357,
+      "upstream_path": "LICENSE",
+      "source_identity": {
+        "version": "1.52.0",
+        "archive_sha256": "014d561b6d13059124155f74a6c5a9a99501f5e209313638dd884f39eb418ee6"
+      }
+    },
+    {
+      "component": "go",
+      "path": "docs/productization/licenses/go/LICENSE",
+      "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad",
+      "bytes": 1453,
+      "upstream_path": "LICENSE",
+      "source_identity": {
+        "version": "1.27.1",
+        "archive_sha256": "ee215d57e0ec269c60cc9ceca68e6bda321ba9ee5afe24f4b0988703c2d87d12",
+        "url": "https://go.dev/dl/go1.27.1.darwin-arm64.tar.gz"
+      }
+    },
+    {
+      "component": "actions-checkout",
+      "path": "docs/productization/licenses/actions-checkout/LICENSE",
+      "sha256": "3e855ffa704114a51628ef8f0bf3aeb41728adf9d9070e263bf58aa5640b0eb5",
+      "bytes": 1097,
+      "upstream_path": "LICENSE",
+      "source_identity": {
+        "repository": "actions/checkout",
+        "commit": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "version": "v7",
+        "transport": "authenticated read-only public GitHub contents API"
+      }
+    },
+    {
+      "component": "checkpoint",
+      "path": "docs/productization/MODEL_LICENSE.txt",
+      "sha256": "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08",
+      "bytes": 3235,
+      "upstream_path": "LICENSE",
+      "source_identity": {
+        "revision": "afde8b8e824c57bfe264c2ef3f9396537249979f",
+        "repository": "fabiogreter/Qwen3.8-Flash-Next-lily-q4",
+        "weights_distributed": false
+      }
+    },
+    {
+      "component": "instrument-sans",
+      "path": "assets/welcome/fonts/OFL.txt",
+      "sha256": "9e27a72ed30eb49a08678f6a5d6ed98ec7ba5368f541637ee0683ec9134ef966",
+      "bytes": 4403,
+      "upstream_path": "ofl/instrumentsans/OFL.txt",
+      "source_identity": {
+        "repository": "google/fonts",
+        "commit": "2fc9491da70cf3e1bafd3c3da49244c5a496e9d5",
+        "npm_package": "@fontsource-variable/instrument-sans",
+        "version": "5.3.0",
+        "font_sha256": "2ee17598a98d8a59e4df8152d015bec9ab8e4d5672cc0ab42bef806b568e3971"
+      }
+    }
+  ],
+  "litellm_enterprise_reference": {
+    "enterprise_tree_present": true,
+    "root_license_reference": "enterprise/LICENSE",
+    "referenced_license_file_present_in_pinned_archive": false,
+    "enterprise_rights_asserted": false
+  },
+  "full_runtime_transitive_notices": "PENDING_FINAL_NATIVE_BUILD",
+  "SBOM_scope": "source dependencies only until final installed-candidate inventory",
+  "source_archive": "NOT_CREATED"
+}

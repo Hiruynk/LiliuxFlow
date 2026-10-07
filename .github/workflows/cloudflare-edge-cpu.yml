@@ -1,0 +1,46 @@
+name: Cloudflare edge CPU checks
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "services/cloudflare-edge/**"
+      - "scripts/cloudflare-edge/**"
+      - "assets/welcome/**"
+      - ".github/workflows/cloudflare-edge-cpu.yml"
+  pull_request:
+    paths:
+      - "services/cloudflare-edge/**"
+      - "scripts/cloudflare-edge/**"
+      - "assets/welcome/**"
+      - ".github/workflows/cloudflare-edge-cpu.yml"
+permissions:
+  contents: read
+jobs:
+  edge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          lfs: false
+          submodules: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24"
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
+      - name: Validate source, guard and bounded builder (no backend/model requests)
+        run: |
+          node --test services/cloudflare-edge/test/*.test.mjs
+          node services/cloudflare-edge/scripts/config.mjs --check
+          node scripts/cloudflare-edge/test-frontend.mjs
+          uv run --no-project --python 3.12 python scripts/cloudflare-edge/test-static-build.py
+          uv run --no-project --python 3.12 python scripts/cloudflare-edge/test_check_live.py
+      - name: Build without deploying or authentication
+        working-directory: services/cloudflare-edge
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          npm ci
+          npm run build

@@ -1,0 +1,443 @@
+diff --git a/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/EntityUsage/EntityUsage.tsx b/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/EntityUsage/EntityUsage.tsx
+--- a/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/EntityUsage/EntityUsage.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/EntityUsage/EntityUsage.tsx
+@@ -462,7 +462,7 @@
+               </h3>
+               <ModelViewToggle value={modelViewType} onChange={setModelViewType}/>
+             </div>
+-            <TopModelView topModels={getTopModels(spendData.results, modelBreakdownKey, topModelsLimit)} topModelsLimit={topModelsLimit} setTopModelsLimit={setTopModelsLimit}/>
++            <TopModelView currentModelNames topModels={getTopModels(spendData.results, modelBreakdownKey, topModelsLimit)} topModelsLimit={topModelsLimit} setTopModelsLimit={setTopModelsLimit}/>
+           </CardContent>
+         </ShadcnCard>
+       </div>
+@@ -506,7 +506,7 @@
+           <div className="flex justify-end mt-2 mb-4">
+             <ModelViewToggle value={modelViewType} onChange={setModelViewType}/>
+           </div>
+-          <ActivityMetrics modelMetrics={modelMetrics} hidePromptCachingMetrics={entityType === "agent"}/>
++          <ActivityMetrics modelMetrics={modelMetrics} currentModelNames hidePromptCachingMetrics={entityType === "agent"}/>
+         </>),
+         },
+         ...(showAgentBreakdown
+diff --git a/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/EntityUsage/TopModelView.tsx b/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/EntityUsage/TopModelView.tsx
+--- a/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/EntityUsage/TopModelView.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/EntityUsage/TopModelView.tsx
+@@ -1,3 +1,4 @@
++import {publicModelLabel} from "@/liliuxflow/PublicModelLabel";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { BarChart } from "@/components/shared/charts";
+@@ -15,17 +16,18 @@
+ };
+ interface TopModelViewProps {
+     topModels: TopModel[];
++    currentModelNames?: boolean;
+     topModelsLimit: number;
+     setTopModelsLimit: (limit: number) => void;
+ }
+ export const TOP_MODEL_LIMITS = [5, 10, 25, 50];
+-export default function TopModelView({ topModels, topModelsLimit, setTopModelsLimit }: TopModelViewProps) {
++export default function TopModelView({ topModels, topModelsLimit, setTopModelsLimit, currentModelNames = false }: TopModelViewProps) {
+     const [modelViewMode, setModelViewMode] = useState<"chart" | "table">("table");
+     const columns = [
+         {
+             header: "Model",
+             accessorKey: "key",
+-            cell: (info: any) => info.getValue() || "-",
++            cell: (info: any) => (currentModelNames ? publicModelLabel(info.getValue()) : info.getValue()) || "-",
+         },
+         {
+             header: "Spend (USD)",
+@@ -70,7 +72,7 @@
+         </Tabs>
+       </div>
+       {modelViewMode === "chart" ? (<div className="relative max-h-[600px] overflow-y-auto">
+-          <BarChart className="mt-4 cursor-pointer hover:opacity-90" style={{ height: Math.min(processedTopModels.length, topModelsLimit) * 52 }} data={processedTopModels} index="key" categories={["spend"]} colors={["cyan"]} valueFormatter={(value) => `$${formatNumberWithCommas(value, 2)}`} layout="vertical" yAxisWidth={200} tickGap={5} showLegend={false}/>
++          <BarChart className="mt-4 cursor-pointer hover:opacity-90" style={{ height: Math.min(processedTopModels.length, topModelsLimit) * 52 }} data={processedTopModels.map((row) => ({...row, publicModelLabel: currentModelNames ? publicModelLabel(row.key) : row.key}))} index="publicModelLabel" categories={["spend"]} colors={["cyan"]} valueFormatter={(value) => `$${formatNumberWithCommas(value, 2)}`} layout="vertical" yAxisWidth={200} tickGap={5} showLegend={false}/>
+         </div>) : (<DataTable columns={columns} data={processedTopModels} isLoading={false} maxBodyHeight={600} size="compact"/>)}
+     </>);
+ }
+diff --git a/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/UsagePageView.tsx b/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/UsagePageView.tsx
+--- a/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/UsagePageView.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/UsagePageView.tsx
+@@ -1,3 +1,4 @@
++import {publicModelLabel} from "@/liliuxflow/PublicModelLabel";
+ import {SourceChartDisplay} from "@/liliuxflow/SourceChartDisplay";
+ import { LocalizedDateValue } from "@/liliuxflow/LocalizedDateValue";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+@@ -669,12 +670,12 @@
+                           {loading ? (<ChartLoader isDateChanging={isDateChanging}/>) : (<div className="relative max-h-[600px] overflow-y-auto">
+                               {(() => {
+                     const modelData = modelViewType === "groups" ? topModelGroups : topModels;
+-                    return (<BarChart className="mt-4" style={{ height: Math.min(modelData.length, topModelsLimit) * 52 }} data={modelData} index="key" categories={["spend"]} colors={["cyan"]} valueFormatter={valueFormatterSpend} layout="vertical" yAxisWidth={200} showLegend={false} customTooltip={({ payload, active }) => {
++                    return (<BarChart className="mt-4" style={{ height: Math.min(modelData.length, topModelsLimit) * 52 }} data={modelData.map((row) => ({...row, publicModelLabel: publicModelLabel(row.key)}))} index="publicModelLabel" categories={["spend"]} colors={["cyan"]} valueFormatter={valueFormatterSpend} layout="vertical" yAxisWidth={200} showLegend={false} customTooltip={({ payload, active }) => {
+                             if (!active || !payload?.[0])
+                                 return null;
+                             const data = payload[0].payload;
+                             return (<div className="bg-card p-4 shadow-lg rounded-lg border">
+-                                          <p className="font-bold">{data.key}</p>
++                                          <p className="font-bold">{publicModelLabel(data.key)}</p>
+                                           <p className="text-info"><LocalizedRichText id="ui.admin.rich.f8c1851979a4" components={{ "value0": <LocalizedValue node={formatNumberWithCommas(data.spend, 2)}/> }}/></p>
+                                           <p className="text-muted-foreground"><LocalizedRichText id="ui.admin.rich.48b3f7d32e07" components={{ "value0": <LocalizedValue node={data.requests.toLocaleString()}/> }}/></p>
+                                           <p className="text-success"><LocalizedRichText id="ui.admin.rich.a6384c085da3" components={{ "value0": <LocalizedValue node={data.successful_requests.toLocaleString()}/> }}/></p>
+@@ -702,7 +703,7 @@
+                   <div className="flex justify-end mt-2 mb-4">
+                     <ModelViewToggle value={modelViewType} onChange={setModelViewType}/>
+                   </div>
+-                  <ActivityMetrics modelMetrics={modelMetrics}/>
++                  <ActivityMetrics modelMetrics={modelMetrics} currentModelNames/>
+                 </TabsContent>
+                 <TabsContent value="keys" keepMounted>
+                   <KeyActivityPanel keyMetrics={keyMetrics}/>
+diff --git a/ui/litellm-dashboard/src/components/SidebarAccountMenu/SidebarAccountMenu.tsx b/ui/litellm-dashboard/src/components/SidebarAccountMenu/SidebarAccountMenu.tsx
+--- a/ui/litellm-dashboard/src/components/SidebarAccountMenu/SidebarAccountMenu.tsx
++++ b/ui/litellm-dashboard/src/components/SidebarAccountMenu/SidebarAccountMenu.tsx
+@@ -1,8 +1,9 @@
++import { brandAssets } from "@/liliuxflow/brandAssets";
++import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { LocalizedRichText } from "@/liliuxflow/LocalizedText";
+ import { LocalizedValue } from "@/liliuxflow/LocalizedText";
+ import useAuthorized from "@/app/(dashboard)/hooks/useAuthorized";
+-import { useHealthReadinessDetails } from "@/app/(dashboard)/hooks/healthReadiness/useHealthReadinessDetails";
+ import { useDisableBlogPosts } from "@/app/(dashboard)/hooks/useDisableBlogPosts";
+ import { useDisableBouncingIcon } from "@/app/(dashboard)/hooks/useDisableBouncingIcon";
+ import { useDisableShowNewBadge } from "@/app/(dashboard)/hooks/useDisableShowNewBadge";
+@@ -19,7 +20,6 @@
+ import { cn } from "@/lib/cva.config";
+ import { ChevronsUpDown, Crown, IdCard, LogOut, Mail, ShieldCheck } from "lucide-react";
+ import React from "react";
+-const RELEASE_NOTES_URL = "https://docs.litellm.ai/release_notes";
+ function hueFromString(seed: string): number {
+     let h = 0;
+     for (let i = 0; i < seed.length; i += 1) {
+@@ -76,9 +76,8 @@
+     collapsed?: boolean;
+ }
+ const SidebarAccountMenu: React.FC<SidebarAccountMenuProps> = ({ onLogout, collapsed = false }) => {
+-    const { userId, userEmail, userRoleLabel: userRole, premiumUser, accessToken } = useAuthorized();
+-    const { data: healthData } = useHealthReadinessDetails(accessToken);
+-    const version = healthData?.litellm_version;
++    const { userId, userEmail, userRoleLabel: userRole, premiumUser } = useAuthorized();
++
+     const disableShowPrompts = useDisableShowPrompts();
+     const disableBlogPosts = useDisableBlogPosts();
+     const disableBouncingIcon = useDisableBouncingIcon();
+@@ -145,14 +144,8 @@
+ 
+       <PopoverContent side="top" align="start" sideOffset={8} className="w-[268px] gap-0 overflow-hidden p-0" data-testid="sidebar-account-menu-panel">
+         <div className="flex items-center gap-2 border-b border-border px-3 py-3">
+-          <span className="text-[15px] font-bold tracking-tight text-foreground">LiteLLM</span>
+-          {!disableBouncingIcon && (localizeProps(<span className="animate-bounce text-lg leading-none" style={{ animationDuration: "2s" }} title="Thanks for using LiteLLM!" aria-hidden>
+-              🌴
+-            </span>, { "title": "ui.admin.display.thanks.for.using.litellm.35563b56" }))}
+-          <span className="flex-1"/>
+-          {version && (<Badge variant="outline" render={<a href={RELEASE_NOTES_URL} target="_blank" rel="noopener noreferrer"/>} className="px-1.5 py-0 font-mono text-[10px] font-medium text-muted-foreground">
+-              v{version}
+-            </Badge>)}
++          <img src={brandAssets.mark} alt="" aria-hidden className="size-5 dark:brightness-0 dark:invert"/>
++          <span className="text-[15px] font-bold tracking-tight text-foreground"><LocalizedText id="brand.name"/></span>
+         </div>
+ 
+         <div className="flex flex-col px-3 py-2">
+diff --git a/ui/litellm-dashboard/src/components/UsagePage/components/KeyModelUsageView.tsx b/ui/litellm-dashboard/src/components/UsagePage/components/KeyModelUsageView.tsx
+--- a/ui/litellm-dashboard/src/components/UsagePage/components/KeyModelUsageView.tsx
++++ b/ui/litellm-dashboard/src/components/UsagePage/components/KeyModelUsageView.tsx
+@@ -1,3 +1,4 @@
++import {publicModelLabel} from "@/liliuxflow/PublicModelLabel";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { BarChart } from "@/components/shared/charts";
+ import { DataTable } from "@/components/shared/DataTable";
+@@ -17,7 +18,7 @@
+     {
+         header: "Model",
+         accessorKey: "model",
+-        cell: ({ row }) => row.original.model || "-",
++        cell: ({ row }) => publicModelLabel(row.original.model) || "-",
+         meta: {
+             liliuxflowHeaderKey: "ui.admin.display.model.d2e4b004"
+         }
+@@ -76,7 +77,7 @@
+       </CardHeader>
+       <CardContent>
+         {viewMode === "chart" ? (<div className="max-h-[234px] overflow-y-auto">
+-            <BarChart style={{ height: topModels.length * 40 }} data={topModels.map((m) => ({ key: m.model, spend: m.spend }))} index="key" categories={["spend"]} colors={["cyan"]} valueFormatter={(value) => `$${formatNumberWithCommas(value, 2)}`} layout="vertical" yAxisWidth={180} tickGap={5} showLegend={false}/>
++            <BarChart style={{ height: topModels.length * 40 }} data={topModels.map((m) => ({ key: m.model, publicModelLabel: publicModelLabel(m.model), spend: m.spend }))} index="publicModelLabel" categories={["spend"]} colors={["cyan"]} valueFormatter={(value) => `$${formatNumberWithCommas(value, 2)}`} layout="vertical" yAxisWidth={180} tickGap={5} showLegend={false}/>
+           </div>) : (<DataTable columns={columns} data={topModels} getRowId={(row) => row.model} maxBodyHeight={COMPACT_TABLE_HEADER_HEIGHT + VISIBLE_ROWS * COMPACT_TABLE_ROW_HEIGHT} size="compact"/>)}
+       </CardContent>
+     </Card>);
+diff --git a/ui/litellm-dashboard/src/components/activity_metrics.tsx b/ui/litellm-dashboard/src/components/activity_metrics.tsx
+--- a/ui/litellm-dashboard/src/components/activity_metrics.tsx
++++ b/ui/litellm-dashboard/src/components/activity_metrics.tsx
+@@ -1,3 +1,4 @@
++import {publicModelLabel} from "@/liliuxflow/PublicModelLabel";
+ import {SourceChartDisplay} from "@/liliuxflow/SourceChartDisplay";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { LocalizedRichText } from "@/liliuxflow/LocalizedText";
+@@ -17,6 +18,7 @@
+ interface ActivityMetricsProps {
+     modelMetrics: Record<string, ModelActivityData>;
+     hidePromptCachingMetrics?: boolean;
++    currentModelNames?: boolean;
+ }
+ const ModelSection = ({ modelName, metrics, hidePromptCachingMetrics = false, }: {
+     modelName: string;
+@@ -158,7 +160,7 @@
+       </CollapsibleContent>
+     </Collapsible>);
+ };
+-export const ActivityMetrics: React.FC<ActivityMetricsProps> = ({ modelMetrics, hidePromptCachingMetrics = false }) => {
++export const ActivityMetrics: React.FC<ActivityMetricsProps> = ({ modelMetrics, hidePromptCachingMetrics = false, currentModelNames = false }) => {
+     const modelNames = Object.keys(modelMetrics).sort((a, b) => {
+         if (a === "")
+             return 1;
+@@ -285,7 +287,7 @@
+       <div className="rounded-lg border">
+         {modelNames.map((modelName) => (<ModelCollapsible key={modelName} defaultOpen={modelName === modelNames[0]} header={<div className="flex justify-between items-center w-full">
+                 <h3 className="text-lg font-medium text-foreground">
+-                  {modelMetrics[modelName].label || <LocalizedText id="ui.admin.dynamic.ba67866982f8"/>}
++                  {(currentModelNames ? publicModelLabel(modelMetrics[modelName].label) : modelMetrics[modelName].label) || <LocalizedText id="ui.admin.dynamic.ba67866982f8"/>}
+                 </h3>
+                 <div className="flex space-x-4 text-sm text-muted-foreground">
+                   <span>${formatNumberWithCommas(modelMetrics[modelName].total_spend, 2)}</span>
+diff --git a/ui/litellm-dashboard/src/components/leftnav.tsx b/ui/litellm-dashboard/src/components/leftnav.tsx
+--- a/ui/litellm-dashboard/src/components/leftnav.tsx
++++ b/ui/litellm-dashboard/src/components/leftnav.tsx
+@@ -1,3 +1,4 @@
++import { brandAssets } from "@/liliuxflow/brandAssets";
+ import displayMap from "@/liliuxflow/final-nav-display-map.json";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { LocalizedRichText } from "@/liliuxflow/LocalizedText";
+@@ -5,7 +6,6 @@
+ import { useTeams } from "@/app/(dashboard)/hooks/teams/useTeams";
+ import useAuthorized from "@/app/(dashboard)/hooks/useAuthorized";
+ import useIsOrgAdmin from "@/app/(dashboard)/hooks/useIsOrgAdmin";
+-import { useHealthReadinessDetails } from "@/app/(dashboard)/hooks/healthReadiness/useHealthReadinessDetails";
+ import { useLogout } from "@/app/(dashboard)/hooks/useLogout";
+ import { getProxyBaseUrl } from "@/components/networking";
+ import { useTheme } from "@/contexts/ThemeContext";
+@@ -353,10 +353,10 @@
+     const { data: teams } = useTeams();
+     const { logoUrl, logoUrlDark } = useTheme();
+     const [erroredDarkLogo, setErroredDarkLogo] = useState<string | null>(null);
+-    const { data: healthData } = useHealthReadinessDetails(accessToken);
++
+     const logout = useLogout(accessToken);
+     const baseUrl = getProxyBaseUrl();
+-    const version = healthData?.litellm_version;
++
+     const currentRoute = routeForPathname(usePathname());
+     const selectedKey = findMenuItemKey(currentRoute);
+     const [openGroups, setOpenGroups] = useState<Set<string>>(() => {
+@@ -472,20 +472,18 @@
+           </SidebarMenuSub>)}
+       </SidebarMenuItem>);
+     };
+-    const logoSrc = logoUrl || `${baseUrl}/get_image`;
++    const logoSrc = logoUrl || brandAssets.light;
+     const reachableDarkLogo = logoUrlDark === erroredDarkLogo ? null : logoUrlDark;
+-    const darkLogoSrc = reachableDarkLogo || logoUrl || `${baseUrl}/get_image?theme=dark`;
++    const darkLogoSrc = reachableDarkLogo || logoUrl || brandAssets.dark;
+     return (<Sidebar collapsed={collapsed}>
+       <SidebarHeader className="h-14 border-b border-border group-data-[collapsed=true]/sidebar:h-auto">
+         <div className="flex items-center justify-between gap-2 group-data-[collapsed=true]/sidebar:flex-col">
+           <div className="flex min-w-0 items-center gap-2">
+-            {localizeProps(<Link href={uiHref("")} className="flex min-w-0 items-center" aria-label="LiteLLM home">
+-              <img src={logoSrc} alt="LiteLLM" className={cn(LOGO_CLASS_NAME, "dark:hidden")}/>
++            {localizeProps(<Link href={uiHref("")} className="flex min-w-0 items-center" aria-label="LiliuxFlow home">
++              {localizeProps(<img src={logoSrc} alt="LiliuxFlow" className={cn(LOGO_CLASS_NAME, "dark:hidden")}/>, { "alt": "brand.name" })}
+               <img src={darkLogoSrc} alt="" aria-hidden onError={() => setErroredDarkLogo(logoUrlDark)} className={cn(LOGO_CLASS_NAME, "hidden dark:block")}/>
+-            </Link>, { "aria-label": "ui.admin.display.litellm.home.33e0a804" })}
+-            {version && (<Badge variant="outline" render={<a href="https://docs.litellm.ai/release_notes" target="_blank" rel="noopener noreferrer"/>} className="px-1.5 py-0 font-mono text-[10px] font-medium text-muted-foreground group-data-[collapsed=true]/sidebar:hidden">
+-                v{version}
+-              </Badge>)}
++            </Link>, { "aria-label": "brand.home" })}
++
+           </div>
+           {onToggleCollapsed && (localizeProps(<Button variant="ghost" size="icon-sm" onClick={onToggleCollapsed} aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} className="flex-none text-muted-foreground">
+               {collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
+diff --git a/ui/litellm-dashboard/src/components/navbar.tsx b/ui/litellm-dashboard/src/components/navbar.tsx
+--- a/ui/litellm-dashboard/src/components/navbar.tsx
++++ b/ui/litellm-dashboard/src/components/navbar.tsx
+@@ -1,8 +1,7 @@
+ "use client";
++import { brandAssets } from "@/liliuxflow/brandAssets";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { LanguageSelector } from "@/liliuxflow/LanguageSelector";
+-import { useHealthReadinessDetails } from "@/app/(dashboard)/hooks/healthReadiness/useHealthReadinessDetails";
+-import { useDisableBouncingIcon } from "@/app/(dashboard)/hooks/useDisableBouncingIcon";
+ import { useDisableShowPrompts } from "@/app/(dashboard)/hooks/useDisableShowPrompts";
+ import { useWorker } from "@/hooks/useWorker";
+ import { getProxyBaseUrl } from "@/components/networking";
+@@ -11,7 +10,6 @@
+ import { clearTokenCookies } from "@/utils/cookieUtils";
+ import { clearStoredReturnUrl, getLoginUrl } from "@/utils/returnUrlUtils";
+ import useProxySettings from "@/app/(dashboard)/hooks/proxySettings/useProxySettings";
+-import { Badge } from "@/components/ui/badge";
+ import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+ import Link from "next/link";
+ import React from "react";
+@@ -35,14 +33,12 @@
+     const baseUrl = getProxyBaseUrl();
+     const proxySettings = useProxySettings(accessToken);
+     const { logoUrl, logoUrlDark } = useTheme();
+-    const { data: healthData } = useHealthReadinessDetails(accessToken);
+-    const version = healthData?.litellm_version;
+-    const disableBouncingIcon = useDisableBouncingIcon();
++
+     const hideCommunityLinks = useDisableShowPrompts();
+     const { isControlPlane, selectedWorker } = useWorker();
+     const showWorkerSwitch = isControlPlane && selectedWorker !== null;
+-    const imageUrl = logoUrl || `${baseUrl}/get_image`;
+-    const darkImageUrl = logoUrlDark || logoUrl || `${baseUrl}/get_image?theme=dark`;
++    const imageUrl = logoUrl || brandAssets.light;
++    const darkImageUrl = logoUrlDark || logoUrl || brandAssets.dark;
+     const handleLogout = () => {
+         clearTokenCookies();
+         localStorage.removeItem("litellm_selected_worker_id");
+@@ -70,21 +66,12 @@
+               <Link href={uiHref("")} className="flex items-center">
+                 <div className="relative">
+                   <div className="flex h-10 max-w-48 items-center justify-center overflow-hidden">
+-                    {localizeProps(<img src={imageUrl} alt="LiteLLM Brand" className={cn(NAV_LOGO_CLASS_NAME, "dark:hidden")}/>, { "alt": "brand.name" })}
++                    {localizeProps(<img src={imageUrl} alt="LiliuxFlow" className={cn(NAV_LOGO_CLASS_NAME, "dark:hidden")}/>, { "alt": "brand.name" })}
+                     <img src={darkImageUrl} alt="" aria-hidden className={cn(NAV_LOGO_CLASS_NAME, "hidden dark:block")}/>
+                   </div>
+                 </div>
+               </Link>
+-              {version && (<div className="relative">
+-                  {!disableBouncingIcon && (localizeProps(<span className="absolute -left-2 -top-1 animate-bounce text-lg" style={{ animationDuration: "2s" }} title="Thanks for using LiteLLM!">
+-                      🌑
+-                    </span>, { "title": "ui.admin.display.thanks.for.using.litellm.35563b56" }))}
+-                  <Badge variant="outline" className="relative z-raised cursor-pointer text-xs font-medium">
+-                    <a href="https://docs.litellm.ai/release_notes" target="_blank" rel="noopener noreferrer" className="shrink-0">
+-                      v{version}
+-                    </a>
+-                  </Badge>
+-                </div>)}
++
+             </div>
+           </div>
+ 
+diff --git a/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/DrawerHeader.tsx b/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/DrawerHeader.tsx
+--- a/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/DrawerHeader.tsx
++++ b/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/DrawerHeader.tsx
+@@ -1,3 +1,4 @@
++import {publicModelLabel} from "@/liliuxflow/PublicModelLabel";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { LocalizedRichText } from "@/liliuxflow/LocalizedText";
+@@ -81,7 +82,7 @@
+             }}/>, { "alt": { byValue: { "Provider": "ui.admin.dynamic.4fb30049fd84" } } }))}
+       <div className="flex items-center gap-2">
+         <span className="font-semibold" style={{ fontSize: 14 }}>
+-          {model}
++          {publicModelLabel(model)}
+         </span>
+         {providerName && (<span className="text-muted-foreground" style={{ fontSize: 12 }}>
+             {providerName}
+diff --git a/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/LogDetailContent.tsx b/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/LogDetailContent.tsx
+--- a/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/LogDetailContent.tsx
++++ b/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/LogDetailContent.tsx
+@@ -1,3 +1,4 @@
++import {publicModelLabel} from "@/liliuxflow/PublicModelLabel";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { localizeGeneratedProps } from "@/liliuxflow/LocalizedProps";
+@@ -103,7 +104,7 @@
+           </CardHeader>
+           <CardContent>
+             <DescriptionList>
+-              {localizeProps(<DescriptionItem label="Model">{logEntry.model}</DescriptionItem>, { "label": "ui.admin.display.model.d2e4b004" })}
++              {localizeProps(<DescriptionItem label="Model">{publicModelLabel(logEntry.model)}</DescriptionItem>, { "label": "ui.admin.display.model.d2e4b004" })}
+               {localizeProps(<DescriptionItem label="Provider">{logEntry.custom_llm_provider || "-"}</DescriptionItem>, { "label": "ui.admin.display.provider.a15fabaf" })}
+               {localizeProps(<DescriptionItem label="Call Type">{logEntry.call_type}</DescriptionItem>, { "label": "ui.admin.display.call.type.22ebdad8" })}
+               {localizeProps(<DescriptionItem label="Model ID">
+diff --git a/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/RealtimePrettyView.tsx b/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/RealtimePrettyView.tsx
+--- a/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/RealtimePrettyView.tsx
++++ b/ui/litellm-dashboard/src/components/view_logs/LogDetailsDrawer/RealtimePrettyView.tsx
+@@ -1,3 +1,4 @@
++import {publicModelLabel} from "@/liliuxflow/PublicModelLabel";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { LocalizedRichText } from "@/liliuxflow/LocalizedText";
+@@ -131,7 +132,7 @@
+             <span style={{ fontWeight: 500, fontSize: 14 }}><LocalizedText id="ui.admin.display.session.002217ca"/></span>
+           </div>
+           <span className="text-muted-foreground" style={{ fontSize: 12 }}>
+-            {session.model}
++            {publicModelLabel(session.model)}
+           </span>
+           {turnCount > 0 && (<Badge variant="secondary" style={{ margin: 0, fontWeight: 500 }}>
+               {turnCount} {turnCount === 1 ? <LocalizedText id="ui.admin.dynamic.f46976b3b8e3"/> : <LocalizedText id="ui.admin.dynamic.7e176e37efef"/>}
+@@ -160,7 +161,7 @@
+             gap: "8px 24px",
+             fontSize: 13,
+         }}>
+-            {localizeProps(<ConfigRow label="Model" value={session.model}/>, { "label": "ui.admin.display.model.d2e4b004" })}
++            {localizeProps(<ConfigRow label="Model" value={publicModelLabel(session.model)}/>, { "label": "ui.admin.display.model.d2e4b004" })}
+             {localizeProps(<ConfigRow label="Voice" value={session.voice}/>, { "label": "ui.admin.display.voice.802e2228" })}
+             {localizeProps(<ConfigRow label="Temperature" value={session.temperature}/>, { "label": "ui.admin.display.temperature.6b444c13" })}
+             {localizeProps(<ConfigRow label="Max Output Tokens" value={session.max_response_output_tokens}/>, { "label": "ui.admin.display.max.output.tokens.a26d4f9c" })}
+diff --git a/ui/litellm-dashboard/src/components/view_logs/RequestLogsFilters.tsx b/ui/litellm-dashboard/src/components/view_logs/RequestLogsFilters.tsx
+--- a/ui/litellm-dashboard/src/components/view_logs/RequestLogsFilters.tsx
++++ b/ui/litellm-dashboard/src/components/view_logs/RequestLogsFilters.tsx
+@@ -1,4 +1,5 @@
+ "use client";
++import {publicModelLabel} from "@/liliuxflow/PublicModelLabel";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { useMemo, useState } from "react";
+@@ -78,7 +79,7 @@
+             if (!modelId || seen.has(modelId))
+                 return [];
+             seen.add(modelId);
+-            return [{ label: modelName || modelId, value: modelId, sublabel: `Model ID: ${modelId}` }];
++            return [{ label: publicModelLabel(modelName) || modelId, value: modelId, sublabel: `Model ID: ${modelId}` }];
+         }));
+     }, [data]);
+     return (localizeProps(<DataTableFilterField label="Model">
+diff --git a/ui/litellm-dashboard/src/components/view_logs/RequestLogsTableColumns.tsx b/ui/litellm-dashboard/src/components/view_logs/RequestLogsTableColumns.tsx
+--- a/ui/litellm-dashboard/src/components/view_logs/RequestLogsTableColumns.tsx
++++ b/ui/litellm-dashboard/src/components/view_logs/RequestLogsTableColumns.tsx
+@@ -1,4 +1,5 @@
+ "use client";
++import {publicModelLabel} from "@/liliuxflow/PublicModelLabel";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import { localizeGeneratedProps } from "@/liliuxflow/LocalizedProps";
+@@ -239,7 +240,7 @@
+             const provider = log.custom_llm_provider;
+             const sessionModels = log.session_models ?? [];
+             const modelNames = sessionModels.length > 0 ? sessionModels : [log.model ?? ""];
+-            const modelLabel = log.session_models_truncated ? `${modelNames.join(", ")}, ...` : modelNames.join(", ");
++            const modelLabel = log.session_models_truncated ? `${modelNames.map(publicModelLabel).join(", ")}, ...` : modelNames.map(publicModelLabel).join(", ");
+             const isSingleModel = modelNames.length === 1;
+             return (<div className="flex items-center space-x-2">
+           {provider && isSingleModel && (<img src={getLogoUrl(log, provider)} alt="" className="w-4 h-4" onError={(event) => {
+diff --git a/ui/litellm-dashboard/src/contexts/ThemeContext.tsx b/ui/litellm-dashboard/src/contexts/ThemeContext.tsx
+--- a/ui/litellm-dashboard/src/contexts/ThemeContext.tsx
++++ b/ui/litellm-dashboard/src/contexts/ThemeContext.tsx
+@@ -1,4 +1,5 @@
+-import React, { createContext, useContext, useState, useEffect, ReactNode } from "react";
++import { brandAssets, brandAssetOrDefault } from "@/liliuxflow/brandAssets";
++import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from "react";
+ import { getProxyBaseUrl } from "@/components/networking";
+ 
+ interface ThemeContextType {
+@@ -26,9 +27,12 @@
+ }
+ 
+ export const ThemeProvider: React.FC<ThemeProviderProps> = ({ children, accessToken }) => {
+-  const [logoUrl, setLogoUrl] = useState<string | null>("/ui/liliuxflow-logo-light.svg");
+-  const [logoUrlDark, setLogoUrlDark] = useState<string | null>("/ui/liliuxflow-logo-dark.svg");
+-  const [faviconUrl, setFaviconUrl] = useState<string | null>("/ui/liliuxflow-favicon.svg");
++  const [logoUrl, setLogoUrlState] = useState<string>(brandAssets.light);
++  const setLogoUrl = useCallback((url: string | null) => setLogoUrlState(brandAssetOrDefault(url, brandAssets.light)), []);
++  const [logoUrlDark, setLogoUrlDarkState] = useState<string>(brandAssets.dark);
++  const setLogoUrlDark = useCallback((url: string | null) => setLogoUrlDarkState(brandAssetOrDefault(url, brandAssets.dark)), []);
++  const [faviconUrl, setFaviconUrlState] = useState<string>(brandAssets.favicon);
++  const setFaviconUrl = useCallback((url: string | null) => setFaviconUrlState(brandAssetOrDefault(url, brandAssets.favicon)), []);
+ 
+   useEffect(() => {
+     const loadThemeSettings = async () => {

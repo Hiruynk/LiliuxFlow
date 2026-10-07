@@ -1,0 +1,86 @@
+diff --git a/src/serve.rs b/src/serve.rs
+index 7c5b23e..37b0cd1 100644
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -93,6 +93,19 @@ fn derive_cache_budget(
+         .saturating_sub(BUDGET_HEADROOM_BYTES);
+     (derived.max(BUDGET_FLOOR_BYTES), derived < BUDGET_FLOOR_BYTES)
+ }
++
++fn prompt_cache_divergence_summary(
++    agreement_tokens: usize,
++    reused_tokens: usize,
++    prompt_tokens: usize,
++    cached_tail_tokens: usize,
++) -> String {
++    format!(
++        "prompt/cache divergence: agreement_tokens={agreement_tokens} reused_tokens={reused_tokens} \
++         prompt_tokens={prompt_tokens} cached_tail_tokens={cached_tail_tokens}"
++    )
++}
++
+ /// How long a running request may keep going after a stop signal before it
+ /// is cancelled at its next token.
+ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+@@ -967,32 +980,22 @@ impl<M: LanguageModel> Engine<M> {
+         session.add_checkpoint(snapshot);
+         let prefix_secs = started.elapsed().as_secs_f64();
+ 
+-        // A long shared prefix that nothing could resume from: show the seam
+-        // once, as the text either side of it in this prompt and what the
+-        // cached lineage continued with. This is how a client that renders
+-        // the same preamble differently between runs is found at a glance.
+-        // An ordinary hit (`agreement == reused`) diverges too, at the user's
+-        // message, and says nothing worth a line of prompt text in the log.
++        // A long shared prefix that nothing could resume from: report token
++        // counts only. Prompt text can include prior reasoning and tool
++        // arguments, so it must never be written to the service log.
+         if min_tokens > 0
+             && agreement >= min_tokens
+             && agreement > reused
+             && agreement < n - 1
+         {
+-            let tokenizer = generator.tokenizer();
+-            let text = |ids: &[u32]| {
+-                tokenizer
+-                    .decode(ids, false)
+-                    .unwrap_or_else(|e| format!("<undecodable: {e}>"))
+-            };
+-            let window = 12;
+             eprintln!(
+-                "divergence at {agreement}: prompt {:?} | {:?}, cached lineage continued {:?}",
+-                text(&p.prompt[agreement.saturating_sub(window)..agreement]),
+-                text(&p.prompt[agreement..(agreement + window).min(n)]),
+-                text(
+-                    &acquired.divergent_tail
+-                        [..acquired.divergent_tail.len().min(window)]
+-                ),
++                "{}",
++                prompt_cache_divergence_summary(
++                    agreement,
++                    reused,
++                    n,
++                    acquired.divergent_tail.len(),
++                )
+             );
+         }
+ 
+diff --git a/tests/unit/serve.rs b/tests/unit/serve.rs
+index af65b6c..ff457cd 100644
+--- a/tests/unit/serve.rs
++++ b/tests/unit/serve.rs
+@@ -1,6 +1,14 @@
+ use super::*;
+ use crate::qwen4exp::ImageSpan;
+ 
++#[test]
++fn prompt_cache_divergence_diagnostic_contains_counters_only() {
++    assert_eq!(
++        prompt_cache_divergence_summary(42, 35, 100, 12),
++        "prompt/cache divergence: agreement_tokens=42 reused_tokens=35 prompt_tokens=100 cached_tail_tokens=12"
++    );
++}
++
+ #[test]
+ fn call_ids_are_stable_per_request_and_index() {
+     assert_eq!(call_id("chatcmpl-1-1", 0), call_id("chatcmpl-1-1", 0));

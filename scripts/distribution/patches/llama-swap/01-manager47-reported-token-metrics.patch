@@ -1,0 +1,370 @@
+--- a/internal/server/metrics.go
++++ b/internal/server/metrics.go
+@@ -8,6 +8,7 @@
+ 	"context"
+ 	"fmt"
+ 	"io"
++	"math"
+ 	"net"
+ 	"net/http"
+ 	"strings"
+@@ -354,46 +355,52 @@
+ // usagePaths lists the JSON paths where a per-event usage object can live.
+ var usagePaths = []string{"usage", "response.usage", "message.usage"}
+ 
+-// extractUsageTokens reads input/output/cached token counts from a usage
+-// gjson.Result, handling the field-name differences across endpoints.
++// optionalMetricNumber accepts only finite, non-negative JSON numbers. A
++// missing/null/invalid optional measurement must not become an invented zero.
++func optionalMetricNumber(root gjson.Result, paths ...string) (float64, bool) {
++	for _, path := range paths {
++		value := root.Get(path)
++		if value.Type == gjson.Number {
++			number := value.Float()
++			if !math.IsNaN(number) && !math.IsInf(number, 0) && number >= 0 {
++				return number, true
++			}
++		}
++	}
++	return 0, false
++}
++
++func optionalMetricCount(root gjson.Result, paths ...string) (int64, bool) {
++	for _, path := range paths {
++		if number, ok := optionalMetricNumber(root, path); ok && math.Trunc(number) == number && number < float64(math.MaxInt64) {
++			return int64(number), true
++		}
++	}
++	return -1, false
++}
++
++// extractUsageTokens retains the existing unknown sentinel (-1) for absent or
++// invalid counts, and accepts a provider-reported zero as an actual zero.
+ func extractUsageTokens(usage gjson.Result) (input, output, cached int64, ok bool) {
+-	cached = -1
++	input, output, cached = -1, -1, -1
+ 	if !usage.Exists() {
+ 		return
+ 	}
+-
+-	if v := usage.Get("prompt_tokens"); v.Exists() {
+-		input = v.Int()
+-		ok = true
+-	} else if v := usage.Get("input_tokens"); v.Exists() {
+-		input = v.Int()
+-		ok = true
+-	}
+-
+-	if v := usage.Get("completion_tokens"); v.Exists() {
+-		output = v.Int()
+-		ok = true
+-	} else if v := usage.Get("output_tokens"); v.Exists() {
+-		output = v.Int()
+-		ok = true
+-	}
+-
+-	if v := usage.Get("cache_read_input_tokens"); v.Exists() {
+-		cached = v.Int()
+-		ok = true
+-	} else if v := usage.Get("input_tokens_details.cached_tokens"); v.Exists() {
+-		cached = v.Int()
+-		ok = true
+-	} else if v := usage.Get("prompt_tokens_details.cached_tokens"); v.Exists() {
+-		cached = v.Int()
+-		ok = true
++	if value, valid := optionalMetricCount(usage, "prompt_tokens", "input_tokens"); valid {
++		input, ok = value, true
++	}
++	if value, valid := optionalMetricCount(usage, "completion_tokens", "output_tokens"); valid {
++		output, ok = value, true
++	}
++	if value, valid := optionalMetricCount(usage, "cache_read_input_tokens", "input_tokens_details.cached_tokens", "prompt_tokens_details.cached_tokens"); valid {
++		cached, ok = value, true
+ 	}
+ 	return
+ }
+ 
+ func processStreamingResponse(modelID string, start time.Time, body []byte) (ActivityLogEntry, error) {
+ 	var (
+-		inputTokens, outputTokens int64
++		inputTokens, outputTokens int64 = -1, -1
+ 		cachedTokens              int64 = -1
+ 		hasAny                    bool
+ 		usage                     gjson.Result
+@@ -436,10 +443,10 @@
+ 				continue
+ 			}
+ 			hasAny = true
+-			if i > 0 {
++			if i >= 0 {
+ 				inputTokens = i
+ 			}
+-			if o > 0 {
++			if o >= 0 {
+ 				outputTokens = o
+ 			}
+ 			if c >= 0 {
+@@ -488,34 +495,48 @@
+ 	// block. These are base values that llama-server timings and vLLM metrics
+ 	// override when present.
+ 	if usage.Exists() {
+-		if v := usage.Get("prompt_tokens_per_sec"); v.Exists() {
+-			promptPerSecond = v.Float()
+-		}
+-		if v := usage.Get("completion_tokens_per_sec"); v.Exists() {
+-			tokensPerSecond = v.Float()
+-		}
+-		if v := usage.Get("total_time"); v.Exists() {
+-			if totalTimeMs := int(v.Float() * 1000); totalTimeMs > durationMs {
++		if value, ok := optionalMetricNumber(usage, "prompt_tokens_per_sec"); ok {
++			promptPerSecond = value
++		}
++		if value, ok := optionalMetricNumber(usage, "completion_tokens_per_sec"); ok {
++			tokensPerSecond = value
++		}
++		if value, ok := optionalMetricNumber(usage, "total_time"); ok && value*1000 < float64(math.MaxInt) {
++			if totalTimeMs := int(value * 1000); totalTimeMs > durationMs {
+ 				durationMs = totalTimeMs
+ 			}
+ 		}
+ 	}
+ 
+ 	if timings.Exists() {
+-		inputTokens = timings.Get("prompt_n").Int()
+-		outputTokens = timings.Get("predicted_n").Int()
+-		promptPerSecond = timings.Get("prompt_per_second").Float()
+-		tokensPerSecond = timings.Get("predicted_per_second").Float()
+-		timingsDurationMs := int(timings.Get("prompt_ms").Float() + timings.Get("predicted_ms").Float())
+-		if timingsDurationMs > durationMs {
+-			durationMs = timingsDurationMs
+-		}
+-		if cachedValue := timings.Get("cache_n"); cachedValue.Exists() {
+-			cachedTokens = cachedValue.Int()
+-		}
+-		if timings.Get("draft_n").Exists() && timings.Get("draft_n_accepted").Exists() {
+-			draftTokens = int(timings.Get("draft_n").Int())
+-			draftAccTokens = int(timings.Get("draft_n_accepted").Int())
++		// Preserve llama-server fields and recognize fixed Lily's reported
++		// tokens/milliseconds/rates. Unknown extensions preserve existing usage.
++		if value, ok := optionalMetricCount(timings, "prompt_n", "prompt_tokens"); ok {
++			inputTokens = value
++		}
++		if value, ok := optionalMetricCount(timings, "predicted_n", "generated_tokens"); ok {
++			outputTokens = value
++		}
++		if value, ok := optionalMetricNumber(timings, "prompt_per_second", "prefill_per_second"); ok {
++			promptPerSecond = value
++		}
++		if value, ok := optionalMetricNumber(timings, "predicted_per_second", "decode_per_second"); ok {
++			tokensPerSecond = value
++		}
++		promptMs, hasPromptMs := optionalMetricNumber(timings, "prompt_ms", "prefill_ms")
++		decodeMs, hasDecodeMs := optionalMetricNumber(timings, "predicted_ms", "decode_ms")
++		if (hasPromptMs || hasDecodeMs) && promptMs+decodeMs < float64(math.MaxInt) {
++			if timingsDurationMs := int(promptMs + decodeMs); timingsDurationMs > durationMs {
++				durationMs = timingsDurationMs
++			}
++		}
++		if value, ok := optionalMetricCount(timings, "cache_n", "cached_tokens"); ok && (inputTokens < 0 || value <= inputTokens) {
++			cachedTokens = value
++		}
++		drafted, hasDrafted := optionalMetricCount(timings, "draft_n", "drafted_tokens")
++		accepted, hasAccepted := optionalMetricCount(timings, "draft_n_accepted", "accepted_tokens")
++		if hasDrafted && hasAccepted && accepted <= drafted {
++			draftTokens, draftAccTokens = int(drafted), int(accepted)
+ 		}
+ 	}
+ 	// vLLM reports speculative decoding counts under metrics.speculative_decoding
+@@ -523,24 +544,24 @@
+ 	// are required so the acceptance rate is never derived from a half-filled
+ 	// object.
+ 	if spec := responseMetrics.Get("speculative_decoding"); spec.Exists() {
+-		drafted := spec.Get("num_draft_tokens")
+-		accepted := spec.Get("num_accepted_draft_tokens")
+-		if drafted.Exists() && accepted.Exists() {
+-			draftTokens = int(drafted.Int())
+-			draftAccTokens = int(accepted.Int())
+-		}
+-	}
+-	if timeToFirstToken := responseMetrics.Get("time_to_first_token_ms"); timeToFirstToken.Exists() && timeToFirstToken.Float() > 0 {
++		drafted, hasDrafted := optionalMetricCount(spec, "num_draft_tokens")
++		accepted, hasAccepted := optionalMetricCount(spec, "num_accepted_draft_tokens")
++		if hasDrafted && hasAccepted && accepted <= drafted {
++			draftTokens, draftAccTokens = int(drafted), int(accepted)
++		}
++	}
++	if timeToFirstToken, ok := optionalMetricNumber(responseMetrics, "time_to_first_token_ms"); ok && timeToFirstToken > 0 && inputTokens >= 0 {
+ 		cachedForRate := cachedTokens
+ 		if cachedForRate < 0 {
+ 			cachedForRate = 0
+ 		}
+-		promptPerSecond = float64(inputTokens-cachedForRate) / (timeToFirstToken.Float() / 1000)
+-	}
+-	if meanInterTokenLatency := responseMetrics.Get("mean_itl_ms"); meanInterTokenLatency.Exists() && meanInterTokenLatency.Float() > 0 {
+-		tokensPerSecond = 1000 / meanInterTokenLatency.Float()
+-	}
+-
++		if cachedForRate <= inputTokens {
++			promptPerSecond = float64(inputTokens-cachedForRate) / (timeToFirstToken / 1000)
++		}
++	}
++	if meanInterTokenLatency, ok := optionalMetricNumber(responseMetrics, "mean_itl_ms"); ok && meanInterTokenLatency > 0 {
++		tokensPerSecond = 1000 / meanInterTokenLatency
++	}
+ 	return ActivityLogEntry{
+ 		Timestamp: time.Now(),
+ 		Model:     modelID,
+--- a/internal/store/activity.go
++++ b/internal/store/activity.go
+@@ -1,6 +1,7 @@
+ package store
+ 
+ import (
++	"encoding/json"
+ 	"math"
+ 	"sort"
+ 	"time"
+@@ -15,6 +16,63 @@
+ 	OutputTokens    int     `json:"output_tokens"`
+ 	PromptPerSecond float64 `json:"prompt_per_second"`
+ 	TokensPerSecond float64 `json:"tokens_per_second"`
++}
++
++// MarshalJSON keeps unknown internal sentinels out of the public metrics DTO.
++// Stored rows/schema remain unchanged, and a backend-reported zero remains 0.
++func (metrics TokenMetrics) MarshalJSON() ([]byte, error) {
++	count := func(value int) *int {
++		if value < 0 {
++			return nil
++		}
++		return &value
++	}
++	rate := func(value float64) *float64 {
++		if value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
++			return nil
++		}
++		return &value
++	}
++	return json.Marshal(struct {
++		Cached   *int     `json:"cache_tokens"`
++		Drafted  *int     `json:"draft_tokens"`
++		Accepted *int     `json:"draft_acc_tokens"`
++		Input    *int     `json:"input_tokens"`
++		Output   *int     `json:"output_tokens"`
++		Prefill  *float64 `json:"prompt_per_second"`
++		Decode   *float64 `json:"tokens_per_second"`
++	}{count(metrics.CachedTokens), count(metrics.DraftTokens), count(metrics.DraftAccTokens), count(metrics.InputTokens), count(metrics.OutputTokens), rate(metrics.PromptPerSecond), rate(metrics.TokensPerSecond)})
++}
++
++// UnmarshalJSON prevents a nullable public DTO from turning unknown into zero
++// when an existing typed collector or peer decodes it again.
++func (metrics *TokenMetrics) UnmarshalJSON(data []byte) error {
++	var dto struct {
++		Cached   *int     `json:"cache_tokens"`
++		Drafted  *int     `json:"draft_tokens"`
++		Accepted *int     `json:"draft_acc_tokens"`
++		Input    *int     `json:"input_tokens"`
++		Output   *int     `json:"output_tokens"`
++		Prefill  *float64 `json:"prompt_per_second"`
++		Decode   *float64 `json:"tokens_per_second"`
++	}
++	if err := json.Unmarshal(data, &dto); err != nil {
++		return err
++	}
++	count := func(value *int) int {
++		if value == nil || *value < 0 {
++			return -1
++		}
++		return *value
++	}
++	rate := func(value *float64) float64 {
++		if value == nil || *value < 0 || math.IsNaN(*value) || math.IsInf(*value, 0) {
++			return -1
++		}
++		return *value
++	}
++	*metrics = TokenMetrics{count(dto.Cached), count(dto.Drafted), count(dto.Accepted), count(dto.Input), count(dto.Output), rate(dto.Prefill), rate(dto.Decode)}
++	return nil
+ }
+ 
+ // ActivityLogEntry represents parsed token statistics from llama-server logs.
+@@ -129,6 +187,10 @@
+ 
+ // ActivityStats are aggregate totals and speed histograms over activity rows.
+ type ActivityStats struct {
++	ObservedRows        int            `json:"-"`
++	KnownInputRows      int            `json:"-"`
++	KnownOutputRows     int            `json:"-"`
++	KnownCacheRows      int            `json:"-"`
+ 	TotalRequests       int            `json:"total_requests"`
+ 	TotalInputTokens    int            `json:"total_input_tokens"`
+ 	TotalOutputTokens   int            `json:"total_output_tokens"`
+@@ -215,3 +277,44 @@
+ 	fraction := rank - float64(lower)
+ 	return sorted[lower] + fraction*(sorted[upper]-sorted[lower])
+ }
++
++// MarshalJSON exposes an unknown overall total as null when any contributing
++// row is unknown; empty-set and complete reported-zero totals remain 0.
++func (stats ActivityStats) MarshalJSON() ([]byte, error) {
++	type plain ActivityStats
++	total := func(value, known int) *int {
++		if value < 0 || known < stats.ObservedRows {
++			return nil
++		}
++		return &value
++	}
++	return json.Marshal(struct {
++		plain
++		Input  *int `json:"total_input_tokens"`
++		Output *int `json:"total_output_tokens"`
++		Cache  *int `json:"total_cache_tokens"`
++	}{plain(stats), total(stats.TotalInputTokens, stats.KnownInputRows), total(stats.TotalOutputTokens, stats.KnownOutputRows), total(stats.TotalCacheTokens, stats.KnownCacheRows)})
++}
++
++// Nullable totals stay unknown when a typed collector decodes the DTO again.
++func (stats *ActivityStats) UnmarshalJSON(data []byte) error {
++	type plain ActivityStats
++	var dto struct {
++		plain
++		Input  *int `json:"total_input_tokens"`
++		Output *int `json:"total_output_tokens"`
++		Cache  *int `json:"total_cache_tokens"`
++	}
++	if err := json.Unmarshal(data, &dto); err != nil {
++		return err
++	}
++	value := func(number *int) int {
++		if number == nil || *number < 0 {
++			return -1
++		}
++		return *number
++	}
++	*stats = ActivityStats(dto.plain)
++	stats.TotalInputTokens, stats.TotalOutputTokens, stats.TotalCacheTokens = value(dto.Input), value(dto.Output), value(dto.Cache)
++	return nil
++}
+--- a/internal/store/sqlite/activity.go
++++ b/internal/store/sqlite/activity.go
+@@ -136,13 +136,17 @@
+ 	row := r.db.QueryRowContext(ctx, `
+ 		SELECT
+ 			COALESCE(MAX(id), 0),
+-			COALESCE(SUM(input_tokens), 0),
+-			COALESCE(SUM(output_tokens), 0),
+-			COALESCE(SUM(CASE WHEN cache_tokens > 0 THEN cache_tokens ELSE 0 END), 0)
++			COALESCE(SUM(CASE WHEN input_tokens >= 0 THEN input_tokens ELSE 0 END), 0),
++			COALESCE(SUM(CASE WHEN output_tokens >= 0 THEN output_tokens ELSE 0 END), 0),
++			COALESCE(SUM(CASE WHEN cache_tokens > 0 THEN cache_tokens ELSE 0 END), 0),
++			COUNT(*),
++			COALESCE(SUM(CASE WHEN input_tokens >= 0 THEN 1 ELSE 0 END), 0),
++			COALESCE(SUM(CASE WHEN output_tokens >= 0 THEN 1 ELSE 0 END), 0),
++			COALESCE(SUM(CASE WHEN cache_tokens >= 0 THEN 1 ELSE 0 END), 0)
+ 		FROM activity`+where, args...)
+ 
+ 	var stats store.ActivityStats
+-	if err := row.Scan(&stats.TotalRequests, &stats.TotalInputTokens, &stats.TotalOutputTokens, &stats.TotalCacheTokens); err != nil {
++	if err := row.Scan(&stats.TotalRequests, &stats.TotalInputTokens, &stats.TotalOutputTokens, &stats.TotalCacheTokens, &stats.ObservedRows, &stats.KnownInputRows, &stats.KnownOutputRows, &stats.KnownCacheRows); err != nil {
+ 		return store.ActivityStats{}, fmt.Errorf("activity stats: %w", err)
+ 	}
+ 

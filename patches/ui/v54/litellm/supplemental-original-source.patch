@@ -1,0 +1,91 @@
+--- a/ui/litellm-dashboard/src/components/templates/KeyEditViewControls.tsx
++++ b/ui/litellm-dashboard/src/components/templates/KeyEditViewControls.tsx
+@@ -1,3 +1,4 @@
++import { LocalizedValue } from "@/liliuxflow/LocalizedText";
+ import { localizeProps } from "@/liliuxflow/LocalizedProps";
+ import React from "react";
+ import { Control } from "react-hook-form";
+@@ -10,10 +11,10 @@
+ import SkillSelector from "../skills/SkillSelector";
+ import { AgentsAndGroups, KeyEditFormValues } from "./keyEditFormValues";
+ export const labelWithHint = (label: React.ReactNode, hint: string): React.ReactNode => (<>
+-    {label}
++    <LocalizedValue node={label} sourceDisplayChoices={{"Allowed Routes": "ui.admin.display.allowed.routes.388331cc", "Budget Windows": "ui.keyEdit54.34a7ff25992a", "Budget Fallbacks": "ui.admin.display.budget.fallbacks.15b492a2", "Throttle on budget exceeded": "ui.keyEdit54.e1c85f09ac43", "Enable Prompt Caching": "ui.keyEdit54.596e16994136", "Estimated Output Tokens": "ui.keyEdit54.a46c8e94bd85", "Estimated Output Tokens Per Model": "ui.keyEdit54.5c78937734ed", "Per-Tag Rate Limits": "ui.keyEdit54.cdbe0b845ccb", "Disable Global Guardrails": "ui.admin.display.disable.global.guardrails.218af842", "Policies": "navigation.policies", "Prompts": "ui.admin.display.prompts.7c5cc715", "Access Groups": "navigation.accessGroups", "Allowed Pass Through Routes": "ui.admin.display.allowed.pass.through.routes.a882f9e3", "Organization": "ui.admin.display.organization.2725ef15", "Skills": "ui.admin.display.skills.8840d1c9"}} sourceChoiceProvenance="data"/>
+     <Tooltip>
+-      <TooltipTrigger render={<CircleHelp className="size-3.5 shrink-0 cursor-help text-muted-foreground"/>}/>
+-      <TooltipContent className="max-w-xs">{hint}</TooltipContent>
++      {localizeProps(<TooltipTrigger aria-label={hint} render={<CircleHelp className="size-3.5 shrink-0 cursor-help text-muted-foreground"/>}/>, { "aria-label": { byValue: {"List of allowed routes for the key (comma-separated). Can be specific routes (e.g., '/chat/completions') or route patterns (e.g., 'llm_api_routes', 'management_routes', '/keys/*'). Leave empty to allow all routes.": "ui.keyEdit54.b53cb83df0e6", "Set multiple independent budget windows (e.g., hourly $10 AND monthly $200). Each window tracks spend separately and resets on its own schedule.": "ui.admin.tooltip.63deaaac3791", "When a model exceeds its per-model budget, requests automatically reroute to fallback models instead of failing": "ui.keyEdit54.3dd38f2bbd12", "When this key exceeds its max budget, throttle its TPM/RPM to the globally configured percentage instead of blocking access entirely. Requires budget_exceeded_throttle_percentage in litellm_settings and a TPM/RPM limit on the key.": "ui.admin.tooltip.37dbe05f6fa8", "Automatically add prompt caching breakpoints (cache_control markers) to requests made with this key, cutting input cost on repeated prompts. Applies to Anthropic and Bedrock Claude models; requests that already set their own cache_control markers are left untouched.": "ui.admin.tooltip.c051826f964d", "Scope rate limits to a request tag so each tag (e.g. a cell or group) gets its own RPM counter. Requests without a matching tag fall back to the key-level limit.": "ui.admin.tooltip.3c676b7c0723", "When enabled, this key will bypass any guardrails configured to run on every request (global guardrails)": "ui.admin.tooltip.750240de3825", "Apply policies to this key to control guardrails and other settings": "ui.admin.tooltip.dd5c93ab7681", "Setting prompts by key is a premium feature": "ui.keyEdit54.c75d866fe1be", "Assign access groups to this key. Access groups control which models, MCP servers, and agents this key can use": "ui.admin.tooltip.f0d4e5f6e4f0", "Setting allowed pass through routes by key is a premium feature": "ui.keyEdit54.85fa9913ae93", "The organization this key belongs to. Selecting an organization filters the available teams.": "ui.admin.tooltip.fcd3c48b17d9", "Enabled skills are visible to every key. Grant disabled (private) Claude Code plugins to this key here.": "ui.keyEdit54.703ccd9942e6", "Expected output tokens reserved for TPM limiting when a request omits max_tokens. Overrides the built-in estimate for this key.": "ui.keyEdit54.f7ba3261b469", "Per-model expected output tokens reserved for TPM limiting when a request omits max_tokens. Takes precedence over the key-wide estimate.": "ui.keyEdit54.f9c186ee782a", "Only a proxy admin can change this. It sets how many output tokens the rate limiter reserves for a request that omits max_tokens, which is charged against the team and organization TPM windows.": "ui.keyEdit54.d43a122c67aa", "Premium feature - Upgrade to set allowed pass through routes by key": "ui.keyEdit54.850d014f76f0", "Select or enter allowed pass through routes": "ui.keyEdit54.08d161531438"} } })}
++      <TooltipContent className="max-w-xs"><LocalizedValue node={hint} sourceDisplayChoices={{"List of allowed routes for the key (comma-separated). Can be specific routes (e.g., '/chat/completions') or route patterns (e.g., 'llm_api_routes', 'management_routes', '/keys/*'). Leave empty to allow all routes.": "ui.keyEdit54.b53cb83df0e6", "Set multiple independent budget windows (e.g., hourly $10 AND monthly $200). Each window tracks spend separately and resets on its own schedule.": "ui.admin.tooltip.63deaaac3791", "When a model exceeds its per-model budget, requests automatically reroute to fallback models instead of failing": "ui.keyEdit54.3dd38f2bbd12", "When this key exceeds its max budget, throttle its TPM/RPM to the globally configured percentage instead of blocking access entirely. Requires budget_exceeded_throttle_percentage in litellm_settings and a TPM/RPM limit on the key.": "ui.admin.tooltip.37dbe05f6fa8", "Automatically add prompt caching breakpoints (cache_control markers) to requests made with this key, cutting input cost on repeated prompts. Applies to Anthropic and Bedrock Claude models; requests that already set their own cache_control markers are left untouched.": "ui.admin.tooltip.c051826f964d", "Scope rate limits to a request tag so each tag (e.g. a cell or group) gets its own RPM counter. Requests without a matching tag fall back to the key-level limit.": "ui.admin.tooltip.3c676b7c0723", "When enabled, this key will bypass any guardrails configured to run on every request (global guardrails)": "ui.admin.tooltip.750240de3825", "Apply policies to this key to control guardrails and other settings": "ui.admin.tooltip.dd5c93ab7681", "Setting prompts by key is a premium feature": "ui.keyEdit54.c75d866fe1be", "Assign access groups to this key. Access groups control which models, MCP servers, and agents this key can use": "ui.admin.tooltip.f0d4e5f6e4f0", "Setting allowed pass through routes by key is a premium feature": "ui.keyEdit54.85fa9913ae93", "The organization this key belongs to. Selecting an organization filters the available teams.": "ui.admin.tooltip.fcd3c48b17d9", "Enabled skills are visible to every key. Grant disabled (private) Claude Code plugins to this key here.": "ui.keyEdit54.703ccd9942e6", "Expected output tokens reserved for TPM limiting when a request omits max_tokens. Overrides the built-in estimate for this key.": "ui.keyEdit54.f7ba3261b469", "Per-model expected output tokens reserved for TPM limiting when a request omits max_tokens. Takes precedence over the key-wide estimate.": "ui.keyEdit54.f9c186ee782a", "Only a proxy admin can change this. It sets how many output tokens the rate limiter reserves for a request that omits max_tokens, which is charged against the team and organization TPM windows.": "ui.keyEdit54.d43a122c67aa", "Premium feature - Upgrade to set allowed pass through routes by key": "ui.keyEdit54.850d014f76f0", "Select or enter allowed pass through routes": "ui.keyEdit54.08d161531438"}} sourceChoiceProvenance="data"/></TooltipContent>
+     </Tooltip>
+   </>);
+ const KEY_TYPE_OPTIONS = [
+@@ -27,13 +28,13 @@
+     onChange: (value: string) => void;
+ }) => (<Select items={Object.fromEntries(KEY_TYPE_OPTIONS.map((option) => [option.value, option.label]))} value={value} onValueChange={(next: string | null) => next != null && onChange(next)}>
+     <SelectTrigger id={id} className="w-full">
+-      {localizeProps(<SelectValue placeholder="Select key type"/>, { "placeholder": "ui.admin.display.select.key.type.e9d76b48" })}
++      {localizeProps(<SelectValue placeholder="Select key type">{(selected: string | null) => <LocalizedValue node={KEY_TYPE_OPTIONS.find(option => option.value === selected)?.label ?? selected} sourceDisplayChoices={{"AI APIs": "ui.admin.display.ai.apis.c7c1b4ad", "Management": "ui.admin.display.management.a29bffec", "Full Access": "ui.admin.display.full.access.5160f6c3"}} sourceChoiceProvenance="data"/>}</SelectValue>, { "placeholder": "ui.admin.display.select.key.type.e9d76b48" })}
+     </SelectTrigger>
+     <SelectContent>
+       {KEY_TYPE_OPTIONS.map((option) => (<SelectItem key={option.value} value={option.value}>
+           <div className="py-1">
+-            <div className="font-medium">{option.label}</div>
+-            <div className="mt-0.5 text-[11px] text-muted-foreground">{option.hint}</div>
++            <div className="font-medium"><LocalizedValue node={option.label} sourceDisplayChoices={{"AI APIs": "ui.admin.display.ai.apis.c7c1b4ad", "Management": "ui.admin.display.management.a29bffec", "Full Access": "ui.admin.display.full.access.5160f6c3"}} sourceChoiceProvenance="ui-producer"/></div>
++            <div className="mt-0.5 text-[11px] text-muted-foreground"><LocalizedValue node={option.hint} sourceDisplayChoices={{"Can call only AI API routes (chat/completions, embeddings, etc.)": "ui.keyDisplay53.aiRoutesHint", "Can call only management routes (user/team/key management)": "ui.keyDisplay53.managementRoutesHint", "Can call all routes (AI APIs, Management, and read-only)": "ui.keyDisplay53.allRoutesHint"}} sourceChoiceProvenance="ui-producer"/></div>
+           </div>
+         </SelectItem>))}
+     </SelectContent>
+@@ -48,7 +49,7 @@
+     </FormField>, { "label": "ui.admin.display.agents.access.groups.253fe8a9" })}
+ 
+     <FormField control={control} name="skills" label={labelWithHint("Skills", SKILLS_HINT)}>
+-      {({ value, onChange }) => (<SkillSelector onChange={onChange} value={value as string[] | undefined} accessToken={accessToken}/>)}
++      {({ value, onChange }) => (localizeProps(<SkillSelector onChange={onChange} value={value as string[] | undefined} accessToken={accessToken}/>, { placeholder: "ui.admin.display.select.skills.optional.f6ac77b8" }))}
+     </FormField>
+   </>);
+ export const KeyBudgetNumberField = ({ control, name, label, placeholder, }: {
+--- a/ui/litellm-dashboard/src/components/templates/key_edit_view.tsx
++++ b/ui/litellm-dashboard/src/components/templates/key_edit_view.tsx
+@@ -300,7 +300,7 @@
+           </FormField>, { "label": "ui.admin.display.key.alias.96759912" })}
+ 
+           {localizeProps(<FormField control={form.control} name="models" label="Models" description={isModelsDisabled ? "Models field is disabled for this key type" : undefined}>
+-            {({ value, onChange, id }) => (localizeProps(<MultiSelect id={id} options={modelOptions} value={isModelsDisabled ? [] : (value as string[] | undefined) ?? []} onValueChange={(next) => {
++            {({ value, onChange, id }) => (localizeProps(<MultiSelect id={id} options={modelOptions} sourceOptionLabels={{ "all-proxy-models": { sourceLabel: "All Proxy Models", key: "ui.admin.display.all.proxy.models.fb5c2ab2" }, "all-team-models": { sourceLabel: "All Team Models", key: "ui.admin.display.all.team.models.423eddb7" } }} value={isModelsDisabled ? [] : (value as string[] | undefined) ?? []} onValueChange={(next) => {
+                 if (next.includes("all-team-models")) {
+                     onChange(["all-team-models"]);
+                 }
+@@ -437,7 +437,7 @@
+           {localizeProps(<FormField control={form.control} name="allowed_passthrough_routes" label={premiumUser
+             ? "Allowed Pass Through Routes"
+             : labelWithHint("Allowed Pass Through Routes", "Setting allowed pass through routes by key is a premium feature")}>
+-            {({ value, onChange }) => (<PassThroughRoutesSelector value={value as string[] | undefined} onChange={onChange} accessToken={accessToken || ""} placeholder={currentValuePlaceholder(premiumUser, keyData.metadata?.allowed_passthrough_routes, "Premium feature - Upgrade to set allowed pass through routes by key", "Select or enter allowed pass through routes")} disabled={!premiumUser}/>)}
++            {({ value, onChange }) => (localizeProps(<PassThroughRoutesSelector value={value as string[] | undefined} onChange={onChange} accessToken={accessToken || ""} placeholder={currentValuePlaceholder(premiumUser, keyData.metadata?.allowed_passthrough_routes, "Premium feature - Upgrade to set allowed pass through routes by key", "Select or enter allowed pass through routes")} disabled={!premiumUser}/>, { placeholder: { byValue: {"Premium feature - Upgrade to set allowed pass through routes by key": "ui.keyEdit54.850d014f76f0", "Select or enter allowed pass through routes": "ui.keyEdit54.08d161531438"} } }))}
+           </FormField>, { "label": { byValue: { "Allowed Pass Through Routes": "ui.admin.dynamic.7db99c7cd1b3" } } })}
+ 
+           {localizeProps(<FormField control={form.control} name="vector_stores" label="Vector Stores">
+--- a/ui/litellm-dashboard/src/components/team/LoggingSettings.tsx
++++ b/ui/litellm-dashboard/src/components/team/LoggingSettings.tsx
+@@ -155,7 +155,7 @@
+           <Select multiple value={disabledCallbacks} onValueChange={handleDisabledCallbacksChange}>
+             <SelectTrigger className="w-full">
+               {localizeProps(<SelectValue placeholder="Select callbacks to disable">
+-                {(selected: string[]) => (selected.length === 0 ? "Select callbacks to disable" : selected.join(", "))}
++                {(selected: string[]) => (selected.length === 0 ? <LocalizedText id="ui.admin.display.select.callbacks.to.disable.d9c0ed8e"/> : selected.join(", "))}
+               </SelectValue>, { "placeholder": "ui.admin.display.select.callbacks.to.disable.d9c0ed8e" })}
+             </SelectTrigger>
+             <SelectContent>
+--- a/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/UsagePageView.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/usage/_components/components/UsagePageView.tsx
+@@ -203,7 +203,9 @@
+             setGatewayActivityData(null);
+         });
+     }, [isAdmin, gatewayRequest, currentGatewayRangeKey]);
+-    const gatewayActivity = selectGatewayActivity(isAdmin, gatewayActivityData, currentGatewayRangeKey);
++    // Deployment-wide gateway counts cannot describe a selected user. The existing
++    // server-aggregated user metadata already answers the scoped request totals.
++    const gatewayActivity = selectGatewayActivity(isAdmin && effectiveUserId === null, gatewayActivityData, currentGatewayRangeKey);
+     const activeAggregated = selectForRange(aggregatedData, currentAggregatedRangeKey);
+     // A failure belongs to the range it happened on. Reading it through the same
+     // rule keeps the paginated hook disabled while a new range is in flight, and

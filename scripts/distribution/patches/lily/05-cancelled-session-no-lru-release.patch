@@ -1,0 +1,30 @@
+diff --git a/src/serve.rs b/src/serve.rs
+index fcf36bf..14c51e8 100644
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -96,0 +97,5 @@ fn derive_cache_budget(
++#[inline]
++fn should_return_session_to_cache(client_cancelled: bool) -> bool {
++    !client_cancelled
++}
++
+@@ -1319 +1324,8 @@ impl<M: LanguageModel> Engine<M> {
+-        sessions.release(ctx, session, &images, p.cache_key.as_deref());
++        if should_return_session_to_cache(sink.cancelled()) {
++            sessions.release(ctx, session, &images, p.cache_key.as_deref());
++        } else {
++            drop(session);
++            eprintln!(
++                "[lily-meta] request_id={request_id} phase=decode_session_cancelled session_disposition=dropped"
++            );
++        }
+diff --git a/tests/unit/serve.rs b/tests/unit/serve.rs
+index ff457cd..e41a244 100644
+--- a/tests/unit/serve.rs
++++ b/tests/unit/serve.rs
+@@ -392,0 +393,5 @@ fn the_image_digest_covers_the_rows_and_the_grid() {
++#[test]
++fn client_cancelled_partial_session_is_not_returned_to_lru() {
++    assert!(!super::should_return_session_to_cache(true));
++    assert!(super::should_return_session_to_cache(false));
++}
