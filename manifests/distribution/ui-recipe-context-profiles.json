@@ -15,6 +15,61 @@
           "strip": 1
         },
         {
+          "path": "patches/ui/v50/litellm/supplemental-original-source.patch",
+          "sha256": "9103ec91489a23a1eb868c30700b40dff7ba3af5bf2c7396acd6be4f099c7157",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v51/litellm/supplemental-original-source.patch",
+          "sha256": "efdf06903826b330f7bf88d283c3fdba3d46c5d41e6e8030117316f39e6eae72",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v52b/litellm/supplemental-original-source.patch",
+          "sha256": "b9a437a56a9e2561949b24ebfaeddeb2729f9da838a5513c6c9f5a32718f1ac1",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v53/litellm/supplemental-original-source.patch",
+          "sha256": "8c3b4c53f954344b53bd8065ec0c19d1b553f97ebdf63a0a1c63371df7ea875c",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v54/litellm/supplemental-original-source.patch",
+          "sha256": "9a09dcab4830250b487dfaf08a790d6f0666a7ce69a259204687e0f5b53cfd6d",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v55/litellm/supplemental-original-source.patch",
+          "sha256": "0a13a82fe58bd2cf09199aa0046785fdf521d23c68e59a531947a2d835495a29",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v56/litellm/supplemental-original-source.patch",
+          "sha256": "4cfed792136cab2a4c5274f368ebdfdbb27eb0d6becb1c7a6120f60d78c1f1be",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v57/litellm/supplemental-original-source.patch",
+          "sha256": "ecb6bcf28418f9993e3d400a728f9500506a551df138bfdb956a40babcf2e6bb",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v58/litellm/supplemental-original-source.patch",
+          "sha256": "9d46dc6fa998768fa25306b97a3027ffacabeb51d5d57f24b44a1da1acb05390",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/v58c/litellm/supplemental-original-source.patch",
+          "sha256": "45e926f93a8fd344d559273826811c484851d3e7c00dd8dd5f5fd13150979db3",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/context-profiles/litellm/lp61-supplemental-original-source.patch",
+          "sha256": "ae1a602ac99eeea0d4edfc33ae36bfc0bf5b0eb1da02ffea574fefdb019eab12",
+          "strip": 1
+        },
+        {
           "path": "patches/ui/output-budget-64k/litellm.patch",
           "sha256": "79b12d351c3530818e6c8244eb352bf08f96c17e27ea3df4481fcd346178a200",
           "strip": 1
@@ -304,7 +359,7 @@
           "sha256": "7bda495a7979c8fe7f9580241a9291bda9871be8480a1b181ec06488930c3294"
         }
       ],
-      "source_tree_sha256": "7bff6ddcb17c9142b20305d295eeb77c266cbf22c6ccfefde012227ba0de0438",
+      "source_tree_sha256": "c39d36b83050ed2f8556f2e4267100167c6ca8bbf46fe996052144acd4242515",
       "ui_accepted": false,
       "supported_locales": [
         "en",
