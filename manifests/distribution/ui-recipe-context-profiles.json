@@ -68,6 +68,11 @@
           "path": "patches/ui/context-profiles/litellm/lp61-supplemental-original-source.patch",
           "sha256": "ae1a602ac99eeea0d4edfc33ae36bfc0bf5b0eb1da02ffea574fefdb019eab12",
           "strip": 1
+        },
+        {
+          "path": "patches/ui/output-budget-64k/litellm.patch",
+          "sha256": "79b12d351c3530818e6c8244eb352bf08f96c17e27ea3df4481fcd346178a200",
+          "strip": 1
         }
       ],
       "extra_files": [
@@ -354,7 +359,7 @@
           "sha256": "7bda495a7979c8fe7f9580241a9291bda9871be8480a1b181ec06488930c3294"
         }
       ],
-      "source_tree_sha256": "daa75dcaad66f37ae661238cfa90fd4e61970785805b10ae6820e05f05e0d81e",
+      "source_tree_sha256": "c39d36b83050ed2f8556f2e4267100167c6ca8bbf46fe996052144acd4242515",
       "ui_accepted": false,
       "supported_locales": [
         "en",
@@ -405,6 +410,11 @@
         {
           "path": "patches/llama-swap-ui/context-profiles/localized-source.patch",
           "sha256": "47417354fce288535adf75ca9b2ee49e7c1316a3a56a071ea5ad5273bad7fae5",
+          "strip": 1
+        },
+        {
+          "path": "patches/ui/output-budget-64k/llama-swap.patch",
+          "sha256": "623b0d6fa1dbcaeb9ae5de1f09dabe236db4a42e20fd1b11eab95ba5f9cb8322",
           "strip": 1
         }
       ],
@@ -524,7 +534,7 @@
           "sha256": "3b7f9a19a6b4935729f520c7f4f86e617a9e0762b429149aeed9f11fe679a8e8"
         }
       ],
-      "source_tree_sha256": "c3fdf3f3ab2f504114c2ddbf8cffedb178cf4c3920c73b50d90570e0a3a00a5b",
+      "source_tree_sha256": "d502139f8856fb52fd1f22c7c0ee96514bc2503d6157583b31e76d1d36e3a33c",
       "ui_accepted": false
     }
   },

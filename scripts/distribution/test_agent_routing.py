@@ -27,10 +27,10 @@ class RoutingTests(unittest.TestCase):
   alias='qwen3.8-flash-next-lily-q4-64k'
   for enabled in (1,2,3):
    manager,lp=self.render(alias,enabled);self.assertEqual(len(lp['model_list']),enabled);self.assertEqual(len(manager['models']),enabled)
-   for route,(tokens,seconds) in zip(lp['model_list'],((65536,600),(131072,1200),(262144,1800))):
-    name=route['model_name'];self.assertEqual(manager['models'][name]['capabilities']['context'],tokens);self.assertEqual(route['model_info']['max_tokens'],tokens);self.assertEqual(route['model_info']['default_output_tokens'],4096);self.assertEqual(route['litellm_params']['timeout'],seconds+30);self.assertEqual(route['litellm_params']['stream_timeout'],seconds+30);self.assertIn('--profile ctx',manager['models'][name]['cmd'])
+   for route,(tokens,seconds) in zip(lp['model_list'],((65536,3672),(131072,4272),(262144,4872))):
+    name=route['model_name'];self.assertEqual(manager['models'][name]['capabilities']['context'],tokens);self.assertEqual(route['model_info']['max_tokens'],tokens);self.assertEqual(route['model_info']['default_output_tokens'],65536);self.assertEqual(route['litellm_params']['timeout'],seconds+30);self.assertEqual(route['litellm_params']['stream_timeout'],seconds+30);self.assertIn('--profile ctx',manager['models'][name]['cmd'])
    self.assertNotIn('qwen38-flash-next-q4-safe64k',manager['models'])
-   self.assertEqual(lp['router_settings']['timeout'],(600,1200,1800)[enabled-1]+30)
+   self.assertEqual(lp['router_settings']['timeout'],(3672,4272,4872)[enabled-1]+30)
  def test_caller_guard_endpoint_no_fallback_context_and_auto_boundaries_preserved(self):
   alias='qwen3.8-flash-next-lily-q4-64k';manager,lp=self.render(alias);params=lp['model_list'][0]['litellm_params'];self.assertEqual(params['api_base'],'http://127.0.0.1:18080/v1');self.assertEqual(params['api_key'],'os.environ/MANAGER_BACKEND_TOKEN');self.assertNotIn('LITELLM_MASTER_KEY',params.values());self.assertEqual(lp['router_settings']['num_retries'],0);self.assertEqual(lp['router_settings']['max_fallbacks'],0);self.assertEqual(lp['router_settings']['fallbacks'],[]);self.assertFalse(lp['general_settings']['allow_client_side_credentials']);self.assertTrue(lp['general_settings']['cancel_on_disconnect']);self.assertEqual(manager['models'][alias]['capabilities']['context'],65536);self.assertTrue(manager['models'][alias]['capabilities']['disableAuto']);self.assertEqual(manager['models'][alias]['proxy'],'http://127.0.0.1:${PORT}')
 

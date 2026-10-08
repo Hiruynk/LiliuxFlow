@@ -174,7 +174,7 @@ lf models install qwen3.8-flash-next-lily-q4 --output "$MODEL_DIR" --execute
 uv run --no-project --python 3.12 python scripts/distribution/client_example.py --api openai --stream
 ```
 
-其他用戶端請設定 API base 為 `http://127.0.0.1:4000/v1`、模型為 **`qwen3.8-flash-next-lily-q4-64k`**，並使用分配給該應用程式的 LiteLLM 虛擬金鑰。在 API 管理介面設定其模型權限與限制。預設輸出預算為 4,096 tokens，包含 thinking，且受輸入加輸出合計 65,536 tokens 的上限約束。
+其他用戶端請設定 API base 為 `http://127.0.0.1:4000/v1`、模型為 **`qwen3.8-flash-next-lily-q4-64k`**，並使用分配給該應用程式的 LiteLLM 虛擬金鑰。在 API 管理介面設定其模型權限與限制。預設與最大輸出預算均為 65,536 tokens，包含 thinking。輸入與輸出共用所選模型的總 context；Lily 會將輸出限制在剩餘空間，達到上限時回報 `length`。
 
 此設定提供 Chat Completions。既有介面採用自訂 SSE 或純文字；調整用戶端時應依照其傳輸格式。不支援 JSON／JSON Schema 回應格式、音訊／視訊或逐請求 `keep_alive`。既有 API 範例、支援選項及取消行為詳見 [API 文件](docs/API.md)。
 

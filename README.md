@@ -174,7 +174,7 @@ The included client reads the installation's caller settings and streams a Chat 
 uv run --no-project --python 3.12 python scripts/distribution/client_example.py --api openai --stream
 ```
 
-For another client, use the API base `http://127.0.0.1:4000/v1`, model **`qwen3.8-flash-next-lily-q4-64k`**, and a LiteLLM virtual key assigned to that application. Manage its model permissions and limits in the API dashboard. The default output budget is 4,096 tokens including thinking, within the 65,536-token total context.
+For another client, use the API base `http://127.0.0.1:4000/v1`, model **`qwen3.8-flash-next-lily-q4-64k`**, and a LiteLLM virtual key assigned to that application. Manage its model permissions and limits in the API dashboard. The default and maximum output budget is 65,536 tokens, including thinking. Input and output share the selected model’s total context; Lily clamps output to the remaining window and reports `length` when that limit is reached.
 
 This profile provides Chat Completions. The legacy interface uses custom SSE or plain text; client adaptations should follow its wire format. JSON/JSON Schema response formats, audio/video and request-specific `keep_alive` are unsupported. See [API](docs/API.md) for legacy examples, supported options and cancellation behavior.
 

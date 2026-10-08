@@ -46,6 +46,8 @@ jobs:
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/liliuxflow-compat-cpu
         run: |
           uv run --locked --no-dev --project services/compat python -m unittest discover -s scripts/distribution -p test_optional_models.py -v
+          uv run --locked --no-dev --project services/compat python -m unittest discover -s scripts/distribution -p test_context_stall_recovery.py -v
+          uv run --locked --no-dev --project services/compat python -m unittest discover -s scripts/distribution -p test_output_budget_64k.py -v
           uv run --locked --no-dev --project services/compat python -m unittest discover -s scripts/distribution -p test_portable_product.py -v
       - name: Exercise the pinned model installer SDK with simulated HTTP only
         env:
