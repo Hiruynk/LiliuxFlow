@@ -20,7 +20,7 @@ import time
 import uuid
 from common import DistributionError, private_directory, read_object, write_json_new
 from ownership import capture, unchanged, terminate
-from profile_registry import ProfileRegistry, legacy_registry, MINIMUM_RAM_HEADROOM_GIB
+from profile_registry import ProfileRegistry, legacy_registry, MINIMUM_RAM_HEADROOM_GIB, OPENAI_MAX_IMAGES
 from trust import validate, atomic_private_json
 
 
@@ -97,7 +97,7 @@ def lily_argv(trusted, port, *, profile_id='ctx64k', allow_validation=False, cac
             '--cache-bytes', str(profile.cache_bytes), '--max-sessions', str(profile.max_sessions),
             '--disk-cache-bytes', str(profile.disk_cache_bytes), '--disk-cache-ttl', '24h',
             '--durable-min-tokens', '1024', '--idle-unload', '0', '--queue', '4',
-            '--vision', 'auto', '--disk-cache-dir', str(cache)]
+            '--vision', 'auto', '--max-images', str(OPENAI_MAX_IMAGES), '--disk-cache-dir', str(cache)]
 
 
 def cache_footprint(roots):

@@ -87,6 +87,33 @@ def _control_body(status: int, code: str, detail: str) -> JSONResponse:
     )
 
 
+def _pre_admission_validation_rejection(status, content_type, body):
+    """Only pinned native HTTP400 invalid_request_error, fully received."""
+    if status != 400 or content_type.split(';', 1)[0].strip().lower() != 'application/json' or len(body) > 4096:
+        return False
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate error key')
+            result[key] = value
+        return result
+    try:
+        value = json.loads(body, object_pairs_hook=unique_object)
+    except (ValueError, UnicodeError):
+        return False
+    if not isinstance(value, dict) or set(value) != {'error'}:
+        return False
+    error = value['error']
+    if not isinstance(error, dict) or set(error) != {'message', 'type'} or error['type'] != 'invalid_request_error':
+        return False
+    message = error['message']
+    if not isinstance(message, str):
+        return False
+    return isinstance(message, str)
+
+
+
 class _GuardError(Exception):
     def __init__(self, status: int, code: str, detail: str):
         self.status, self.code, self.detail = status, code, detail
@@ -125,6 +152,7 @@ class _ProfileTicket:
     forwarded: bool = False
     cleanup_profile: Any = None
     stage: str = 'loading'
+    pre_admission_rejected: bool = False
 
 
 class _ProfileStreamingResponse(StreamingResponse):
@@ -724,7 +752,17 @@ class _ContextLifecycleGuard(_LifecycleGuard):
                 await self._stop_and_prove(ticket.cleanup_profile, deadline)
                 ticket.cleanup_profile = None
                 safe = True
-            if ticket.forwarded:
+            if ticket.forwarded and ticket.pre_admission_rejected:
+                try:
+                    proven = await _stage(self.resource_probe(ticket.profile, 'pre_admission_rejected'),
+                                          deadline=min(deadline, asyncio.get_running_loop().time() + self.proof_wait_seconds))
+                    if proven is True:
+                        safe = True
+                        self._resident_profile = ticket.profile
+                        self._last_release_method = 'native_pre_admission_rejected'
+                except (Exception, asyncio.CancelledError):
+                    pass  # Unknown state still requires the existing owned exit path.
+            if ticket.forwarded and not safe:
                 if complete:
                     try:
                         await self._proof(ticket.profile, 'generation_complete',
@@ -778,13 +816,21 @@ class _ContextLifecycleGuard(_LifecycleGuard):
             raise _GuardError(503 if known else 404, 'profile_disabled' if known else 'model_not_found',
                               'requested model is disabled' if known else 'model is outside the finite registry') from error
         forbidden = {'num_ctx', 'max_seq', 'context_tokens', 'context_length', 'profile_path',
-                     'model_path', 'extra_args', 'truncate', 'truncation'}
+                     'model_path', 'extra_args', 'truncate', 'truncation', 'max_images'}
         if forbidden.intersection(value):
             raise _GuardError(400, 'invalid_request', 'request cannot override the selected context profile')
         for field in ('options', 'extra_body'):
             nested = value.get(field)
             if isinstance(nested, dict) and forbidden.intersection(nested):
                 raise _GuardError(400, 'invalid_request', 'request cannot override the selected context profile')
+        # Count the whole conversation before acquiring a permit or lazy loading.
+        # The immutable registry policy is not an inference-body override.
+        messages = value.get('messages', [])
+        image_count = sum(1 for message in messages if isinstance(message, dict)
+                          for part in (message.get('content') if isinstance(message.get('content'), list) else [])
+                          if isinstance(part, dict) and part.get('type') in ('image_url', 'input_image')) if isinstance(messages, list) else 0
+        if image_count > self.registry.maximum_images:
+            raise _GuardError(400, 'too_many_images', 'request image count exceeds the 64-image limit')
         budgets = [value[k] for k in ('max_tokens', 'max_completion_tokens') if k in value and value[k] is not None]
         if any(type(budget) is not int or not 0 < budget <= min(profile.context_tokens, 65536) for budget in budgets):
             raise _GuardError(400, 'invalid_request', 'output budget must not exceed 65536 tokens')
@@ -848,13 +894,22 @@ class _ContextLifecycleGuard(_LifecycleGuard):
                 iterator = response.aiter_raw().__aiter__()
                 terminal_seen = False
                 tail = b''
+                rejected_body = bytearray() if response.status_code == 400 and response.headers.get('content-type', '').split(';', 1)[0].strip().lower() == 'application/json' else None
                 try:
                     while True:
                         try:
                             chunk = await _stage(iterator.__anext__(), deadline=deadline, disconnect=disconnect)
                         except StopAsyncIteration:
                             complete = response.is_success
+                            if rejected_body is not None:
+                                ticket.pre_admission_rejected = _pre_admission_validation_rejection(
+                                    response.status_code, response.headers.get('content-type', ''), bytes(rejected_body))
                             return
+                        if rejected_body is not None:
+                            if len(rejected_body) + len(chunk) <= 4096:
+                                rejected_body.extend(chunk)
+                            else:
+                                rejected_body = None
                         if 'text/event-stream' in response.headers.get('content-type', ''):
                             examined = tail + chunk
                             terminal_seen = terminal_seen or b'data: [DONE]\n' in examined or b'data: [DONE]\r\n' in examined

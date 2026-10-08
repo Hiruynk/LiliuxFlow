@@ -14,6 +14,8 @@ from common import DistributionError, no_symlinks
 REGISTRY_PATH = 'profiles/distribution/context-registry.json'
 DEFAULT_ALIAS = 'qwen3.8-flash-next-lily-q4-64k'
 MAX_OUTPUT_TOKENS = 65536
+# Pinned db3f8a7c supports this process flag; latest13f removed it.
+OPENAI_MAX_IMAGES = 64
 TARGETS = (
     ('ctx64k', DEFAULT_ALIAS, 65536, 3672, 300, 4, 32 * 1024**3),
     ('ctx128k', 'qwen3.8-flash-next-lily-q4-128k', 131072, 4272, 600, 2, 10 * 1024**3),
@@ -65,6 +67,10 @@ class ProfileRegistry:
     temporary_cache_reserve_bytes: int = 12 * 1024**3
     maximum_added_cache_bytes: int = 32 * 1024**3
     minimum_free_disk_bytes: int = 64 * 1024**3
+
+    @property
+    def maximum_images(self):
+        return OPENAI_MAX_IMAGES
 
     @property
     def default(self):

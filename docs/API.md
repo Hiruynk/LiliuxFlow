@@ -37,6 +37,12 @@ uv run --no-project --python 3.12 python scripts/distribution/client_example.py 
 
 Its total context is 131,072 tokens; the default output budget is 65,536. The 64K model stays the default. The 262K model is also enabled with a 262,144-token total context. Use `--model qwen3.8-flash-next-lily-q4-262k` with a caller explicitly granted that model; the helper applies its longer bounded timeout. Profile switches and cold cache restores can add delay.
 
+## Images in Chat Completions
+
+The OpenAI-compatible interface accepts up to **64 image inputs across the entire conversation**, including images resent in earlier user messages. Use PNG or JPEG data URLs in `image_url` content parts. The whole request remains limited to 8 MiB; image decoding, per-image resizing and the selected model's total context limit also apply. Images are preserved rather than silently removed to fit a limit.
+
+An excessive image count is rejected before the model is loaded. A native validation error keeps an already loaded model available when the guard verifies that the same owned process remains idle and no inference lane was acquired. Other cleanup and cancellation protections remain in effect. The legacy Compat image subset described below retains its separate single-PNG limit.
+
 ## Legacy request and response
 
 Send JSON with `model`, `messages` and an optional `stream` flag:

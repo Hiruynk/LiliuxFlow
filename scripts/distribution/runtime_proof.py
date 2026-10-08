@@ -167,6 +167,27 @@ class RunnerResourceProbe:
                     return False
                 self.baseline = state
                 return True
+            if phase == 'pre_admission_rejected':
+                before = self.baseline
+                if (before is None or state is None or any(key not in before or key not in state for key in OWNER_KEYS)
+                    or type(before.get('schema_version')) is not int or type(state.get('schema_version')) is not int
+                    or not self._owned(before, profile, live=True) or not self._owned(state, profile, live=True)
+                    or any(state.get(key) != before.get(key) for key in OWNER_KEYS)):
+                    return False
+                if any(record.get('proof_valid') is not True or record.get('stderr_closed') is not False
+                       or record.get('child_exited') is not False
+                       or record.get('native_context_tokens') != profile.context_tokens
+                       or record.get('active_lane_ids') != [] for record in (before, state)):
+                    return False
+                fields = ('event_sequence', 'acquired_sequence', 'released_sequence')
+                if any(type(record.get(key)) is not int or record[key] < 0
+                       for record in (before, state) for key in fields):
+                    return False
+                return (all(state[key] == before[key] for key in fields)
+                        and state['acquired_sequence'] == state['released_sequence']
+                        and state['event_sequence'] == state['acquired_sequence'] + state['released_sequence']
+                        and state.get('last_released_request_id') == before.get('last_released_request_id')
+                        and state.get('last_prefill_progress') == before.get('last_prefill_progress'))
             if phase == 'generation_complete':
                 if not self._owned(state, profile, live=True) or state.get('proof_valid') is not True:
                     return False
