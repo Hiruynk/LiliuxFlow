@@ -16,6 +16,10 @@ from ownership import unchanged
 from trust import private_file
 
 
+OWNER_KEYS = ('schema_version', 'installation_id', 'runner', 'child', 'profile_id', 'public_alias',
+              'context_tokens', 'backend_port', 'binary_sha256', 'startup_id', 'argv_sha256')
+
+
 def validation_authorized(trusted, profile_id):
     """A short-lived owner-bound validation record is distinct from production enablement."""
     try:
@@ -98,18 +102,20 @@ class RunnerResourceProbe:
     def _recover_closed(self, profile):
         """Reap only an exact exited-owner lease; preserve native event counters."""
         state = self._state()
-        if state is None or not self._owned(state, profile, live=False):
+        previous = self.profiles.get(state.get('profile_id')) if state is not None else None
+        # A failed switch can leave the preceding profile's closed lease. The
+        # record's trusted profile binds release; the caller's new target does
+        # not establish ownership of that preceding native process.
+        if previous is None or not self._owned(state, previous, live=False):
             return False
-        if type(state.get('schema_version')) is not int or state.get('public_alias') != profile.public_alias:
+        if type(state.get('schema_version')) is not int or state.get('public_alias') != previous.public_alias:
             return False
         if unchanged(state['runner']) or unchanged(state['child']) or not self._port_free(state['backend_port']):
             return False
         if not self.lease.exists():
             return self._gone(state)
-        keys = ('schema_version', 'installation_id', 'runner', 'child', 'profile_id', 'public_alias',
-                'context_tokens', 'backend_port', 'binary_sha256', 'startup_id', 'argv_sha256')
         record = read_object(private_file(self.lease / 'lease.json'))
-        if any(record.get(key) != state.get(key) for key in keys):
+        if any(record.get(key) != state.get(key) for key in OWNER_KEYS):
             return False
         directory_stat = self.lease.stat()
         if directory_stat.st_uid != os.getuid() or directory_stat.st_mode & 0o077:
@@ -149,7 +155,8 @@ class RunnerResourceProbe:
                     self.baseline = None
                     return not self.lease.exists()
                 previous = self.profiles.get(state.get('profile_id'))
-                if previous is not None and self._owned(state, previous, live=False) and self._gone(state):
+                if (previous is not None and self._owned(state, previous, live=False)
+                    and (self._gone(state) or self._recover_closed(profile))):
                     self.baseline = None
                     return True
                 if not self._owned(state, profile, live=True) or state.get('proof_valid') is not True:
@@ -178,7 +185,8 @@ class RunnerResourceProbe:
                     self.exit_snapshot = None
                     return not self.lease.exists()
                 previous = self.profiles.get(state.get('profile_id'))
-                if previous is not None and self._owned(state, previous, live=False) and self._gone(state):
+                if (previous is not None and self._owned(state, previous, live=False)
+                    and (self._gone(state) or self._recover_closed(profile))):
                     self.exit_snapshot = state
                     return True
                 if not self._owned(state, profile, live=False):
@@ -189,14 +197,21 @@ class RunnerResourceProbe:
                 return True
             if phase == 'unloaded':
                 if self.exit_snapshot is not None:
-                    return self._gone(self.exit_snapshot)
+                    before = self.exit_snapshot
+                    if self._gone(before):
+                        return True
+                    if (state is not None and all(state.get(key) == before.get(key) for key in OWNER_KEYS)
+                        and self._recover_closed(profile)):
+                        return self._gone(before)
+                    return False
                 # Startup may publish the private record while Stop is running.
                 # Capture it before allowing another runner to acquire the lease.
                 if state is not None:
-                    if not self._owned(state, profile, live=False):
+                    previous = self.profiles.get(state.get('profile_id'))
+                    if previous is None or not self._owned(state, previous, live=False):
                         return False
                     self.exit_snapshot = state
-                    return self._gone(state)
+                    return self._gone(state) or self._recover_closed(profile)
                 return not self.lease.exists()
             if phase == 'recover_closed':
                 return self._recover_closed(profile)

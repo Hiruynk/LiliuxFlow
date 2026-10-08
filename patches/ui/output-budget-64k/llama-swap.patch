@@ -1,0 +1,60 @@
+diff --git a/ui/src/components/playground/ChatInterface.svelte b/ui/src/components/playground/ChatInterface.svelte
+--- a/ui/src/components/playground/ChatInterface.svelte
++++ b/ui/src/components/playground/ChatInterface.svelte
+@@ -4,6 +4,7 @@
+   import { get } from "svelte/store";
+   import { hasListedModels, playgroundModels } from "../../stores/api";
+   import { persistentStore } from "../../stores/persistent";
++  import { MAX_OUTPUT_TOKENS, migrateLegacyOutputBudget } from "../../lib/outputBudget.mjs";
+   import { showGenerationStats } from "../../stores/generationStats";
+   import { streamChatCompletion, type Endpoint } from "../../lib/chatApi";
+   import { currentStats, markCancelled, startTracking, trackChunk } from "../../lib/generationStats";
+@@ -29,7 +30,11 @@
+   const systemPromptStore = persistentStore<string>("playground-system-prompt", "");
+   const temperatureStore = persistentStore<number>("playground-temperature", 0.7);
+   const endpointStore = persistentStore<Endpoint>("playground-endpoint", "v1/chat/completions");
+-  const maxTokensStore = persistentStore<number>("playground-max-tokens", 4096);
++  // Apply the authorized old-default migration once, before creating the store.
++  try {
++    if (typeof window !== "undefined") migrateLegacyOutputBudget(window.localStorage);
++  } catch { /* Storage access may be disabled; the normal store fallback applies. */ }
++  const maxTokensStore = persistentStore<number>("playground-max-tokens", MAX_OUTPUT_TOKENS);
+   const topPStore = persistentStore<number>("playground-top-p", 1);
+   const topKStore = persistentStore<number>("playground-top-k", 40);
+   const minPStore = persistentStore<number>("playground-min-p", 0);
+@@ -552,7 +557,7 @@
+           </div>
+           <div>
+             <Label class="mb-1" for="max-tokens">{$uiText("ui.manager.display.max.tokens.cc3f19cc")}</Label>
+-            <Input id="max-tokens" type="number" min="1" bind:value={$maxTokensStore} disabled={isStreaming} />
++            <Input id="max-tokens" type="number" min="1" max={MAX_OUTPUT_TOKENS} bind:value={$maxTokensStore} disabled={isStreaming} />
+             <p class="text-muted-foreground mt-1 text-xs">{$uiText("ui.manager.display.required.for.v1.messages.f00c2580")}</p>
+           </div>
+         </TabsContent>
+diff --git a/ui/src/lib/outputBudget.mjs b/ui/src/lib/outputBudget.mjs
+new file mode 100644
+--- /dev/null
++++ b/ui/src/lib/outputBudget.mjs
+@@ -0,0 +1,22 @@
++/** The output budget includes thinking and is bounded by remaining context. */
++export const MAX_OUTPUT_TOKENS = 65536;
++const KEY = "playground-max-tokens";
++const MIGRATION = "liliuxflow-playground-output-65536-v1";
++
++/**
++ * Migrate only the old numeric default once. Later custom values are preserved.
++ * @param {{ getItem: (key: string) => string | null, setItem: (key: string, value: string) => void }} storage
++ * @returns {boolean} Whether the old default was replaced.
++ */
++export function migrateLegacyOutputBudget(storage) {
++  try {
++    if (storage.getItem(MIGRATION) === "1") return false;
++    const saved = storage.getItem(KEY);
++    const migrate = saved !== null && JSON.parse(saved) === 4096;
++    if (migrate) storage.setItem(KEY, JSON.stringify(MAX_OUTPUT_TOKENS));
++    storage.setItem(MIGRATION, "1");
++    return migrate;
++  } catch {
++    return false;
++  }
++}

@@ -172,7 +172,7 @@ def configs(trusted, *, validation_profile_ids=()):
         routes.append({'model_name':alias,'litellm_params':{'model':'openai/'+alias,'api_base':'http://127.0.0.1:'+str(ports['guard'])+'/v1',
             'api_key':'os.environ/MANAGER_BACKEND_TOKEN','timeout':profile.total_deadline_seconds+30,'stream_timeout':profile.total_deadline_seconds+30},
             'model_info':{'id':'liliuxflow-'+profile.profile_id,'mode':'chat','max_tokens':profile.context_tokens,
-                          'max_input_tokens':profile.context_tokens,'max_output_tokens':profile.context_tokens,
+                          'max_input_tokens':profile.context_tokens,'max_output_tokens':min(profile.context_tokens,65536),
                           'default_output_tokens':profile.default_output_tokens,'context_profile_id':profile.profile_id}})
     lp={'model_list':routes,
         'general_settings':{'master_key':'os.environ/LITELLM_MASTER_KEY','database_url':'os.environ/DATABASE_URL',
