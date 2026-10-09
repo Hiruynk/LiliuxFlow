@@ -768,17 +768,23 @@ def stop(data,*,dry_run=False,controlplane_only=False,force=False):
         raise DistributionError('owned agent identity differs; no process signaled')
     if dry_run:return {'state':'validated_stop_plan','requires_idle_guard':True,'data_preserved':True}
     drain(trusted)
-    # Remove only the exact own label first, so no manager auto-reload occurs during cleanup.
-    result=subprocess.run(['/bin/launchctl','bootout','gui/'+str(os.getuid())+'/'+trusted['config']['launchd_label']],capture_output=True)
-    if result.returncode:raise DistributionError('own LaunchAgent removal failed; model already drained')
-    deadline=time.monotonic()+60
-    while time.monotonic()<deadline:
-        if not unchanged(registry['agent']):
-            if state.exists():raise DistributionError('agent exited with retained ownership registry; inspect before restart')
-            (data/'run/stack.plist').unlink(missing_ok=True)
-            return {'state':'stopped','data_preserved':True,'model_preserved':True}
-        time.sleep(.25)
-    raise DistributionError('owned agent did not finish stop; registry preserved')
+    held=guard_admission_status(trusted)
+    if (held.get('admission_paused') is not True or held.get('pause_reason')!='session_maintenance'
+        or type(held.get('active_inferences')) is not int or held['active_inferences']!=0
+        or type(held.get('pending_inferences')) is not int or held['pending_inferences']!=0):
+        raise DistributionError('normal stop atomic idle hold was not proven')
+    from runtime_proof import RunnerResourceProbe
+    probe=RunnerResourceProbe(trusted);native=probe._state()
+    profile=trusted['registry'].default if native is None else probe.profiles.get(native.get('profile_id'))
+    if profile is None or not probe._probe(profile,'before_unload') or not probe._probe(profile,'unloaded'):
+        raise DistributionError('normal stop native ownership/exit is unverified')
+    # Reuse existing exact owned shutdown/normal PG fast stop after idle drain.
+    result=_force_stop(trusted,dry_run=False)
+    if result.get('state')!='stopped' or result.get('data_preserved') is not True:
+        raise DistributionError('normal stop owned shutdown did not complete')
+    if trusted['config'].get('database_initialized') is True and result.get('postgres_fast_stop') is not True:
+        raise DistributionError('normal stop initialized PostgreSQL exit is unverified')
+    return {**result,'force':False,'normal_idle_drain':True,'native_exit_proven':True}
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--data-root',type=Path,required=True);parser.add_argument('--controlplane-only',action='store_true');args=parser.parse_args();os.umask(0o077)

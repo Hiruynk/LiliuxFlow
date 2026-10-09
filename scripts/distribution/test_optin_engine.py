@@ -352,4 +352,33 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+
+
+
+class ShortCompletionProofTests(ProbeTests):
+ def setUp(self):
+  super().setUp()
+  self.before['qsa_dispatch_metadata']=None;self.after['qsa_dispatch_metadata']=None
+  self.before['ngram_preload_observed']=None;self.after['ngram_preload_observed']=None
+  self.probe.baseline=copy.deepcopy(self.before)
+ def complete(self,state):
+  atomic_private_json(self.data/'model-state.json',state)
+  with patch.object(proof,'unchanged',return_value=True):return self.probe._probe(self.profile,'generation_complete')
+ def test_short_completion_with_actual_owned_lease_no_QSA_or_preload_observation_keeps_release(self):
+  state={**copy.deepcopy(self.after),'last_release_cancelled':False,'last_cancelled_request_id':None,'cancelled_session_dropped':False}
+  self.assertTrue(self.complete(state));self.assertIsNone(self.probe._state()['qsa_dispatch_metadata']);self.assertIsNone(self.probe._state()['ngram_preload_observed'])
+ def test_None_never_waives_wrong_engine_route_owner_queue_or_unbalanced_release(self):
+  state={**copy.deepcopy(self.after),'last_release_cancelled':False}
+  for change in [{'proof_valid':False},{'qsa_route_effective':{'requested':'split','route':'query'}},{'queued_request_ids':['req-100-10']},
+      {'active_lane_ids':['req-100-9']},{'released_sequence':8},{'queue_acquired_sequence':8},{'binary_sha256':'f'*64},
+      {'startup_id':'b'*32},{'argv_sha256':'c'*64},{'stderr_closed':True}]:
+   with self.subTest(change=change):self.assertFalse(self.complete({**copy.deepcopy(state),**change}))
+  for key,value in [('context_tokens',131072),('mtp_drafts',0),('kv_cache','q8'),('max_batch',4),('max_batch',True)]:
+   invalid=copy.deepcopy(state);invalid['native_engine_effective'][key]=value;self.assertFalse(self.complete(invalid))
+ def test_observed_dispatch_still_must_pass_strict_shape_route_counts(self):
+  valid={'sparse_prefill_rows':4096,'route':'split','split_dispatch_count':1,'query_dispatch_count':0}
+  state={**copy.deepcopy(self.after),'qsa_dispatch_metadata':valid};self.assertTrue(self.complete(state))
+  for change in [{'sparse_prefill_rows':0},{'route':'query'},{'split_dispatch_count':0},{'query_dispatch_count':1},{'split_dispatch_count':True}]:
+   invalid=copy.deepcopy(state);invalid['qsa_dispatch_metadata'].update(change);self.assertFalse(self.complete(invalid));self.assertFalse(self.probe._runtime_matches(invalid,completed=True))
+
 if __name__=="__main__":unittest.main(verbosity=2)

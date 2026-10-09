@@ -80,7 +80,9 @@ class RunnerResourceProbe:
             or record['queue_entered_sequence'] != record['queue_terminal_sequence'] + record['queue_acquired_sequence']
             or record['queue_event_sequence'] != sum(record[k] for k in queue_fields[1:])):
             return False
-        return native_matches(record, require_dispatch=completed)
+        # Lane release is independent of optional sparse-prefill coverage.
+        # None remains NOT_OBSERVED; a present record keeps the strict gate.
+        return native_matches(record, require_dispatch=completed and record.get('qsa_dispatch_metadata') is not None)
 
     def _state(self):
         path = self.run_root / 'model-state.json'
