@@ -60,6 +60,8 @@ class SourceIdentityTests(unittest.TestCase):
         target = self.source / 'manifests/distribution/native-sources.json'
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / 'manifests/distribution/native-sources.json', target)
+        baseline = self.source / 'manifests/distribution/lily-source-baseline.json'
+        shutil.copyfile(ROOT / 'manifests/distribution/lily-source-baseline.json', baseline)
 
     def plan(self):
         with patch.object(builder, 'installation', return_value=self.config):
