@@ -410,6 +410,58 @@ def reconcile_designated_owner_caller(*, caller_path, expected_user_id, api_base
     return changes
 
 
+
+UI_USER_STABLE=('user_id','user_role','max_budget','budget_duration','tpm_limit','rpm_limit','user_email',
+                'team_id','organization_id','max_parallel_requests','model_max_budget','model_rpm_limit',
+                'model_tpm_limit','permissions','allowed_routes','blocked','metadata','sso_user_id')
+def reconcile_designated_ui_user(*,user_id,api_base,master_key,registry,backup_root,dry_run=True,authorized_opt_in_aliases=()):
+    """Append explicit enabled models to one named UI user; never inspect session keys."""
+    if not isinstance(user_id,str) or not 1<=len(user_id)<=256 or any(ord(c)<32 for c in user_id) or type(dry_run) is not bool:
+        raise DistributionError('UI user selection must be explicit and bounded')
+    parsed=urlsplit(api_base)
+    if parsed.scheme!='http' or parsed.hostname!='127.0.0.1' or parsed.username or parsed.password or parsed.path!='/v1' or parsed.query or parsed.fragment:
+        raise DistributionError('UI user API must be the owned loopback v1 endpoint')
+    base=api_base.removesuffix('/v1');enabled=[p.public_alias for p in registry.enabled_profiles]
+    _owner_grant_models(enabled,authorized_opt_in_aliases)  # Reject disabled/unknown opt-ins before any API operation.
+    def inventory():
+        status,body=http_json(base+'/user/info?user_id='+quote(user_id,safe=''),token=master_key)
+        user=body.get('user_info') if isinstance(body,dict) else None
+        if status!=200 or not isinstance(user,dict) or user.get('user_id')!=user_id:
+            raise DistributionError('selected UI user identity could not be verified')
+        return user
+    before=inventory();old=before.get('models');models=_expanded_owner_models(old,[alias for alias in enabled if alias in authorized_opt_in_aliases],authorized_opt_in_aliases)
+    result={'user_id':user_id,'models_before':old,'models_after':models,'changed':models!=old,'writes':False,
+            'roles_or_limits_changed':False,'other_users_changed':False,'session_keys_read_or_updated':False,
+            'existing_sessions':'sign out and sign in again to inherit the updated user models'}
+    if dry_run or models==old:return result
+    archive=private_directory(Path(backup_root)/str(time.time_ns()));write_json_new(archive/'before.json',{'schema_version':1,'user_info':before})
+    def stable(user):return all(user.get(k)==before.get(k) for k in UI_USER_STABLE)
+    def update(values):
+        status,_=http_json(base+'/user/update',method='POST',payload={'user_id':user_id,'models':values},token=master_key)
+        if status!=200:raise DistributionError('selected UI user models update was refused')
+    try:
+        update(models);after=inventory()
+        if after.get('models')!=models or not stable(after):raise DistributionError('selected UI user models verification failed')
+    except Exception:
+        # A timeout or refused response may follow a committed update. Restore
+        # only a proven old/expected state; concurrent identity/limit drift refuses.
+        try:
+            current=inventory()
+            if not stable(current) or current.get('models') not in (old,models):raise DistributionError('UI user ACL rollback refuses concurrent drift')
+            if current['models']==models:update(old)
+            restored=inventory()
+            if restored.get('models')!=old or not stable(restored):raise DistributionError('UI user ACL rollback is unproven')
+        except Exception:raise DistributionError('UI user ACL update failed; private rollback retained for explicit review') from None
+        raise DistributionError('UI user ACL update failed; original models restored') from None
+    return {**result,'writes':True,'rollback_snapshot':str(archive/'before.json')}
+
+
+def reconcile_ui_user(trusted,user_id,*,dry_run=True,authorized_opt_in_aliases=()):
+    if trusted.get('model_configured') is False:raise DistributionError('UI user model grant requires a configured model')
+    return reconcile_designated_ui_user(user_id=user_id,api_base='http://127.0.0.1:'+str(trusted['config']['ports']['litellm'])+'/v1',
+        master_key=trusted['secrets']['LITELLM_MASTER_KEY'],registry=trusted['registry'],backup_root=trusted['data_root']/'backups/ui-user-acl',
+        dry_run=dry_run,authorized_opt_in_aliases=authorized_opt_in_aliases)
+
 def reconcile_owner_caller(trusted, *, dry_run=False,authorized_opt_in_aliases=()):
     data=trusted['data_root'];cfg=trusted['config']
     return reconcile_designated_owner_caller(caller_path=data/'secrets/caller.json',

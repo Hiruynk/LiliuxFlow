@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts/distribution'))
 sys.path.insert(0, str(ROOT / 'services/compat/src'))
 import model_runner
-from profile_registry import OPENAI_MAX_IMAGES, load_registry
+from profile_registry import LEGACY_ENGINE, OPENAI_MAX_IMAGES, load_registry
 from compat_api.app import MAX_MEDIA_IMAGES, MAX_MEDIA_BYTES, MAX_TOTAL_MEDIA_BYTES
 from compat_api.llama_guard import _GuardError, create_app
 
@@ -38,11 +38,16 @@ class ImageAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.app = create_app(manager_url='http://127.0.0.1:18081', control_token='synthetic-control',
                               backend_token='synthetic-backend', registry=self.registry,
                               resource_probe=lambda *_: True,
-                              validation_aliases=tuple(p.public_alias for p in self.registry.profiles))
+                              validation_aliases=tuple(p.public_alias for p in self.registry.profiles
+                                                       if p.engine_id == LEGACY_ENGINE))
         self.guard = self.app.state.lifecycle_guard
 
     async def test_count_0_10_12_64_preserves_all_parts_and_selected_profile(self):
-        for profile in self.registry.profiles:
+        legacy_profiles = tuple(profile for profile in self.registry.profiles
+                                if profile.engine_id == LEGACY_ENGINE)
+        self.assertEqual(tuple(profile.profile_id for profile in legacy_profiles),
+                         ('ctx64k', 'ctx128k', 'ctx262k'))
+        for profile in legacy_profiles:
             for count in (0, 10, 12, 64):
                 with self.subTest(profile=profile.profile_id, count=count):
                     body = image_body(profile.public_alias, [count])
@@ -102,9 +107,13 @@ class ImageAdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.registry.maximum_images, 64)
 
     async def test_context_and_output_budget_contract_is_preserved(self):
-        self.assertEqual([p.context_tokens for p in self.registry.profiles], [65536, 131072, 262144])
-        self.assertEqual([p.default_output_tokens for p in self.registry.profiles], [65536] * 3)
-        for profile in self.registry.profiles:
+        legacy_profiles = tuple(profile for profile in self.registry.profiles
+                                if profile.engine_id == LEGACY_ENGINE)
+        self.assertEqual(tuple(profile.profile_id for profile in legacy_profiles),
+                         ('ctx64k', 'ctx128k', 'ctx262k'))
+        self.assertEqual([p.context_tokens for p in legacy_profiles], [65536, 131072, 262144])
+        self.assertEqual([p.default_output_tokens for p in legacy_profiles], [65536] * 3)
+        for profile in legacy_profiles:
             body = image_body(profile.public_alias, [10])
             body['max_tokens'] = 65536
             self.assertEqual(await self.guard._profile(body), profile)
@@ -123,14 +132,18 @@ class ImageArgvContractTests(unittest.TestCase):
         with self.assertRaises((FrozenInstanceError, AttributeError, TypeError)):
             registry.maximum_images = 999
 
-    def test_actual_three_profile_argv_adds_pinned_image_limit_without_mode_changes(self):
+    def test_legacy_three_profile_argv_adds_pinned_image_limit_without_mode_changes(self):
         registry = load_registry(ROOT)
+        legacy_profiles = tuple(profile for profile in registry.profiles
+                                if profile.engine_id == LEGACY_ENGINE)
+        self.assertEqual(tuple(profile.profile_id for profile in legacy_profiles),
+                         ('ctx64k', 'ctx128k', 'ctx262k'))
         with tempfile.TemporaryDirectory() as temporary:
             trusted = {'registry': registry, 'data_root': Path(temporary).resolve(),
                        'binaries': {'lily': Path('/synthetic/pinned-lily')},
                        'config': {'model_dir': '/synthetic/same-Q4', 'ports': {'guard': 18080}}}
             caches = []
-            for profile in registry.profiles:
+            for profile in legacy_profiles:
                 argv = model_runner.lily_argv(trusted, 19000, profile_id=profile.profile_id, allow_validation=True)
                 values = dict(zip(argv[1::2], argv[2::2]))
                 self.assertEqual(values['--max-images'], '64')

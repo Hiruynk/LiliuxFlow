@@ -118,7 +118,11 @@ class RunnerAdvisoryTests(unittest.TestCase):
                                stopped=stopped, popen=popen, memory=memory)
 
     def test_all_profiles_start_and_remain_running_below_recommended_ram(self):
-        for profile in self.registry.profiles:
+        legacy_profiles = tuple(profile for profile in self.registry.profiles
+                                 if profile.engine_id == profile_registry.LEGACY_ENGINE)
+        self.assertEqual(tuple(profile.profile_id for profile in legacy_profiles),
+                         ('ctx64k', 'ctx128k', 'ctx262k'))
+        for profile in legacy_profiles:
             with self.subTest(profile_id=profile.profile_id):
                 low = (profile.minimum_ram_headroom_gib - 1) * GIB
                 result = self.execute(profile.profile_id, [low] * 4)

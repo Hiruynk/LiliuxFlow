@@ -253,6 +253,13 @@ def profiles(args):
         registry=validate(no_symlinks(args.data_root),require_checkpoint=False)['registry'];catalog_source='trusted_installation'
     if args.profile_command=='list':
         emit({'default_profile_id':registry.default.profile_id,'profiles':[p.as_dict() for p in registry.profiles],'catalog_source':catalog_source,'network_operation':False,'model_loaded_by_command':False});return 0
+    if args.profile_command=='grant-ui-user':
+        from trust import validate
+        from agent import reconcile_ui_user
+        trusted=validate(no_symlinks(args.data_root));ids=args.profile_ids
+        if len(set(ids))!=len(ids):raise DistributionError('UI user profile grants must be unique')
+        aliases=tuple(trusted['registry'].by_id(pid).public_alias for pid in ids)
+        emit(reconcile_ui_user(trusted,args.user_id,dry_run=not args.execute,authorized_opt_in_aliases=aliases));return 0
     profile=next((p for p in registry.profiles if p.profile_id==args.profile_id),None)
     if profile is None:raise DistributionError('profile ID is outside the finite registry')
     if args.profile_command=='info':emit({**profile.as_dict(),'catalog_source':catalog_source,'network_operation':False,'model_loaded_by_command':False});return 0
@@ -617,6 +624,9 @@ def main():
     profile_commands.add_parser('info').add_argument('profile_id')
     command=profile_commands.add_parser('grant-owner',help='append the enabled opt-in alias only to the existing designated owner caller')
     command.add_argument('profile_id',choices=('ctx64k-mtp2','ctx128k-mtp2','ctx262k-mtp2'))
+    grant=command.add_mutually_exclusive_group(required=True);grant.add_argument('--dry-run',action='store_true');grant.add_argument('--execute',action='store_true')
+    command=profile_commands.add_parser('grant-ui-user',help='append explicit enabled MTP2 models to one named UI user; sign in again afterward')
+    command.add_argument('user_id');command.add_argument('profile_ids',nargs='+',choices=('ctx64k-mtp2','ctx128k-mtp2','ctx262k-mtp2'))
     grant=command.add_mutually_exclusive_group(required=True);grant.add_argument('--dry-run',action='store_true');grant.add_argument('--execute',action='store_true')
     args = parser.parse_args()
     os.umask(0o077)

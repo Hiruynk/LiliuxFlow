@@ -36,11 +36,24 @@ class CatalogTests(unittest.TestCase):
         with patch.object(installer, '_sdk', side_effect=AssertionError('version must not initialize SDK')), patch.object(cli, 'load_install', side_effect=AssertionError('version must not read installation')), patch.object(sys, 'argv', ['lf', '--version']), contextlib.redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(SystemExit) as result:cli.main()
         self.assertEqual(result.exception.code, 0);self.assertEqual(output.getvalue().strip(), 'LiliuxFlow 0.1.0')
-    def test_canonical_inventory_is_referenced_once_with_three_profiles_and_no_default_download(self):
+    def test_canonical_inventory_is_shared_by_six_profiles_and_keeps_default(self):
         model = catalog.select_model(ROOT, catalog.MODEL_ID)
         self.assertEqual(model.total_bytes, 105_518_409_249)
         self.assertEqual(len(model.inventory['files']), 67)
-        self.assertEqual([p.context_tokens for p in model.profiles], [65536, 131072, 262144])
+        self.assertEqual([p.profile_id for p in model.profiles],
+                         ['ctx64k', 'ctx128k', 'ctx262k',
+                          'ctx64k-mtp2', 'ctx128k-mtp2', 'ctx262k-mtp2'])
+        self.assertEqual([p.context_tokens for p in model.profiles],
+                         [65536, 131072, 262144, 65536, 131072, 262144])
+        self.assertEqual({p.runtime_model_id for p in model.profiles},
+                         {catalog.SHARED['runtime_model_id']})
+        self.assertEqual(model.entry['repository'], catalog.SHARED['model_repository'])
+        self.assertEqual(model.entry['revision'], catalog.SHARED['model_revision'])
+        public_profiles = model.public_info()['profiles']
+        self.assertEqual([profile['model'] for profile in public_profiles],
+                         [profile.public_alias for profile in model.profiles])
+        self.assertEqual([profile['default'] for profile in public_profiles],
+                         [True, False, False, False, False, False])
         self.assertFalse(model.entry['install_by_default'])
         self.assertFalse(model.entry['redistribute_payload'])
         self.assertNotIn('files', model.entry)

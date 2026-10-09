@@ -62,6 +62,8 @@ For an installation with the selected profile enabled and granted to your virtua
 
 Omitting thinking controls preserves checkpoint-default HIGH thinking. Input and output share the selected total context; reasoning counts toward the output budget, whose maximum is 65,536 tokens for every profile. The aliases also select enabled profiles in legacy requests. Request parameters and caller grants cannot enable a disabled profile or override its engine, KV precision or context.
 
+For an explicitly selected UI login user, preview `lf profiles grant-ui-user my-ui-user ctx64k-mtp2 ctx128k-mtp2 ctx262k-mtp2 --dry-run`, then use `--execute` to append only enabled profiles. This models-only update preserves the user's role and limits; sign out and sign in again so a new dashboard session inherits the user models. It does not change ordinary API keys.
+
 ## Images in Chat Completions
 
 The OpenAI-compatible interface accepts up to **64 image inputs across the entire conversation**, including images resent in earlier user messages. Use PNG or JPEG data URLs in `image_url` content parts. The whole request remains limited to 8 MiB; image decoding, per-image resizing and the selected model's total context limit also apply. Images are preserved rather than silently removed to fit a limit.
