@@ -22,6 +22,21 @@ from common import DistributionError, private_directory, read_object, write_json
 from ownership import capture, unchanged, terminate
 from profile_registry import ProfileRegistry, legacy_registry, MINIMUM_RAM_HEADROOM_GIB, OPENAI_MAX_IMAGES
 from trust import validate, atomic_private_json
+from optin_engine import OPT64, engine_for, record_fields, latest_argv, effective_env
+
+
+def pending_owned_identity(process, runner_identity, argv):
+    """Reconcile only this wrapper's still-unreaped Popen; never infer gone."""
+    if process.poll() is not None:
+        process.wait(); return None
+    from ownership import inspect
+    row = inspect(process.pid, executable=Path(argv[0]))
+    if (row is None or row.get('pid') != process.pid or row.get('ppid') != runner_identity['pid']
+        or row.get('uid') != os.getuid() or not isinstance(row.get('started'), str)
+        or row.get('command_sha256') != hashlib.sha256(' '.join(argv).encode()).hexdigest()):
+        raise DistributionError('pending native identity is unknown; owner and lease retained')
+    return row
+
 
 
 def memory_available():
@@ -90,7 +105,10 @@ def lily_argv(trusted, port, *, profile_id='ctx64k', allow_validation=False, cac
     if type(port) is not int or not 1024 <= port <= 65535 or port in trusted['config']['ports'].values():
         raise DistributionError('Lily backend port conflicts with a control-plane port')
     profile = selected_profile(trusted, profile_id, allow_validation=allow_validation)
+    engine = engine_for(trusted, profile)
     cache = private_directory(cache_dir if cache_dir is not None else trusted['data_root'] / 'cache' / profile.cache_namespace)
+    if engine is not None:
+        return latest_argv(engine, profile, trusted['binaries']['lily_opt64'], trusted['config']['model_dir'], port, cache)
     return [str(trusted['binaries']['lily']), '--model', trusted['config']['model_dir'],
             '--bind', '127.0.0.1:' + str(port), '--max-seq', str(profile.context_tokens),
             '--mtp-drafts', '0', '--ngram-table', 'paged', '--ngram-preload', 'false',
@@ -208,6 +226,9 @@ class LaneState:
     MEMORY = re.compile(r'^memory: ([0-9]{1,5}\.[0-9]) GB allocated, ([0-9]{1,5}\.[0-9]) GB recommended working set, ([0-9]{1,5}\.[0-9]) GB session cache budget \(([0-9]{1,12}) B/token of context; a full ([0-9]{1,12})-token request needs ([0-9]{1,5}\.[0-9]) GB\)$')
 
     def __init__(self, path, record):
+        self.latest_engine = record.get('engine_id') == OPT64
+        if self.latest_engine and (record.get('profile_id')!='ctx64k-mtp2' or record.get('context_tokens')!=65536):
+            raise DistributionError('native metadata engine/profile binding differs')
         self.path = Path(path)
         self.lock = threading.Lock()
         self.record = {**record, 'event_sequence': 0, 'acquired_sequence': 0,
@@ -216,12 +237,19 @@ class LaneState:
                        'qsa_route_effective': None, 'qsa_dispatch_metadata': None,
                        'native_context_tokens': None, 'native_memory': None,
                        'proof_valid': True, 'stderr_closed': False, 'child_exited': False}
+        if self.latest_engine:
+            self.record.update(native_engine_effective=None,last_acquired_request_id=None,ngram_preload_observed=None,
+                last_cancelled_request_id=None,cancelled_session_dropped=False,queued_request_ids=[],
+                queue_event_sequence=0,queue_entered_sequence=0,queue_terminal_sequence=0,queue_acquired_sequence=0)
         self._write()
 
     def _write(self):
         atomic_private_json(self.path, self.record)
 
     def consume(self, raw):
+        if self.latest_engine:
+            from native_metadata import consume_latest
+            return consume_latest(self, raw)
         route, dispatch, memory = self.ROUTE.fullmatch(raw), self.DISPATCH.fullmatch(raw), self.MEMORY.fullmatch(raw)
         if route or dispatch or memory:
             with self.lock:
@@ -298,6 +326,9 @@ def _drain_metadata(pipe, state):
             if not raw:
                 break
             if len(raw) > 8192 or not raw.endswith(b'\n'):
+                if state.latest_engine:
+                    with state.lock:
+                        state.record['proof_valid']=False;state._write()
                 while raw and not raw.endswith(b'\n'):
                     raw = pipe.readline(8193)
                 continue
@@ -320,6 +351,8 @@ def execute_trusted(trusted, port, *, profile_id='ctx64k', allow_validation=Fals
     Root paths are private internal arguments, never public request/CLI input.
     """
     profile = selected_profile(trusted, profile_id, allow_validation=allow_validation)
+    engine = engine_for(trusted,profile)
+    binary_name = 'lily_opt64' if engine else 'lily'
     argv = lily_argv(trusted, port, profile_id=profile_id, allow_validation=allow_validation, cache_dir=cache_dir)
     registry = trusted.get('registry') or legacy_registry(trusted['profile'])
     if cache_roots is None:
@@ -348,9 +381,10 @@ def execute_trusted(trusted, port, *, profile_id='ctx64k', allow_validation=Fals
               'minimum_ram_headroom_gib': profile.minimum_ram_headroom_gib,
               'ram_headroom_policy': 'advisory',
               'recommended_ram_headroom_gib': profile.minimum_ram_headroom_gib,
-              'backend_port': port, 'binary_sha256': trusted['trust']['binaries']['lily']['sha256'],
+              'backend_port': port, 'binary_sha256': trusted['trust']['binaries'][binary_name]['sha256'],
               'argv_sha256': hashlib.sha256(json.dumps(argv, separators=(',', ':')).encode()).hexdigest(),
               'startup_id': uuid.uuid4().hex}
+    record.update(record_fields(engine))
     write_json_new(lease / 'lease.json', record)
     child = identity = state = drain = None
     handlers = {}
@@ -365,10 +399,11 @@ def execute_trusted(trusted, port, *, profile_id='ctx64k', allow_validation=Fals
         for signum in (signal.SIGTERM, signal.SIGINT):
             handlers[signum] = signal.signal(signum, forward)
         env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(Path.home()),
-               'TMPDIR': str(private_directory(run_root / 'tmp')), 'LANG': 'en_US.UTF-8', 'LILY_QSA_ROUTE': 'split'}
+               'TMPDIR': str(private_directory(run_root / 'tmp')), 'LANG': 'en_US.UTF-8'}
+        env = effective_env(env) if engine else {**env, 'LILY_QSA_ROUTE':'split'}
         ram_warned = _warn_ram_headroom_once(preflight_ram, False)
         child = subprocess.Popen(argv, env=env, stderr=subprocess.PIPE)
-        identity = capture(child.pid, parent=os.getpid(), executable=trusted['binaries']['lily'])
+        identity = capture(child.pid, parent=os.getpid(), executable=trusted['binaries'][binary_name])
         record['child'] = identity
         atomic_private_json(lease / 'lease.json', record)
         atomic_private_json(run_root / 'model.json', record)
@@ -398,6 +433,10 @@ def execute_trusted(trusted, port, *, profile_id='ctx64k', allow_validation=Fals
             time.sleep(1)
         return child.wait()
     finally:
+        if engine and child is not None and child.poll() is None and identity is None:
+            identity = pending_owned_identity(child, runner, argv)
+            record['child']=identity
+            atomic_private_json(lease/'lease.json',record)
         if child is not None and child.poll() is None and identity:
             terminate(identity, grace=20)
         if child is not None and child.poll() is not None:
@@ -431,7 +470,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data-root', type=Path, required=True)
     parser.add_argument('--port', type=int, required=True)
-    parser.add_argument('--profile', default='ctx64k', choices=('ctx64k', 'ctx128k', 'ctx262k'))
+    parser.add_argument('--profile', default='ctx64k', choices=('ctx64k', 'ctx128k', 'ctx262k', 'ctx64k-mtp2'))
     parser.add_argument('--validation', action='store_true')
     args = parser.parse_args()
     os.umask(0o077)

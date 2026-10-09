@@ -21,7 +21,11 @@ TARGETS = (
     ('ctx128k', 'qwen3.8-flash-next-lily-q4-128k', 131072, 4272, 600, 2, 10 * 1024**3),
     ('ctx262k', 'qwen3.8-flash-next-lily-q4-262k', 262144, 4872, 900, 1, 10 * 1024**3),
 )
-MINIMUM_RAM_HEADROOM_GIB = {'ctx64k': 15, 'ctx128k': 15, 'ctx262k': 13}
+LEGACY_ENGINE = 'legacy-db3-mtp0'
+OPT64_ENGINE = 'latest13f-defer-pc123-mtp2-opt64k'
+OPT64_PROFILE = 'ctx64k-mtp2'
+OPT64_ALIAS = 'qwen3.8-flash-next-lily-q4-mtp2-64k'
+MINIMUM_RAM_HEADROOM_GIB = {'ctx64k-mtp2': 15, 'ctx64k': 15, 'ctx128k': 15, 'ctx262k': 13}
 SHARED = {
     'runtime_model_id': 'Qwen3.8-Flash-Next',
     'model_repository': 'fabiogreter/Qwen3.8-Flash-Next-lily-q4',
@@ -50,10 +54,15 @@ class RuntimeProfile:
     production_enabled: bool
     validation_only: bool
     minimum_ram_headroom_gib: int = 15
+    engine_id: str = LEGACY_ENGINE
 
     def as_dict(self):
         # Returning a detached value cannot mutate a running request's profile.
-        return {**SHARED, **asdict(self)}
+        value = {**SHARED, **asdict(self)}
+        if self.engine_id == OPT64_ENGINE:
+            value.update(mtp_drafts=2, kv_cache='bf16', max_batch=1, qsa_scores='scalar',
+                         ngram_preload=True, thinking_budget='off', thinking_nudges=False, tool_call_ends_thinking=False)
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,11 +113,11 @@ def _same(actual, expected):
     return type(actual) is type(expected) and actual == expected
 
 
-def parse_registry(document):
+def parse_registry(document, *, enabled_optin_profiles=()):
     expected_keys = {'schema_version', 'default_profile_id', 'pending_limit', 'maximum_body_bytes',
                      'total_disk_cache_cap_bytes', 'temporary_cache_reserve_bytes', 'maximum_added_cache_bytes',
                      'minimum_free_disk_bytes', 'shared', 'profiles'}
-    if not isinstance(document, dict) or set(document) != expected_keys:
+    if not isinstance(document, dict) or set(document) not in (expected_keys, expected_keys | {'optin_profiles'}):
         raise DistributionError('context registry schema fields differ')
     fixed = {'schema_version': 1, 'default_profile_id': 'ctx64k', 'pending_limit': 4,
              'maximum_body_bytes': 8 * 1024**2, 'total_disk_cache_cap_bytes': 64 * 1024**3,
@@ -123,7 +132,7 @@ def parse_registry(document):
     if not isinstance(rows, list) or len(rows) != len(TARGETS):
         raise DistributionError('context registry must contain exactly three canonical profiles')
     profiles = []
-    fields = set(RuntimeProfile.__dataclass_fields__) - {'runtime_model_id'}
+    fields = set(RuntimeProfile.__dataclass_fields__) - {'runtime_model_id', 'engine_id'}
     for row, (pid, alias, context, deadline, wait, sessions, disk) in zip(rows, TARGETS):
         if not isinstance(row, dict) or set(row) != fields:
             raise DistributionError('context profile fields differ')
@@ -150,6 +159,25 @@ def parse_registry(document):
         raise DistributionError('the established default 64K profile must remain enabled')
     if sum(p.disk_cache_bytes for p in profiles) + document['temporary_cache_reserve_bytes'] > document['total_disk_cache_cap_bytes']:
         raise DistributionError('context disk retention does not leave the shared temporary reserve')
+    opt_rows = document.get('optin_profiles', [])
+    if (not isinstance(enabled_optin_profiles, (tuple, list))
+        or list(enabled_optin_profiles) not in ([], [OPT64_PROFILE])
+        or not isinstance(opt_rows, list) or len(opt_rows) > 1):
+        raise DistributionError('opt-in profile authorization differs')
+    if opt_rows:
+        row = opt_rows[0]
+        expected = {'profile_id':OPT64_PROFILE, 'public_alias':OPT64_ALIAS, 'context_tokens':65536,
+                    'default_output_tokens':65536, 'total_deadline_seconds':3672, 'queue_wait_seconds':300,
+                    'idle_ttl_seconds':1800, 'cache_bytes':8*1024**3, 'max_sessions':1, 'disk_cache_bytes':0,
+                    'cache_namespace':'lily-q4-afde8b8e-13f7b540-pc123-split-scalar-bf16-mtp2-ctx64k',
+                    'production_enabled':False, 'validation_only':False, 'minimum_ram_headroom_gib':15,
+                    'engine_id':OPT64_ENGINE}
+        if not isinstance(row, dict) or set(row)!=set(expected) or any(not _same(row[k],v) for k,v in expected.items()):
+            raise DistributionError('opt-in profile differs from the finite 64K contract')
+        selected = {**row, 'production_enabled': bool(enabled_optin_profiles)}
+        profiles.append(RuntimeProfile(runtime_model_id=SHARED['runtime_model_id'], **selected))
+    elif enabled_optin_profiles:
+        raise DistributionError('authorized opt-in profile is missing from the trusted registry')
     return ProfileRegistry(tuple(profiles))
 
 

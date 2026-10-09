@@ -120,7 +120,8 @@ class _GuardError(Exception):
 
 
 class _CallerGone(Exception):
-    pass
+    def __init__(self):
+        self.generation_failed = False
 
 
 async def _stage(awaitable: Any, *, deadline: float, disconnect: asyncio.Task | None = None):
@@ -135,12 +136,23 @@ async def _stage(awaitable: Any, *, deadline: float, disconnect: asyncio.Task | 
         if task not in done:
             raise _GuardError(504, 'request_deadline', 'request exceeded its selected profile deadline')
         return await task
-    except BaseException:
+    except BaseException as error:
         if not task.done():
             task.cancel()
         outcome = await asyncio.gather(task, return_exceptions=True)
+        if isinstance(error,_CallerGone) and outcome:
+            value = outcome[0]
+            if (isinstance(value,httpx.Response) and not value.is_success
+                or isinstance(value,BaseException) and not isinstance(value,asyncio.CancelledError)):
+                error.generation_failed = True
         if outcome and isinstance(outcome[0], httpx.Response):
-            await outcome[0].aclose()
+            try:
+                await outcome[0].aclose()
+            except Exception:
+                if isinstance(error,_CallerGone):
+                    error.generation_failed = True
+                else:
+                    raise
         raise
 
 
@@ -153,25 +165,42 @@ class _ProfileTicket:
     cleanup_profile: Any = None
     stage: str = 'loading'
     pre_admission_rejected: bool = False
+    caller_cancelled: bool = False
+    generation_failed: bool = False
 
 
 class _ProfileStreamingResponse(StreamingResponse):
     """One disconnect reader, with cleanup even when ASGI send itself fails."""
-    def __init__(self, content: Any, *, disconnect: asyncio.Task, cleanup: Callable, **kwargs):
+    def __init__(self, content: Any, *, disconnect: asyncio.Task, cleanup: Callable, ticket=None, **kwargs):
         super().__init__(content, **kwargs)
         self.disconnect = disconnect
         self.cleanup = cleanup
+        self.ticket = ticket
 
     async def __call__(self, scope, receive, send):
         streaming = asyncio.create_task(self.stream_response(send))
         try:
             done, _ = await asyncio.wait({streaming, self.disconnect}, return_when=asyncio.FIRST_COMPLETED)
             if self.disconnect in done:
+                if self.ticket is not None:
+                    if not self.disconnect.cancelled() and self.disconnect.exception() is None:
+                        self.ticket.caller_cancelled = True
+                    else:
+                        self.ticket.generation_failed = True
                 if not streaming.done():
                     streaming.cancel()
-                await asyncio.gather(streaming, return_exceptions=True)
+                outcome = await asyncio.gather(streaming, return_exceptions=True)
+                if self.ticket is not None and any(isinstance(value,BaseException) and
+                    not isinstance(value,(asyncio.CancelledError,_CallerGone)) for value in outcome):
+                    self.ticket.generation_failed = True
+                if self.ticket is not None and any(isinstance(value,_CallerGone) and value.generation_failed for value in outcome):
+                    self.ticket.generation_failed = True
             else:
                 await streaming
+        except BaseException:
+            if self.ticket is not None:
+                self.ticket.generation_failed = True
+            raise
         finally:
             streaming.cancel()
             self.disconnect.cancel()
@@ -739,11 +768,13 @@ class _ContextLifecycleGuard(_LifecycleGuard):
         ticket.cleanup_profile = None
 
     async def _finish(self, ticket, response, *, complete):
+        close_failed = False
         if response is not None:
             try:
                 await response.aclose()
             except Exception:
                 complete = False
+                close_failed = True
         ticket.stage = 'cleanup'
         safe = not ticket.forwarded and ticket.cleanup_profile is None
         deadline = asyncio.get_running_loop().time() + self.cleanup_seconds
@@ -770,6 +801,19 @@ class _ContextLifecycleGuard(_LifecycleGuard):
                         safe = True
                         self._resident_profile = ticket.profile
                         self._last_release_method = 'native_lane'
+                    except (Exception, asyncio.CancelledError):
+                        await self._stop_and_prove(ticket.profile, deadline)
+                        safe = True
+                        self._last_release_method = 'owned_child_exit'
+                elif (getattr(ticket.profile,'engine_id',None)=='latest13f-defer-pc123-mtp2-opt64k'
+                      and ticket.caller_cancelled and not ticket.generation_failed and not close_failed
+                      and (response is None or response.is_success)):
+                    try:
+                        await self._proof(ticket.profile, 'generation_cancelled',
+                                          deadline=min(deadline, asyncio.get_running_loop().time() + self.proof_wait_seconds))
+                        safe = True
+                        self._resident_profile = ticket.profile
+                        self._last_release_method = 'native_cancelled_session_drop'
                     except (Exception, asyncio.CancelledError):
                         await self._stop_and_prove(ticket.profile, deadline)
                         safe = True
@@ -918,27 +962,39 @@ class _ContextLifecycleGuard(_LifecycleGuard):
                         if terminal_seen:
                             complete = response.is_success
                             return
-                except _CallerGone:
+                except _CallerGone as error:
+                    ticket.caller_cancelled = True
+                    ticket.generation_failed = ticket.generation_failed or error.generation_failed
                     return
                 except _GuardError as error:
+                    ticket.generation_failed = True
                     if not terminal_seen and 'text/event-stream' in response.headers.get('content-type', ''):
                         packet = {'error': {'type': error.code, 'message': error.detail}}
                         yield ('data: ' + json.dumps(packet, separators=(',', ':')) + '\n\ndata: [DONE]\n\n').encode()
                     return
                 except httpx.HTTPError:
+                    ticket.generation_failed = True
                     if not terminal_seen and 'text/event-stream' in response.headers.get('content-type', ''):
                         yield b'data: {"error":{"type":"manager_unavailable","message":"upstream stream failed"}}\n\ndata: [DONE]\n\n'
                     return
+                except Exception:
+                    ticket.generation_failed = True
+                    raise
 
             async def cleanup():
                 await self._finish(ticket, response, complete=complete)
 
             delegated = True
-            return _ProfileStreamingResponse(chunks(), disconnect=disconnect, cleanup=cleanup,
+            return _ProfileStreamingResponse(chunks(), disconnect=disconnect, cleanup=cleanup, ticket=ticket,
                                              status_code=response.status_code, headers=headers, media_type=None)
-        except _CallerGone:
+        except _CallerGone as error:
+            if ticket is not None:
+                ticket.caller_cancelled = True
+                ticket.generation_failed = ticket.generation_failed or error.generation_failed
             return _ClientGoneResponse()
         except ClientDisconnect:
+            if ticket is not None:
+                ticket.caller_cancelled = True
             return _ClientGoneResponse()
         except _GuardError as error:
             result = _control_body(error.status, error.code, error.detail)

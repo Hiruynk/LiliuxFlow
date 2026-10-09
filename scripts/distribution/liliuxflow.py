@@ -240,8 +240,33 @@ def configure_runtime(args):
 def build_runtime(args):
     from build_native import build
     emit(build(no_symlinks(args.data_root), cargo=args.cargo, go=args.go, node=args.node,
-               npm_cli=args.npm_cli, pg_bin=args.pg_bin, ui_manifest=args.ui_manifest, execute=args.execute))
+               npm_cli=args.npm_cli, pg_bin=args.pg_bin, ui_manifest=args.ui_manifest, execute=args.execute,optin_engine=getattr(args,'optin_engine',None)))
     return 0
+
+def profiles(args):
+    from profile_registry import load_registry
+    registry=load_registry(ROOT)
+    catalog_source='source_catalog'
+    install=Path(args.data_root)/'install.json'
+    if install.exists() and read_object(no_symlinks(install)).get('runtime_state') not in (None,'NOT_BUILT'):
+        from trust import validate
+        registry=validate(no_symlinks(args.data_root),require_checkpoint=False)['registry'];catalog_source='trusted_installation'
+    if args.profile_command=='list':
+        emit({'default_profile_id':registry.default.profile_id,'profiles':[p.as_dict() for p in registry.profiles],'catalog_source':catalog_source,'network_operation':False,'model_loaded_by_command':False});return 0
+    profile=next((p for p in registry.profiles if p.profile_id==args.profile_id),None)
+    if profile is None:raise DistributionError('profile ID is outside the finite registry')
+    if args.profile_command=='info':emit({**profile.as_dict(),'catalog_source':catalog_source,'network_operation':False,'model_loaded_by_command':False});return 0
+    if args.profile_id!='ctx64k-mtp2':raise DistributionError('explicit caller opt-in supports only ctx64k-mtp2')
+    from trust import validate
+    from agent import reconcile_owner_caller
+    trusted=validate(no_symlinks(args.data_root))
+    selected=trusted['registry'].by_id('ctx64k-mtp2')
+    emit(reconcile_owner_caller(trusted,dry_run=not args.execute,authorized_opt_in_aliases=(selected.public_alias,)));return 0
+
+def build_optin_runtime(args):
+    from build_native import build_optin_candidate,build_optin_source_candidate
+    action=build_optin_source_candidate if args.source_only else build_optin_candidate
+    emit(action(no_symlinks(args.data_root),cargo=args.cargo,execute=args.execute));return 0
 
 def verify_model(args):
     from trust import verify_checkpoint, verify_metadata
@@ -566,8 +591,12 @@ def main():
     commands.add_parser('configure').add_argument('--port',action='append',type=parse_port,required=True)
     command = commands.add_parser('build')
     command.add_argument('--execute', action='store_true')
+    command.add_argument('--optin-engine',choices=('latest13f-defer-pc123-mtp2-opt64k',),help='explicitly build and enable the optional MTP2 64K engine alongside the established MTP0 profiles')
     for name in ('cargo','go','node','npm-cli','pg-bin','ui-manifest'):
         command.add_argument('--'+name, type=Path)
+    command=commands.add_parser('build-optin',help='add only the finite MTP2 engine, or compile a fresh source candidate without enablement')
+    command.add_argument('--source-only',action='store_true',help='compile/source receipt only for a NOT_BUILT private candidate; no model routes or legacy runtime receipt')
+    command.add_argument('--execute',action='store_true');command.add_argument('--cargo',type=Path)
     command=commands.add_parser('initialize')
     command.add_argument('--execute', action='store_true')
     command.add_argument('--controlplane-only', action='store_true')
@@ -583,6 +612,12 @@ def main():
     command = commands.add_parser('build-release')
     command.add_argument('--commit', required=True)
     command.add_argument('--output', type=Path, required=True)
+    profile_commands=commands.add_parser('profiles',help='read-only profile catalog and explicit designated owner opt-in').add_subparsers(dest='profile_command',required=True)
+    profile_commands.add_parser('list')
+    profile_commands.add_parser('info').add_argument('profile_id')
+    command=profile_commands.add_parser('grant-owner',help='append the enabled opt-in alias only to the existing designated owner caller')
+    command.add_argument('profile_id',choices=('ctx64k-mtp2',))
+    grant=command.add_mutually_exclusive_group(required=True);grant.add_argument('--dry-run',action='store_true');grant.add_argument('--execute',action='store_true')
     args = parser.parse_args()
     os.umask(0o077)
     try:
@@ -590,8 +625,8 @@ def main():
             from package import build_archive
             emit(build_archive(ROOT, args.commit, args.output))
             return 0
-        return {'setup': setup, 'models': models, 'doctor': doctor, 'status': status, 'start': require_runtime, 'stop': require_runtime,
-                'backup': backup, 'uninstall': uninstall, 'configure': configure_runtime, 'build': build_runtime, 'initialize': initialize_runtime,
+        return {'setup': setup, 'models': models, 'profiles':profiles,'doctor': doctor, 'status': status, 'start': require_runtime, 'stop': require_runtime,
+                'backup': backup, 'uninstall': uninstall, 'configure': configure_runtime, 'build': build_runtime, 'build-optin':build_optin_runtime,'initialize': initialize_runtime,
                 'verify-model': verify_model, 'restore': restore_runtime, 'rollback': rollback_runtime}[args.command](args)
     except KeyboardInterrupt:
         message = 'operation cancelled'

@@ -98,6 +98,14 @@ def validate(data, *, require_checkpoint=True, trace=None):
         raise DistributionError('release trust upstream source differs')
     if trust.get('lily_patch_sha256') != [x['sha256'] for x in pinned['lily']['patches']]:
         raise DistributionError('release trust canonical Lily patch series differs')
+    engine_support=trust.get('engine_contract_support')
+    if engine_support is not None and (not isinstance(engine_support,dict) or set(engine_support)!={'schema_version'}
+        or type(engine_support.get('schema_version')) is not int or engine_support['schema_version']!=1):
+        raise DistributionError('release engine contract support schema differs')
+    if 'lily_opt64' in pinned and engine_support is None:
+        raise DistributionError('new engine source requires versioned runtime helper trust')
+    from optin_engine import validate_engine_records
+    engines = validate_engine_records(trust, pinned)
     step('profile_open',trust['profile']['path'])
     profile = read_object(verified_file(source, trust['profile']))
     if any(profile.get(key) != value or (type(value) in (bool, int) and type(profile.get(key)) is not type(value)) for key, value in PROFILE.items()):
@@ -112,7 +120,8 @@ def validate(data, *, require_checkpoint=True, trace=None):
         if not isinstance(registry_record, dict) or registry_record.get('path') != REGISTRY_PATH:
             raise DistributionError('release trust context registry path differs')
         step('profile_registry_open', REGISTRY_PATH)
-        registry = parse_registry(read_object(verified_file(source, registry_record)))
+        registry = parse_registry(read_object(verified_file(source, registry_record)),
+                                  enabled_optin_profiles=trust.get('enabled_optin_profiles', ()))
     for item in trust.get('source_files', []):
         step('source_file_open',item['path'])
         verified_file(source, item)
@@ -129,6 +138,19 @@ def validate(data, *, require_checkpoint=True, trace=None):
                                 'manifests/distribution/native-sources.json', 'manifests/distribution/checkpoint-files.json'})
     if not required_source.issubset({x['path'] for x in trust.get('source_files', [])}):
         raise DistributionError('release trust omits a serving boundary source')
+    if engine_support is not None:
+        required_source.update({'scripts/distribution/optin_engine.py','scripts/distribution/native_metadata.py',
+                                'scripts/distribution/native_recipe.py','scripts/distribution/build_native.py',
+                                'manifests/distribution/native-sources.json','manifests/distribution/lily-opt64-source-baseline.json'})
+        required_source.update(row['path'] for row in pinned['lily_opt64']['patches'])
+    if engines:
+        if registry_record is None:
+            raise DistributionError('generated opt-in engine requires a hash-bound registry')
+        required_source.update({'scripts/distribution/optin_engine.py','scripts/distribution/native_recipe.py',
+                                'scripts/distribution/native_metadata.py','manifests/distribution/native-sources.json','manifests/distribution/lily-opt64-source-baseline.json'})
+        required_source.update(row['path'] for row in pinned['lily_opt64']['patches'])
+    if not required_source.issubset({x['path'] for x in trust.get('source_files', [])}):
+        raise DistributionError('release trust omits an opt-in engine boundary source')
     if optional_support is not None:
         from model_catalog import load_catalog
         load_catalog(source)
@@ -195,8 +217,13 @@ def validate(data, *, require_checkpoint=True, trace=None):
     for name,item in trust['binaries'].items():
         step('binary_open',item['path'])
         binaries[name]=verified_file(data,item)
-    if set(binaries) != {'lily', 'llama_swap', 'compat_python', 'litellm_python'} or any(not os.access(p, os.X_OK) for p in binaries.values()):
+    expected_binaries = {'lily', 'llama_swap', 'compat_python', 'litellm_python'} | ({'lily_opt64'} if engines else set())
+    if set(binaries) != expected_binaries or any(not os.access(p, os.X_OK) for p in binaries.values()):
         raise DistributionError('release executable set is incomplete')
+    if engines:
+        from optin_engine import OPT64
+        if trust['binaries']['lily_opt64'].get('path') != 'runtime/bin/lily-opt64' or trust['binaries']['lily_opt64']['sha256'] != engines[OPT64].binary_sha256:
+            raise DistributionError('opt-in engine and actual executable identity differ')
     build_tools=trust.get('build_tools',{})
     if set(build_tools)!={'node','npm','npm_cli'}:
         raise DistributionError('installation-owned Node tool trust is incomplete')
@@ -234,7 +261,7 @@ def validate(data, *, require_checkpoint=True, trace=None):
                     raise DistributionError('checkpoint runtime metadata hash differs')
     step('trust_complete')
     return {'config': config, 'profile': profile, 'registry': registry, 'profiles': registry.enabled_profiles if configured else (),
-            'trust': trust, 'binaries': binaries, 'secrets': secrets, 'checkpoint': checkpoint,
+            'trust': trust, 'binaries': binaries, 'engines': engines, 'secrets': secrets, 'checkpoint': checkpoint,
             'model_configured': configured,
             'source_root': source, 'data_root': data}
 

@@ -121,5 +121,35 @@
       "executable": "bin/node",
       "npm_cli": "lib/node_modules/npm/bin/npm-cli.js"
     }
+  },
+  "lily_opt64": {
+    "repository": "fabiogreter/lily-qwen3.8-flash-next",
+    "commit": "13f7b540937dfafb33184aa0162a0e2d0fbfe65a",
+    "archive_sha256": "4406664bdb4df433a660dee85b6338b28e968d92ee5756c2656add17affe8758",
+    "patches": [
+      {
+        "path": "scripts/distribution/patches/lily-opt64/00-verified-event-defer.patch",
+        "sha256": "2e6a1a17c3c0a82ff0708c6e070ff69ac1b0f4a046cd8002cfcca868c73d075f",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-opt64/01-prefix-privacy.patch",
+        "sha256": "5a63f673c72eb20b360059f37754f76b8c7814da6c350c1b9c988337bdd09f94",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-opt64/02-cancel-drop-queue-terminal.patch",
+        "sha256": "eeeeeb30f92452a08eea37e1052f0ae1e67f84ece5ffcb84337e6ae569c1a534",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-opt64/03-effective-native-metadata.patch",
+        "sha256": "a84a99f1b70b177befa33842ade62894879ffa173395ac5149005c3ea08eccd9",
+        "unidiff_zero": false
+      }
+    ],
+    "source_inventory_sha256": "463795e9152d588f82f3fea27ef240a5f8798c2a4122820694b82294ffe27ce1",
+    "baseline": "manifests/distribution/lily-opt64-source-baseline.json",
+    "default": false
   }
 }

@@ -174,6 +174,10 @@ def configs(trusted, *, validation_profile_ids=()):
             'model_info':{'id':'liliuxflow-'+profile.profile_id,'mode':'chat','max_tokens':profile.context_tokens,
                           'max_input_tokens':profile.context_tokens,'max_output_tokens':min(profile.context_tokens,65536),
                           'default_output_tokens':profile.default_output_tokens,'context_profile_id':profile.profile_id}})
+        if profile.profile_id=='ctx64k-mtp2':manager['models'][alias]['name']+=' · MTP2 opt-in'
+        metadata=profile.as_dict()
+        for name in ('engine_id','mtp_drafts','kv_cache','max_batch','qsa_route','qsa_scores'):
+            if name in metadata:routes[-1]['model_info'][name]=metadata[name]
     lp={'model_list':routes,
         'general_settings':{'master_key':'os.environ/LITELLM_MASTER_KEY','database_url':'os.environ/DATABASE_URL',
          'allow_client_side_credentials':False,'store_prompts_in_spend_logs':False,'background_health_checks':False,'cancel_on_disconnect':True,
@@ -322,17 +326,23 @@ def profile_route_inventory(yaml_models, db_models, registry):
     return {'rows':rows,'conflicts':conflicts,'requires_review':bool(conflicts)}
 
 
-def _expanded_owner_models(current, enabled):
+OPTIN_ALIAS='qwen3.8-flash-next-lily-q4-mtp2-64k'
+def _owner_grant_models(enabled,authorized_opt_in_aliases=()):
+    if not isinstance(authorized_opt_in_aliases,tuple) or authorized_opt_in_aliases not in ((),(OPTIN_ALIAS,)):raise DistributionError('opt-in caller grant must name the exact finite alias')
+    if any(alias not in enabled for alias in authorized_opt_in_aliases):raise DistributionError('opt-in profile is not enabled in the trusted registry')
+    return [alias for alias in enabled if alias!=OPTIN_ALIAS or alias in authorized_opt_in_aliases]
+
+def _expanded_owner_models(current, enabled, authorized_opt_in_aliases=()):
     # LiteLLM treats [] as unrestricted. Refuse to infer a restricted grant from
     # wildcard/unrestricted ACLs, and never change another user's key here.
     if not isinstance(current,list) or not current or any(not isinstance(x,str) for x in current):
         raise DistributionError('designated owner model ACL must be explicit')
     if any('*' in x or x in ('all-proxy-models','all-team-models') for x in current):
         raise DistributionError('designated owner wildcard ACL requires explicit review')
-    return list(dict.fromkeys([*current,*enabled]))
+    return list(dict.fromkeys([*current,*_owner_grant_models(enabled,authorized_opt_in_aliases)]))
 
 
-def reconcile_designated_owner_caller(*, caller_path, expected_user_id, api_base, master_key, registry, backup_root, dry_run=False):
+def reconcile_designated_owner_caller(*, caller_path, expected_user_id, api_base, master_key, registry, backup_root, dry_run=False,authorized_opt_in_aliases=()):
     """Add enabled profiles to only the installation's designated existing key.
 
     Official models-only update endpoints preserve key identity, budget, expiry
@@ -361,8 +371,8 @@ def reconcile_designated_owner_caller(*, caller_path, expected_user_id, api_base
     if key_info.get('user_id')!=user or user_info.get('user_id')!=user:
         raise DistributionError('designated caller API ownership differs')
     enabled=[p.public_alias for p in registry.enabled_profiles]
-    key_models=_expanded_owner_models(key_info.get('models'),enabled)
-    user_models=_expanded_owner_models(user_info.get('models'),enabled)
+    key_models=_expanded_owner_models(key_info.get('models'),enabled,authorized_opt_in_aliases)
+    user_models=_expanded_owner_models(user_info.get('models'),enabled,authorized_opt_in_aliases)
     changes={'key_models':key_models,'user_models':user_models,'enabled_profiles':enabled,
              'key_changed':key_models!=key_info['models'],'user_changed':user_models!=user_info['models']}
     if dry_run:return changes
@@ -394,16 +404,16 @@ def reconcile_designated_owner_caller(*, caller_path, expected_user_id, api_base
             if changes['user_changed']:
                 http_json(base+'/user/update',method='POST',payload={'user_id':user,'models':user_info['models']},token=master)
             raise DistributionError('designated owner ACL verification failed; private rollback snapshot retained')
-    caller['models']=enabled
+    caller['models']=key_models
     atomic_private_json(destination,caller)
     return changes
 
 
-def reconcile_owner_caller(trusted, *, dry_run=False):
+def reconcile_owner_caller(trusted, *, dry_run=False,authorized_opt_in_aliases=()):
     data=trusted['data_root'];cfg=trusted['config']
     return reconcile_designated_owner_caller(caller_path=data/'secrets/caller.json',
         expected_user_id='local-'+cfg['installation_id'],api_base='http://127.0.0.1:'+str(cfg['ports']['litellm'])+'/v1',
-        master_key=trusted['secrets']['LITELLM_MASTER_KEY'],registry=trusted['registry'],backup_root=data/'backups/context-acl',dry_run=dry_run)
+        master_key=trusted['secrets']['LITELLM_MASTER_KEY'],registry=trusted['registry'],backup_root=data/'backups/context-acl',dry_run=dry_run,authorized_opt_in_aliases=authorized_opt_in_aliases)
 
 
 def make_caller(trusted):
@@ -412,7 +422,7 @@ def make_caller(trusted):
         if trusted.get('model_configured') is not False:
             reconcile_owner_caller(trusted)
         return
-    cfg=trusted['config'];alias=trusted['registry'].default.public_alias;models=[p.public_alias for p in trusted['registry'].enabled_profiles] if trusted.get('model_configured') is not False else ['liliuxflow:model-not-configured'];base='http://127.0.0.1:'+str(cfg['ports']['litellm']);master=trusted['secrets']['LITELLM_MASTER_KEY']
+    cfg=trusted['config'];alias=trusted['registry'].default.public_alias;models=_owner_grant_models([p.public_alias for p in trusted['registry'].enabled_profiles]) if trusted.get('model_configured') is not False else ['liliuxflow:model-not-configured'];base='http://127.0.0.1:'+str(cfg['ports']['litellm']);master=trusted['secrets']['LITELLM_MASTER_KEY']
     # LiteLLM [] means unrestricted. A management-only caller receives an
     # explicit unavailable grant; the empty installed catalog hides it.
     user='local-'+cfg['installation_id']

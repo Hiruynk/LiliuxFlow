@@ -14,6 +14,7 @@ import time
 from common import DistributionError, no_symlinks, read_object
 from ownership import unchanged
 from trust import private_file
+from optin_engine import OPT64, engine_for, record_fields, native_matches
 
 
 OWNER_KEYS = ('schema_version', 'installation_id', 'runner', 'child', 'profile_id', 'public_alias',
@@ -52,12 +53,34 @@ class RunnerResourceProbe:
     def __init__(self, trusted, *, run_root=None, lease_root=None):
         self.installation_id = trusted['config']['installation_id']
         self.binary_sha256 = trusted['trust']['binaries']['lily']['sha256']
+        self.trusted=trusted
+        self.binary_sha256s={profile.profile_id:trusted['trust']['binaries']['lily_opt64' if profile.engine_id==OPT64 and profile.production_enabled else 'lily']['sha256']
+                             for profile in trusted['registry'].profiles}
         self.profiles = {profile.profile_id: profile for profile in trusted['registry'].profiles}
         self.run_root = no_symlinks(run_root if run_root is not None else trusted['data_root'] / 'run')
         self.lease = no_symlinks((lease_root if lease_root is not None else
                                   Path.home() / 'Library/Application Support/LiliuxFlow-runtime-leases') / 'gpu.lease')
         self.baseline = None
         self.exit_snapshot = None
+
+    def _owner_keys(self, profile):
+        return OWNER_KEYS + (('engine_id','engine_source_commit','engine_source_inventory_sha256') if profile.engine_id==OPT64 else ())
+
+    def _runtime_matches(self, record, *, completed=False):
+        if not isinstance(record,dict):return False
+        if record.get('engine_id') != OPT64:
+            return record.get('native_context_tokens') == record.get('context_tokens')
+        counters = ('event_sequence', 'acquired_sequence', 'released_sequence')
+        if (any(type(record.get(k)) is not int or record[k] < 0 for k in counters)
+            or record['event_sequence'] != record['acquired_sequence'] + record['released_sequence']):
+            return False
+        queue_fields = ('queue_event_sequence','queue_entered_sequence','queue_terminal_sequence','queue_acquired_sequence')
+        if (record.get('queued_request_ids') != []
+            or any(type(record.get(k)) is not int or record[k] < 0 for k in queue_fields)
+            or record['queue_entered_sequence'] != record['queue_terminal_sequence'] + record['queue_acquired_sequence']
+            or record['queue_event_sequence'] != sum(record[k] for k in queue_fields[1:])):
+            return False
+        return native_matches(record, require_dispatch=completed)
 
     def _state(self):
         path = self.run_root / 'model-state.json'
@@ -68,10 +91,18 @@ class RunnerResourceProbe:
     def _owned(self, record, profile, *, live):
         if not isinstance(record, dict) or record.get('schema_version') != 1:
             return False
-        if record.get('installation_id') != self.installation_id or record.get('binary_sha256') != self.binary_sha256:
+        if record.get('installation_id') != self.installation_id or record.get('binary_sha256') != self.binary_sha256s.get(profile.profile_id):
             return False
         if record.get('profile_id') != profile.profile_id or record.get('context_tokens') != profile.context_tokens:
             return False
+        if profile.engine_id==OPT64:
+            engine=engine_for(self.trusted,profile)
+            if any(record.get(k)!=v for k,v in record_fields(engine).items()):return False
+            if (type(record.get('schema_version')) is not int or record.get('public_alias')!=profile.public_alias
+                or not isinstance(record.get('argv_sha256'),str) or len(record['argv_sha256'])!=64
+                or any(c not in '0123456789abcdef' for c in record['argv_sha256'])
+                or not isinstance(record.get('startup_id'),str) or len(record['startup_id'])!=32
+                or any(c not in '0123456789abcdef' for c in record['startup_id'])):return False
         runner, child = record.get('runner'), record.get('child')
         if not isinstance(runner, dict) or not isinstance(child, dict):
             return False
@@ -87,6 +118,7 @@ class RunnerResourceProbe:
             for key in ('installation_id', 'runner', 'child', 'profile_id', 'context_tokens', 'backend_port', 'binary_sha256', 'startup_id'):
                 if lease.get(key) != record.get(key):
                     return False
+            if profile.engine_id==OPT64 and any(lease.get(k)!=record.get(k) for k in self._owner_keys(profile)):return False
         return True
 
     @staticmethod
@@ -115,7 +147,7 @@ class RunnerResourceProbe:
         if not self.lease.exists():
             return self._gone(state)
         record = read_object(private_file(self.lease / 'lease.json'))
-        if any(record.get(key) != state.get(key) for key in OWNER_KEYS):
+        if any(record.get(key) != state.get(key) for key in self._owner_keys(previous)):
             return False
         directory_stat = self.lease.stat()
         if directory_stat.st_uid != os.getuid() or directory_stat.st_mode & 0o077:
@@ -163,22 +195,24 @@ class RunnerResourceProbe:
                     return False
                 if state.get('native_context_tokens') != profile.context_tokens:
                     return False
+                if not self._runtime_matches(state):return False
                 if state.get('active_lane_ids') != [] or state.get('acquired_sequence') != state.get('released_sequence'):
                     return False
                 self.baseline = state
                 return True
             if phase == 'pre_admission_rejected':
                 before = self.baseline
-                if (before is None or state is None or any(key not in before or key not in state for key in OWNER_KEYS)
+                if (before is None or state is None or any(key not in before or key not in state for key in self._owner_keys(profile))
                     or type(before.get('schema_version')) is not int or type(state.get('schema_version')) is not int
                     or not self._owned(before, profile, live=True) or not self._owned(state, profile, live=True)
-                    or any(state.get(key) != before.get(key) for key in OWNER_KEYS)):
+                    or any(state.get(key) != before.get(key) for key in self._owner_keys(profile))):
                     return False
                 if any(record.get('proof_valid') is not True or record.get('stderr_closed') is not False
                        or record.get('child_exited') is not False
                        or record.get('native_context_tokens') != profile.context_tokens
                        or record.get('active_lane_ids') != [] for record in (before, state)):
                     return False
+                if not self._runtime_matches(before) or not self._runtime_matches(state):return False
                 fields = ('event_sequence', 'acquired_sequence', 'released_sequence')
                 if any(type(record.get(key)) is not int or record[key] < 0
                        for record in (before, state) for key in fields):
@@ -189,6 +223,12 @@ class RunnerResourceProbe:
                         and state.get('last_released_request_id') == before.get('last_released_request_id')
                         and state.get('last_prefill_progress') == before.get('last_prefill_progress'))
             if phase == 'generation_complete':
+                if profile.engine_id==OPT64:
+                    if (not self._runtime_matches(state,completed=True)
+                        or state.get('last_released_request_id')!=state.get('last_acquired_request_id')
+                        or (state.get('last_release_cancelled') is True and
+                            (state.get('cancelled_session_dropped') is not True or
+                             state.get('last_cancelled_request_id')!=state.get('last_released_request_id')))):return False
                 if not self._owned(state, profile, live=True) or state.get('proof_valid') is not True:
                     return False
                 before = self.baseline
@@ -201,6 +241,29 @@ class RunnerResourceProbe:
                         and state.get('active_lane_ids') == []
                         and isinstance(state.get('last_released_request_id'), str)
                         and state.get('stderr_closed') is False)
+            if phase == 'generation_cancelled':
+                before = self.baseline
+                if (profile.engine_id!=OPT64 or before is None or state is None
+                    or not self._owned(before,profile,live=True) or not self._owned(state,profile,live=True)
+                    or any(before.get(key)!=state.get(key) for key in self._owner_keys(profile))
+                    or not self._runtime_matches(before) or not self._runtime_matches(state,completed=True)
+                    or any(record.get('stderr_closed') is not False or record.get('child_exited') is not False
+                           or record.get('active_lane_ids')!=[] or record.get('queued_request_ids')!=[]
+                           for record in (before,state))):
+                    return False
+                request_id = state.get('last_acquired_request_id')
+                if (not isinstance(request_id,str) or request_id in
+                    (before.get('last_acquired_request_id'),before.get('last_released_request_id'))
+                    or state.get('last_released_request_id')!=request_id
+                    or state.get('last_cancelled_request_id')!=request_id
+                    or state.get('last_release_cancelled') is not True
+                    or state.get('cancelled_session_dropped') is not True):
+                    return False
+                increments = {'acquired_sequence':1,'released_sequence':1,'event_sequence':2,
+                              'queue_entered_sequence':1,'queue_acquired_sequence':1,
+                              'queue_terminal_sequence':0,'queue_event_sequence':2}
+                return all(type(before.get(key)) is int and type(state.get(key)) is int
+                           and state[key]==before[key]+value for key,value in increments.items())
             if phase == 'before_unload':
                 if state is None:
                     self.exit_snapshot = None
@@ -221,7 +284,7 @@ class RunnerResourceProbe:
                     before = self.exit_snapshot
                     if self._gone(before):
                         return True
-                    if (state is not None and all(state.get(key) == before.get(key) for key in OWNER_KEYS)
+                    if (state is not None and all(state.get(key) == before.get(key) for key in self._owner_keys(profile))
                         and self._recover_closed(profile)):
                         return self._gone(before)
                     return False

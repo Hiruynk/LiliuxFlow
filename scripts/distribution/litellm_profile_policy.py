@@ -21,7 +21,9 @@ LONG_PROFILE_MODELS = frozenset((
     "qwen3.8-flash-next-lily-q4-262k",
 ))
 DEFAULT_MODEL = "qwen3.8-flash-next-lily-q4-64k"
-CANONICAL_MODELS = LONG_PROFILE_MODELS | {DEFAULT_MODEL}
+OPTIN_MODEL = 'qwen3.8-flash-next-lily-q4-mtp2-64k'
+EXPLICIT_PROFILE_MODELS = LONG_PROFILE_MODELS | {OPTIN_MODEL}
+CANONICAL_MODELS = EXPLICIT_PROFILE_MODELS | {DEFAULT_MODEL}
 
 
 @dataclass(frozen=True)
@@ -81,7 +83,7 @@ def explicit_profile_access(requested_model, key_models, *, key_fingerprint=None
     policy = policy or load_policy()
     if not policy.enabled_models:
         return False
-    if requested_model not in LONG_PROFILE_MODELS:
+    if requested_model not in EXPLICIT_PROFILE_MODELS:
         return True
     if not isinstance(key_models, (list, tuple)) or requested_model not in key_models:
         return False

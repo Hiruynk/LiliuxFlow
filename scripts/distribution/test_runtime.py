@@ -39,11 +39,21 @@ class RuntimeTests(unittest.TestCase):
         trust.atomic_private_json(self.data/'install.json',self.config)
         secret={k:'synthetic-only-'+k+'-fixture' for k in ('LITELLM_MASTER_KEY','LITELLM_SALT_KEY','DB_PASSWORD','PG_OWNER_PASSWORD','UI_PASSWORD','MANAGER_BACKEND_TOKEN','GUARD_CONTROL_TOKEN')};secret['UI_USERNAME']='admin';trust.atomic_private_json(self.data/'secrets/bootstrap.json',secret)
         lock=json.loads((self.source/'manifests/distribution/native-sources.json').read_text())
+        # Mirror the current builder's source-bound engine helper closure without
+        # generating or enabling an opt-in engine in this legacy MTP0 fixture.
+        helper_paths=['scripts/distribution/native_recipe.py','scripts/distribution/optin_engine.py',
+                      'scripts/distribution/native_metadata.py','scripts/distribution/build_native.py',
+                      'manifests/distribution/native-sources.json',
+                      'manifests/distribution/lily-opt64-source-baseline.json']
+        helper_paths += [row['path'] for row in lock['lily_opt64']['patches']]
+        for path in helper_paths:
+            target=self.source/path;target.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copyfile(SOURCE_ROOT/path,target)
         binaries={}
         for name in ('lily','llama_swap','compat_python','litellm_python'):
             p=self.data/'runtime/bin'/name;p.write_text('#!/bin/sh\nexit 0\n');p.chmod(0o700);binaries[name]={'path':str(p.relative_to(self.data)),'sha256':trust.sha256(p)}
-        paths=['services/compat/src/compat_api/'+n for n in ('app.py','profile.py','llama_guard.py','portable.py','__init__.py')]+['scripts/distribution/'+n for n in ('trust.py','agent.py','model_runner.py','ownership.py','forced_stop.py','common.py','profile_registry.py','runtime_proof.py')]
-        self.record={'schema_version':1,'installation_id':self.config['installation_id'],'source_commit':'cpu-fixture','lily_source_commit':lock['lily']['commit'],'llama_swap_source_commit':lock['llama_swap']['commit'],'lily_patch_sha256':[i['sha256'] for i in lock['lily']['patches']],'profile':{'path':'profiles/distribution/safe64k.json','sha256':trust.sha256(self.source/'profiles/distribution/safe64k.json')},'source_files':[{'path':p,'sha256':trust.sha256(self.source/p)} for p in paths],'binaries':binaries,'build_tools':{}}
+        paths=['services/compat/src/compat_api/'+n for n in ('app.py','profile.py','llama_guard.py','portable.py','__init__.py')]+['scripts/distribution/'+n for n in ('trust.py','agent.py','model_runner.py','ownership.py','forced_stop.py','common.py','profile_registry.py','runtime_proof.py')]+helper_paths
+        self.record={'schema_version':1,'installation_id':self.config['installation_id'],'source_commit':'cpu-fixture','engine_contract_support':{'schema_version':1},'lily_source_commit':lock['lily']['commit'],'llama_swap_source_commit':lock['llama_swap']['commit'],'lily_patch_sha256':[i['sha256'] for i in lock['lily']['patches']],'profile':{'path':'profiles/distribution/safe64k.json','sha256':trust.sha256(self.source/'profiles/distribution/safe64k.json')},'source_files':[{'path':p,'sha256':trust.sha256(self.source/p)} for p in paths],'binaries':binaries,'build_tools':{}}
         node_root=self.data/'runtime/toolchains/node/bin';node_root.mkdir(parents=True)
         for name in ('node','npm','npm_cli'):
             file=node_root/name;file.write_text('synthetic tool fixture');file.chmod(0o700);self.record['build_tools'][name]={'path':str(file.relative_to(self.data)),'sha256':trust.sha256(file)}
