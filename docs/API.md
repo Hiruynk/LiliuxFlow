@@ -37,6 +37,31 @@ uv run --no-project --python 3.12 python scripts/distribution/client_example.py 
 
 Its total context is 131,072 tokens; the default output budget is 65,536. The 64K model stays the default. The 262K model is also enabled with a 262,144-token total context. Use `--model qwen3.8-flash-next-lily-q4-262k` with a caller explicitly granted that model; the helper applies its longer bounded timeout. Profile switches and cold cache restores can add delay.
 
+## Optional MTP2 model names
+
+| Model | Total context | Selection |
+| --- | ---: | --- |
+| `qwen3.8-flash-next-lily-q4-64k` | 65,536 | MTP0; API default |
+| `qwen3.8-flash-next-lily-q4-128k` | 131,072 | MTP0 |
+| `qwen3.8-flash-next-lily-q4-262k` | 262,144 | MTP0 |
+| `qwen3.8-flash-next-lily-q4-mtp2-64k` | 65,536 | Optional MTP2 |
+| `qwen3.8-flash-next-lily-q4-mtp2-128k` | 131,072 | Optional MTP2 |
+| `qwen3.8-flash-next-lily-q4-mtp2-262k` | 262,144 | Optional MTP2 |
+
+All three MTP2 profiles have been validated and enabled on the tested M5 Max / 128 GiB installation. Availability on another installation depends on its trusted configuration. A fresh source catalog starts with MTP2 disabled; the optional-engine build initially enables only MTP2 64K. Long profiles require separate operator validation and trusted enablement. Each caller also needs an explicit grant for the selected alias; empty or wildcard grants do not authorize MTP2. The API default stays MTP0 64K.
+
+For an installation with the selected profile enabled and granted to your virtual key, send either of these bodies to `POST /v1/chat/completions` with the usual `Authorization: Bearer <application virtual key>` header:
+
+```json
+{"model":"qwen3.8-flash-next-lily-q4-mtp2-128k","messages":[{"role":"user","content":"Hello."}],"max_tokens":4096}
+```
+
+```json
+{"model":"qwen3.8-flash-next-lily-q4-mtp2-262k","messages":[{"role":"user","content":"Hello."}],"max_tokens":4096}
+```
+
+Omitting thinking controls preserves checkpoint-default HIGH thinking. Input and output share the selected total context; reasoning counts toward the output budget, whose maximum is 65,536 tokens for every profile. The aliases also select enabled profiles in legacy requests. Request parameters and caller grants cannot enable a disabled profile or override its engine, KV precision or context.
+
 ## Images in Chat Completions
 
 The OpenAI-compatible interface accepts up to **64 image inputs across the entire conversation**, including images resent in earlier user messages. Use PNG or JPEG data URLs in `image_url` content parts. The whole request remains limited to 8 MiB; image decoding, per-image resizing and the selected model's total context limit also apply. Images are preserved rather than silently removed to fit a limit.

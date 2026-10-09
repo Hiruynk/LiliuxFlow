@@ -84,21 +84,23 @@ Other Apple Silicon configurations have not been validated. A compatible macOS a
 | `qwen3.8-flash-next-lily-q4-64k` | 65,536 tokens | Enabled; default |
 | `qwen3.8-flash-next-lily-q4-128k` | 131,072 tokens | Enabled; optional |
 | `qwen3.8-flash-next-lily-q4-262k` | 262,144 tokens | Enabled; optional |
-| `qwen3.8-flash-next-lily-q4-mtp2-64k` | 65,536 tokens | Optional; explicit grant |
-| `qwen3.8-flash-next-lily-q4-mtp2-128k` | 131,072 tokens | Disabled; profile acceptance pending |
-| `qwen3.8-flash-next-lily-q4-mtp2-262k` | 262,144 tokens | Disabled; profile acceptance pending |
+| `qwen3.8-flash-next-lily-q4-mtp2-64k` | 65,536 tokens | Optional; locally validated |
+| `qwen3.8-flash-next-lily-q4-mtp2-128k` | 131,072 tokens | Optional; locally validated |
+| `qwen3.8-flash-next-lily-q4-mtp2-262k` | 262,144 tokens | Optional; locally validated |
 
 The three MTP0 profiles share one external Q4 checkpoint, checkpoint-default high thinking, QSA Split and MTP0. Input and output share the total context limit. Each application needs an explicit virtual-key grant for the selected long-context model. Requests use a bounded queue; switching profiles waits for the active generation and its resources to finish releasing.
 
-### Optional MTP2 64K profile
+### Optional MTP2 profiles
 
-`qwen3.8-flash-next-lily-q4-mtp2-64k` is an explicit optional alias for `ctx64k-mtp2`. It shares the Q4 checkpoint and retains HIGH thinking, a 65,536-token total context and output budget including reasoning. The default and the three MTP0 aliases stay the same.
+The three optional MTP2 aliases select `ctx64k-mtp2`, `ctx128k-mtp2` and `ctx262k-mtp2`, with total contexts of 65,536, 131,072 and 262,144 tokens. They share one engine and the same Q4 checkpoint, HIGH thinking, QSA Split and BF16 KV. Each profile has a 65,536-token maximum output budget including reasoning. The API default remains the 64K MTP0 model.
 
-On a stopped installation, use the `lf` helper from Quick start to select the optional engine with `lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute`. `lf profiles list` and `lf profiles info ctx64k-mtp2` read the profile catalog without loading a model.
+All three MTP2 profiles have been validated and enabled on the tested M5 Max / 128 GiB host. This is a local validation result; a fresh installation does not automatically enable them. The source catalog starts with all MTP2 profiles disabled.
 
-After starting the installation, preview the designated owner caller grant with `lf profiles grant-owner ctx64k-mtp2 --dry-run`; apply that exact append-only grant with `--execute` when wanted. Other callers need their own explicit grant for this alias. Empty or wildcard grants do not enable it. Choose the exact alias in each request; request bodies cannot change engines, paths, memory, KV precision or context. JSON/JSON Schema response formats and tool execution remain unsupported.
+On a stopped installation, use the `lf` helper from Quick start with `lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute`. This optional-engine build initially enables only MTP2 64K. The 128K and 262K profiles require separate operator validation and enablement in the trusted installed configuration; enabling one does not enable the other. `lf profiles list` and `lf profiles info ctx128k-mtp2` inspect the catalog without loading a model.
 
-MTP2 profiles share the same engine and Q4 checkpoint. Each has a 65,536-token maximum output budget including reasoning. The 128K and 262K MTP2 rows start disabled; they require separate profile acceptance and trusted enablement. Enabling 128K does not enable 262K. `lf profiles grant-owner ctx128k-mtp2 --dry-run` works only after that profile is enabled; use the exact corresponding ID for 262K.
+Once a profile is enabled, preview its designated owner caller grant with `lf profiles grant-owner ctx128k-mtp2 --dry-run`; apply that exact append-only grant with `--execute` when wanted. Use `ctx64k-mtp2` or `ctx262k-mtp2` for the other profiles. Other callers need their own explicit model grant; empty or wildcard grants do not authorize MTP2. A caller grant does not enable a disabled profile.
+
+Select the exact enabled alias in each API request; [API](docs/API.md) includes direct 128K and 262K examples. Request bodies cannot change engines, paths, memory, KV precision or context. JSON/JSON Schema response formats and tool execution remain unsupported.
 
 ## Shared workload performance
 
