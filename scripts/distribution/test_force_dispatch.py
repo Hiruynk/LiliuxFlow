@@ -29,7 +29,7 @@ class ForceDispatchTests(unittest.TestCase):
         stack.enter_context(patch.object(forced_stop,'terminate_all',side_effect=lambda values,**_:self.live.difference_update(x['pid'] for x in values)))
         stack.enter_context(patch.object(agent,'_force_pg_identity',return_value=(None,None)));stack.enter_context(patch.object(agent,'_force_clear_model_records'))
         stack.enter_context(patch.object(agent.subprocess,'Popen',return_value=types.SimpleNamespace(wait=lambda timeout:0,returncode=0)))
-        stack.enter_context(patch.object(agent.subprocess,'run',side_effect=[subprocess.CompletedProcess([],0,'pid = 12000\n',''),subprocess.CompletedProcess([],1,b'',b'')]))
+        stack.enter_context(patch.object(agent.subprocess,'run',side_effect=[subprocess.CompletedProcess([],0,'pid = 12000\n',''),subprocess.CompletedProcess([],1,'','Could not find service')]))
         return stack
     def test_explicit_force_skips_busy_drain_and_stops_exact_owned_only(self):
         with self.patches(),patch.object(agent,'drain',side_effect=AssertionError('force must cancel own active request')):result=agent._force_stop(self.trusted)

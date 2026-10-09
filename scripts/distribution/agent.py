@@ -629,6 +629,23 @@ def _force_pg_identity(trusted,registry,fs):
         raise DistributionError('force stop PostgreSQL binary/data/start differs')
     return recorded,content
 
+def _wait_launchd_removed(target, released, *, seconds=5, runner=subprocess.run, clock=time.monotonic, sleep=time.sleep):
+    """A read-only bounded settle for the already validated installation label."""
+    deadline=clock()+seconds
+    while True:
+        if released() is not True:raise DistributionError('owned force shutdown incomplete; registry retained')
+        remaining=deadline-clock()
+        if remaining<=0:raise DistributionError('own launchd label remains registered')
+        status=runner(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=max(.01,min(1,remaining)))
+        if status.returncode:
+            diagnostic=(status.stderr or '').lower()
+            if 'could not find service' not in diagnostic and 'no such process' not in diagnostic:
+                raise DistributionError('own launchd removal status is unknown')
+            if released() is not True:raise DistributionError('owned resources changed during launchd removal')
+            return
+        sleep(min(.05,max(0,deadline-clock())))
+
+
 def _force_stop(trusted,*,dry_run=False):
     import forced_stop as fs
     cfg=trusted['config'];data=trusted['data_root'];source=trusted['source_root'];label=cfg['launchd_label']
@@ -692,7 +709,7 @@ def _force_stop(trusted,*,dry_run=False):
         fs.terminate_all([owner],grace=5,resume=True)
         bootout.wait(timeout=15)
         if bootout.returncode or any(not fs.exited(x) for x in captured+[owner]):raise DistributionError('owned force shutdown incomplete; registry retained')
-        if subprocess.run(['/bin/launchctl','print',target],capture_output=True,timeout=5).returncode==0:raise DistributionError('own launchd label remains registered')
+        _wait_launchd_removed(target,lambda:all(fs.exited(x) for x in captured+[owner]+([pg] if pg is not None else [])),runner=subprocess.run)
         _force_clear_model_records(trusted,captured,fs)
         if state.exists():
             if read_object(private_file(state))!=record:raise DistributionError('force stop agent registry changed; retained for review')
