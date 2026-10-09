@@ -84,8 +84,11 @@ LiliuxFlow 的自有实现包括安装监督程序、模型运行器、生命周
 | `qwen3.8-flash-next-lily-q4-64k` | 65,536 tokens | 已启用；默认模型 |
 | `qwen3.8-flash-next-lily-q4-128k` | 131,072 tokens | 已启用；可选 |
 | `qwen3.8-flash-next-lily-q4-262k` | 262,144 tokens | 已启用；可选 |
+| `qwen3.8-flash-next-lily-q4-mtp2-64k` | 65,536 tokens | 可选；须显式授权 |
+| `qwen3.8-flash-next-lily-q4-mtp2-128k` | 131,072 tokens | 停用；等待该配置验收 |
+| `qwen3.8-flash-next-lily-q4-mtp2-262k` | 262,144 tokens | 停用；等待该配置验收 |
 
-上述三个配置共用同一份外置 Q4 checkpoint，保留 checkpoint 默认 high thinking、QSA Split 和 MTP0。输入与输出共同受总上下文上限约束。应用使用长上下文模型前，须为其虚拟密钥明确授予该模型的访问权限。请求采用有界队列；切换配置会等待当前生成结束并完成资源释放。
+上述三个 MTP0 配置共用同一份外置 Q4 checkpoint，保留 checkpoint 默认 high thinking、QSA Split 和 MTP0。输入与输出共同受总上下文上限约束。应用使用长上下文模型前，须为其虚拟密钥明确授予该模型的访问权限。请求采用有界队列；切换配置会等待当前生成结束并完成资源释放。
 
 ### 可选的 MTP2 64K 配置
 
@@ -94,6 +97,8 @@ LiliuxFlow 的自有实现包括安装监督程序、模型运行器、生命周
 在已停止的安装中，使用“快速开始”的 `lf` 函数执行 `lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute`，显式选择此引擎。`lf profiles list` 和 `lf profiles info ctx64k-mtp2` 只读取配置目录，不加载模型。
 
 启动后，可用 `lf profiles grant-owner ctx64k-mtp2 --dry-run` 预览指定 owner caller 的授权，再在需要时加上 `--execute` 追加此别名。其他 caller 须分别显式获授权；空白或通配授权不会启用此模型。每次请求须使用精确别名，不能通过 body 修改引擎、路径、内存、KV 精度或 context。JSON／JSON Schema 响应格式和工具执行仍不支持。
+
+三个 MTP2 配置共用同一引擎和 Q4 checkpoint，输出上限均为 65,536 tokens，包含推理。MTP2 128K／262K 初始停用，须分别完成配置验收和可信启用；启用 128K 不会同时启用 262K。`lf profiles grant-owner ctx128k-mtp2 --dry-run` 仅适用于已启用的配置；262K 请使用对应的精确 ID。
 
 ## 相同工作负载的性能
 

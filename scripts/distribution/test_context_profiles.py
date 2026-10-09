@@ -34,7 +34,10 @@ class ContextRegistryTests(unittest.TestCase):
 
     def test_three_exact_profiles_are_immutable_and_retired_alias_is_unknown(self):
         registry = profile_registry.parse_registry(self.document)
-        self.assertEqual([p.context_tokens for p in registry.profiles], [65536, 131072, 262144])
+        legacy = tuple(p for p in registry.profiles if p.engine_id == profile_registry.LEGACY_ENGINE)
+        self.assertEqual([p.context_tokens for p in legacy], [65536, 131072, 262144])
+        self.assertEqual([(p.profile_id, p.production_enabled, p.validation_only) for p in registry.profiles if p.engine_id != profile_registry.LEGACY_ENGINE],
+                         [('ctx64k-mtp2', False, False), ('ctx128k-mtp2', False, False), ('ctx262k-mtp2', False, False)])
         self.assertEqual([p.profile_id for p in registry.enabled_profiles], ['ctx64k'])
         with self.assertRaises(FrozenInstanceError):
             registry.default.context_tokens = 262144
@@ -76,6 +79,10 @@ class ContextRegistryTests(unittest.TestCase):
                        'config': {'model_dir': '/single/read-only/Q4', 'ports': {'guard': 18080}}}
             paths = []
             for profile in registry.profiles:
+                if profile.engine_id != profile_registry.LEGACY_ENGINE:
+                    with self.assertRaises(DistributionError):
+                        model_runner.lily_argv(trusted, 19000, profile_id=profile.profile_id, allow_validation=True)
+                    continue
                 argv = model_runner.lily_argv(trusted, 19000, profile_id=profile.profile_id, allow_validation=True)
                 self.assertEqual(argv[argv.index('--max-seq') + 1], str(profile.context_tokens))
                 self.assertEqual(argv[argv.index('--max-sessions') + 1], str(profile.max_sessions))
@@ -331,13 +338,14 @@ class LaneEvidenceTests(unittest.TestCase):
 
     def test_three_real_cpu_mock_children_use_exact_identity_and_owner_bound_release_sequences(self):
         registry = profile_registry.load_registry(ROOT)
+        self.assertEqual([p.profile_id for p in registry.enabled_profiles], ['ctx64k', 'ctx128k', 'ctx262k'])
         with tempfile.TemporaryDirectory() as temporary:
             data = Path(temporary).resolve(); run = data / 'run'; lease_root = data / 'leases'
             run.mkdir(mode=0o700); lease_root.mkdir(mode=0o700)
             trusted = {'registry': registry, 'data_root': data, 'config': {'installation_id': 'cpu-mock-install'},
                        'trust': {'binaries': {'lily': {'sha256': '1' * 64}}}}
             probe = runtime_proof.RunnerResourceProbe(trusted, lease_root=lease_root)
-            for index, profile in enumerate(registry.profiles):
+            for index, profile in enumerate(registry.enabled_profiles):
                 # An owned CPU runner creates its own small child. No Q4/Metal.
                 process = subprocess.Popen([sys.executable, '-u', '-c',
                     'import subprocess,sys,time,signal\n'

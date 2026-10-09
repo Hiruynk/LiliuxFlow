@@ -54,7 +54,7 @@ class RunnerResourceProbe:
         self.installation_id = trusted['config']['installation_id']
         self.binary_sha256 = trusted['trust']['binaries']['lily']['sha256']
         self.trusted=trusted
-        self.binary_sha256s={profile.profile_id:trusted['trust']['binaries']['lily_opt64' if profile.engine_id==OPT64 and profile.production_enabled else 'lily']['sha256']
+        self.binary_sha256s={profile.profile_id:trusted['trust']['binaries']['lily_opt64' if profile.engine_id==OPT64 and OPT64 in trusted.get('engines',{}) else 'lily']['sha256']
                              for profile in trusted['registry'].profiles}
         self.profiles = {profile.profile_id: profile for profile in trusted['registry'].profiles}
         self.run_root = no_symlinks(run_root if run_root is not None else trusted['data_root'] / 'run')

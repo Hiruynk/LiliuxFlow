@@ -13,7 +13,7 @@ import httpx
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts/distribution'))
 sys.path.insert(0, str(ROOT / 'services/compat/src'))
-from profile_registry import ProfileRegistry, load_registry
+from profile_registry import OPT64_ENGINE, ProfileRegistry, load_registry
 from compat_api.llama_guard import create_app
 
 
@@ -118,7 +118,7 @@ class MockManager:
 class ContextGuardTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         registry = load_registry(ROOT)
-        self.registry = ProfileRegistry(tuple(replace(p, production_enabled=True) for p in registry.profiles))
+        self.registry = ProfileRegistry(registry.enabled_profiles)
         self.manager = MockManager()
         self.app = create_app('http://127.0.0.1:18081', 'cpu-control', backend_token='cpu-backend',
                               transport=httpx.MockTransport(self.manager.handler), registry=self.registry,
@@ -346,17 +346,66 @@ class ContextGuardTests(unittest.IsolatedAsyncioTestCase):
         self.guard.context_admission = exact
         for profile in self.registry.profiles:
             response = await self.client.post('/v1/chat/completions', json={'model': profile.public_alias,
-                'fixture_prompt_tokens': profile.context_tokens - 8, 'max_tokens': 9})
+                'fixture_prompt_tokens': profile.context_tokens, 'max_tokens': 9})
             self.assertEqual(response.status_code, 400)
             self.assertEqual(response.json()['error']['type'], 'context_length_exceeded')
         for model, expected in [('qwen38-flash-next-q4-safe64k', 404), ('unknown', 404)]:
             response = await self.client.post('/v1/chat/completions', json={'model': model, 'max_tokens': 8})
             self.assertEqual(response.status_code, expected)
-        self.guard.registry = load_registry(ROOT)
-        response = await self.client.post('/v1/chat/completions', json={'model': self.registry.profiles[1].public_alias})
+        disabled_registry = load_registry(ROOT)
+        disabled_profile = disabled_registry.profiles[-1]
+        self.assertEqual(disabled_profile.profile_id, 'ctx262k-mtp2')
+        self.assertEqual(disabled_profile.engine_id, OPT64_ENGINE)
+        self.assertFalse(disabled_profile.production_enabled)
+        self.guard.registry = disabled_registry
+        response = await self.client.post('/v1/chat/completions', json={'model': disabled_profile.public_alias})
         self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()['error']['type'], 'profile_disabled')
         self.assertEqual(self.manager.forwarded, [])
         self.assertNotIn('/running', self.manager.operations)
+
+    async def test_long_mtp2_profiles_disabled_cannot_forward_or_load(self):
+        source_registry = load_registry(ROOT)
+        profiles = tuple(replace(profile, production_enabled=True)
+                         if profile.profile_id == 'ctx64k-mtp2' else profile
+                         for profile in source_registry.profiles)
+        self.guard.registry = ProfileRegistry(profiles)
+        disabled_long = tuple(profile for profile in profiles
+                              if profile.engine_id == OPT64_ENGINE
+                              and profile.profile_id in ('ctx128k-mtp2', 'ctx262k-mtp2'))
+        self.assertEqual(
+            [(profile.profile_id, profile.public_alias, profile.context_tokens, profile.production_enabled)
+             for profile in disabled_long],
+            [
+                ('ctx128k-mtp2', 'qwen3.8-flash-next-lily-q4-mtp2-128k', 131072, False),
+                ('ctx262k-mtp2', 'qwen3.8-flash-next-lily-q4-mtp2-262k', 262144, False),
+            ],
+        )
+
+        catalog = await self.client.get('/api/context-profiles')
+        self.assertEqual(catalog.status_code, 200)
+        catalog_by_alias = {row['model']: row for row in catalog.json()['profiles']}
+        for profile in disabled_long:
+            row = catalog_by_alias[profile.public_alias]
+            self.assertFalse(row['enabled'])
+            self.assertFalse(row['loaded'])
+            self.assertEqual(row['state'], 'disabled')
+
+            response = await self.client.post('/v1/chat/completions', json={
+                'model': profile.public_alias,
+                'messages': [{'role': 'user', 'content': 'synthetic disabled-profile check'}],
+                'max_tokens': 8,
+            })
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json()['error']['type'], 'profile_disabled')
+
+            load_response = await self.client.post('/api/models/load/' + profile.public_alias)
+            self.assertEqual(load_response.status_code, 503)
+            self.assertEqual(load_response.json()['error']['type'], 'profile_disabled')
+            self.assertNotIn('/upstream/' + profile.public_alias + '/health', self.manager.operations)
+
+        self.assertEqual(self.manager.forwarded, [])
+        self.assertIsNone(self.manager.current)
 
     async def test_context_override_body_cap_and_bypass_routes_cannot_load(self):
         for override in ({'num_ctx': 262144}, {'extra_body': {'profile_path': '/tmp/x'}}, {'max_tokens': True}):

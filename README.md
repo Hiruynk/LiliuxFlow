@@ -84,8 +84,11 @@ Other Apple Silicon configurations have not been validated. A compatible macOS a
 | `qwen3.8-flash-next-lily-q4-64k` | 65,536 tokens | Enabled; default |
 | `qwen3.8-flash-next-lily-q4-128k` | 131,072 tokens | Enabled; optional |
 | `qwen3.8-flash-next-lily-q4-262k` | 262,144 tokens | Enabled; optional |
+| `qwen3.8-flash-next-lily-q4-mtp2-64k` | 65,536 tokens | Optional; explicit grant |
+| `qwen3.8-flash-next-lily-q4-mtp2-128k` | 131,072 tokens | Disabled; profile acceptance pending |
+| `qwen3.8-flash-next-lily-q4-mtp2-262k` | 262,144 tokens | Disabled; profile acceptance pending |
 
-The three profiles above share one external Q4 checkpoint, checkpoint-default high thinking, QSA Split and MTP0. Input and output share the total context limit. Each application needs an explicit virtual-key grant for the selected long-context model. Requests use a bounded queue; switching profiles waits for the active generation and its resources to finish releasing.
+The three MTP0 profiles share one external Q4 checkpoint, checkpoint-default high thinking, QSA Split and MTP0. Input and output share the total context limit. Each application needs an explicit virtual-key grant for the selected long-context model. Requests use a bounded queue; switching profiles waits for the active generation and its resources to finish releasing.
 
 ### Optional MTP2 64K profile
 
@@ -94,6 +97,8 @@ The three profiles above share one external Q4 checkpoint, checkpoint-default hi
 On a stopped installation, use the `lf` helper from Quick start to select the optional engine with `lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute`. `lf profiles list` and `lf profiles info ctx64k-mtp2` read the profile catalog without loading a model.
 
 After starting the installation, preview the designated owner caller grant with `lf profiles grant-owner ctx64k-mtp2 --dry-run`; apply that exact append-only grant with `--execute` when wanted. Other callers need their own explicit grant for this alias. Empty or wildcard grants do not enable it. Choose the exact alias in each request; request bodies cannot change engines, paths, memory, KV precision or context. JSON/JSON Schema response formats and tool execution remain unsupported.
+
+MTP2 profiles share the same engine and Q4 checkpoint. Each has a 65,536-token maximum output budget including reasoning. The 128K and 262K MTP2 rows start disabled; they require separate profile acceptance and trusted enablement. Enabling 128K does not enable 262K. `lf profiles grant-owner ctx128k-mtp2 --dry-run` works only after that profile is enabled; use the exact corresponding ID for 262K.
 
 ## Shared workload performance
 

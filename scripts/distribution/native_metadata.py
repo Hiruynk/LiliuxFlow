@@ -3,6 +3,7 @@
 SPDX-License-Identifier: Apache-2.0
 """
 import re
+from optin_engine import OPT_CONTEXTS
 
 ID = r'(req-[0-9]{1,20}-[0-9]{1,20})'
 NUMBER = r'([0-9]{1,12})'
@@ -23,6 +24,10 @@ CRITICAL = ('LILY_QSA_ROUTE_EFFECTIVE', 'LILY_QSA_DISPATCH_METADATA', 'LILY_ENGI
 
 def consume_latest(state, raw):
     """True means full fixed grammar parsed, so the caller may mirror it."""
+    expected_context=OPT_CONTEXTS.get(state.record.get('profile_id'))
+    if expected_context is None or state.record.get('context_tokens')!=expected_context:
+        with state.lock:state.record['proof_valid']=False;state._write()
+        return False
     parsers = (ROUTE, DISPATCH, ENGINE, PRELOAD, ACQUIRE, RELEASE, PROGRESS,
                ENTER, TERMINAL, AFTER_LOAD, DECODE_DROP, PREFILL_DROP)
     found = next(((pattern, match) for pattern in parsers if (match := pattern.fullmatch(raw))), None)
@@ -63,14 +68,14 @@ def consume_latest(state, raw):
             value = {'sparse_prefill_rows': int(rows), 'route': route,
                      'split_dispatch_count': int(split), 'query_dispatch_count': int(query)}
             fixed('qsa_dispatch_metadata', value)
-            if not 16 <= int(rows) <= 65536 or (route, split, query) != ('split', '1', '0'):
+            if not 16 <= int(rows) <= expected_context or (route, split, query) != ('split', '1', '0'):
                 fail()
         elif pattern is ENGINE:
             context, kv, mtp, batch = values
             value = {'context_tokens': int(context), 'kv_cache': kv,
                      'mtp_drafts': int(mtp), 'max_batch': int(batch)}
             fixed('native_engine_effective', value)
-            if value != {'context_tokens': 65536, 'kv_cache': 'bf16', 'mtp_drafts': 2, 'max_batch': 1}:
+            if value != {'context_tokens': expected_context, 'kv_cache': 'bf16', 'mtp_drafts': 2, 'max_batch': 1}:
                 fail()
             record['native_context_tokens'] = value['context_tokens']
         elif pattern is ENTER:
@@ -116,7 +121,7 @@ def consume_latest(state, raw):
             record['last_release_cancelled'] = cancelled == 'true'
         elif pattern is PROGRESS:
             request_id, chunks, tokens = values
-            if record['active_lane_ids'] != [request_id] or not 1 <= int(chunks) <= 65536 or not 1 <= int(tokens) <= 65536:
+            if record['active_lane_ids'] != [request_id] or not 1 <= int(chunks) <= expected_context or not 1 <= int(tokens) <= expected_context:
                 fail()
             elif record.get('last_prefill_progress') is not None:
                 fail()  # Native emits one first-positive record for the request.
@@ -128,7 +133,7 @@ def consume_latest(state, raw):
             progress = record.get('last_prefill_progress')
             if record['active_lane_ids'] != [request_id]:
                 fail()
-            elif pattern is PREFILL_DROP and (int(values[2]) > 65536 or int(values[3]) > 65536):
+            elif pattern is PREFILL_DROP and (int(values[2]) > expected_context or int(values[3]) > expected_context):
                 fail()
             elif (pattern is PREFILL_DROP and progress is not None
                   and (int(values[2]) < progress['completed_chunks']

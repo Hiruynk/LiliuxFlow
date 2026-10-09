@@ -256,11 +256,11 @@ def profiles(args):
     profile=next((p for p in registry.profiles if p.profile_id==args.profile_id),None)
     if profile is None:raise DistributionError('profile ID is outside the finite registry')
     if args.profile_command=='info':emit({**profile.as_dict(),'catalog_source':catalog_source,'network_operation':False,'model_loaded_by_command':False});return 0
-    if args.profile_id!='ctx64k-mtp2':raise DistributionError('explicit caller opt-in supports only ctx64k-mtp2')
+    if args.profile_id not in ('ctx64k-mtp2','ctx128k-mtp2','ctx262k-mtp2'):raise DistributionError('explicit caller opt-in requires a finite MTP2 profile')
     from trust import validate
     from agent import reconcile_owner_caller
     trusted=validate(no_symlinks(args.data_root))
-    selected=trusted['registry'].by_id('ctx64k-mtp2')
+    selected=trusted['registry'].by_id(args.profile_id)
     emit(reconcile_owner_caller(trusted,dry_run=not args.execute,authorized_opt_in_aliases=(selected.public_alias,)));return 0
 
 def build_optin_runtime(args):
@@ -616,7 +616,7 @@ def main():
     profile_commands.add_parser('list')
     profile_commands.add_parser('info').add_argument('profile_id')
     command=profile_commands.add_parser('grant-owner',help='append the enabled opt-in alias only to the existing designated owner caller')
-    command.add_argument('profile_id',choices=('ctx64k-mtp2',))
+    command.add_argument('profile_id',choices=('ctx64k-mtp2','ctx128k-mtp2','ctx262k-mtp2'))
     grant=command.add_mutually_exclusive_group(required=True);grant.add_argument('--dry-run',action='store_true');grant.add_argument('--execute',action='store_true')
     args = parser.parse_args()
     os.umask(0o077)

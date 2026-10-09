@@ -11,6 +11,8 @@ import re
 LEGACY_COMMIT='db3f8a7cdb33f1e88b68c6889331abd31098c923'
 LATEST_COMMIT='13f7b540937dfafb33184aa0162a0e2d0fbfe65a'
 OPT64='latest13f-defer-pc123-mtp2-opt64k'
+# Historical engine identity stays fixed; context is a finite profile parameter.
+OPT_CONTEXTS={'ctx64k-mtp2':65536,'ctx128k-mtp2':131072,'ctx262k-mtp2':262144}
 PATCHES=('2e6a1a17c3c0a82ff0708c6e070ff69ac1b0f4a046cd8002cfcca868c73d075f',
  '5a63f673c72eb20b360059f37754f76b8c7814da6c350c1b9c988337bdd09f94',
  'eeeeeb30f92452a08eea37e1052f0ae1e67f84ece5ffcb84337e6ae569c1a534',
@@ -42,12 +44,12 @@ def from_generated_trust(record):
 
 def latest_argv(engine,profile,binary,model,port,cache):
     """Internal paths supplied by normal verified installation, never request."""
-    if engine.engine_id!=OPT64 or profile.profile_id!='ctx64k-mtp2' or profile.context_tokens!=65536:
+    if engine.engine_id!=OPT64 or profile.profile_id not in OPT_CONTEXTS or type(profile.context_tokens) is not int or profile.context_tokens!=OPT_CONTEXTS[profile.profile_id]:
         raise ValueError('portable_opt_engine_context_out_of_scope')
     if type(port) is not int or not 1024<=port<=65535:
         raise ValueError('portable_opt_engine_port')
     return [str(binary),'--model',str(model),'--bind','127.0.0.1:'+str(port),
-        '--max-seq','65536','--mtp-drafts','2','--max-batch','1','--kv-cache','bf16',
+        '--max-seq',str(profile.context_tokens),'--mtp-drafts','2','--max-batch','1','--kv-cache','bf16',
         '--cache-bytes','8589934592','--max-sessions','1','--disk-cache-dir',str(cache),
         '--disk-cache-bytes','0','--ngram-table','paged','--ngram-preload','true',
         '--pin-weights','off','--pin-hold','1m','--thinking','true','--thinking-budget','off',
@@ -55,9 +57,9 @@ def latest_argv(engine,profile,binary,model,port,cache):
 
 
 def native_policy_matches(engine,profile,state):
-    if engine.engine_id!=OPT64 or profile.profile_id!='ctx64k-mtp2' or profile.context_tokens!=65536:return False
+    if engine.engine_id!=OPT64 or profile.profile_id not in OPT_CONTEXTS or type(profile.context_tokens) is not int or profile.context_tokens!=OPT_CONTEXTS[profile.profile_id]:return False
     return (state.get('proof_valid') is True and state.get('binary_sha256')==engine.binary_sha256
-      and state.get('native_engine_effective')=={'context_tokens':65536,'kv_cache':'bf16','mtp_drafts':2,'max_batch':1}
+      and state.get('native_engine_effective')=={'context_tokens':profile.context_tokens,'kv_cache':'bf16','mtp_drafts':2,'max_batch':1}
       and all(type(state['native_engine_effective'].get(key)) is int for key in ('context_tokens','mtp_drafts','max_batch'))
       and state.get('qsa_route_effective')=={'requested':'split','route':'split'})
 
@@ -79,7 +81,10 @@ def validate_engine_records(trust, pinned):
     records=trust.get('optin_engines', {})
     enabled=trust.get('enabled_optin_profiles', [])
     if (not isinstance(records,dict) or set(records) not in (set(),{OPT64})
-        or not isinstance(enabled,list) or enabled not in ([],['ctx64k-mtp2'])
+        or not isinstance(enabled,list) or any(not isinstance(pid,str) for pid in enabled)
+        or len(set(enabled))!=len(enabled)
+        or any(pid not in OPT_CONTEXTS for pid in enabled)
+        or enabled!=[pid for pid in OPT_CONTEXTS if pid in enabled]
         or bool(enabled)!=bool(records)):
         raise DistributionError('generated opt-in engine authorization differs')
     if not records:return {}
@@ -92,7 +97,7 @@ def validate_engine_records(trust, pinned):
 def engine_for(trusted, profile):
     if profile.engine_id == 'legacy-db3-mtp0':return None
     engine=trusted.get('engines',{}).get(OPT64)
-    if profile.engine_id != OPT64 or profile.profile_id!='ctx64k-mtp2' or not isinstance(engine,Engine):
+    if profile.engine_id != OPT64 or profile.profile_id not in OPT_CONTEXTS or type(profile.context_tokens) is not int or profile.context_tokens!=OPT_CONTEXTS[profile.profile_id] or not isinstance(engine,Engine):
         raise DistributionError('selected opt-in engine is not generated and trusted')
     return engine
 
@@ -103,15 +108,17 @@ def record_fields(engine):
 
 
 def native_matches(record, *, require_dispatch=False):
+    expected=OPT_CONTEXTS.get(record.get('profile_id'))
+    if expected is None or type(record.get('context_tokens')) is not int or record['context_tokens']!=expected:return False
     value=record.get('native_engine_effective')
     if (record.get('proof_valid') is not True or not isinstance(value,dict)
-        or value != {'context_tokens':65536,'kv_cache':'bf16','mtp_drafts':2,'max_batch':1}
+        or value != {'context_tokens':expected,'kv_cache':'bf16','mtp_drafts':2,'max_batch':1}
         or any(type(value.get(k)) is not int for k in ('context_tokens','mtp_drafts','max_batch'))
-        or record.get('native_context_tokens')!=65536
+        or record.get('native_context_tokens')!=expected
         or record.get('qsa_route_effective')!={'requested':'split','route':'split'}):return False
     if not require_dispatch:return True
     dispatch=record.get('qsa_dispatch_metadata')
     return (isinstance(dispatch,dict) and type(dispatch.get('sparse_prefill_rows')) is int
-        and 16<=dispatch['sparse_prefill_rows']<=65536 and dispatch.get('route')=='split'
+        and 16<=dispatch['sparse_prefill_rows']<=expected and dispatch.get('route')=='split'
         and type(dispatch.get('split_dispatch_count')) is int and dispatch['split_dispatch_count']==1
         and type(dispatch.get('query_dispatch_count')) is int and dispatch['query_dispatch_count']==0)

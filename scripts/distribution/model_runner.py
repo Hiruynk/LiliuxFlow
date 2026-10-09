@@ -22,7 +22,7 @@ from common import DistributionError, private_directory, read_object, write_json
 from ownership import capture, unchanged, terminate
 from profile_registry import ProfileRegistry, legacy_registry, MINIMUM_RAM_HEADROOM_GIB, OPENAI_MAX_IMAGES
 from trust import validate, atomic_private_json
-from optin_engine import OPT64, engine_for, record_fields, latest_argv, effective_env
+from optin_engine import OPT64, OPT_CONTEXTS, engine_for, record_fields, latest_argv, effective_env
 
 
 def pending_owned_identity(process, runner_identity, argv):
@@ -227,7 +227,7 @@ class LaneState:
 
     def __init__(self, path, record):
         self.latest_engine = record.get('engine_id') == OPT64
-        if self.latest_engine and (record.get('profile_id')!='ctx64k-mtp2' or record.get('context_tokens')!=65536):
+        if self.latest_engine and (record.get('profile_id') not in OPT_CONTEXTS or type(record.get('context_tokens')) is not int or record['context_tokens']!=OPT_CONTEXTS[record['profile_id']]):
             raise DistributionError('native metadata engine/profile binding differs')
         self.path = Path(path)
         self.lock = threading.Lock()
@@ -470,7 +470,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data-root', type=Path, required=True)
     parser.add_argument('--port', type=int, required=True)
-    parser.add_argument('--profile', default='ctx64k', choices=('ctx64k', 'ctx128k', 'ctx262k', 'ctx64k-mtp2'))
+    parser.add_argument('--profile', default='ctx64k', choices=('ctx64k', 'ctx128k', 'ctx262k', 'ctx64k-mtp2', 'ctx128k-mtp2', 'ctx262k-mtp2'))
     parser.add_argument('--validation', action='store_true')
     args = parser.parse_args()
     os.umask(0o077)

@@ -25,7 +25,10 @@ LEGACY_ENGINE = 'legacy-db3-mtp0'
 OPT64_ENGINE = 'latest13f-defer-pc123-mtp2-opt64k'
 OPT64_PROFILE = 'ctx64k-mtp2'
 OPT64_ALIAS = 'qwen3.8-flash-next-lily-q4-mtp2-64k'
-MINIMUM_RAM_HEADROOM_GIB = {'ctx64k-mtp2': 15, 'ctx64k': 15, 'ctx128k': 15, 'ctx262k': 13}
+OPT_TARGETS=(('ctx64k-mtp2',OPT64_ALIAS,65536,3672,300,15),
+             ('ctx128k-mtp2','qwen3.8-flash-next-lily-q4-mtp2-128k',131072,4272,600,15),
+             ('ctx262k-mtp2','qwen3.8-flash-next-lily-q4-mtp2-262k',262144,4872,900,13))
+MINIMUM_RAM_HEADROOM_GIB = {'ctx128k-mtp2':15,'ctx262k-mtp2':13,'ctx64k-mtp2': 15, 'ctx64k': 15, 'ctx128k': 15, 'ctx262k': 13}
 SHARED = {
     'runtime_model_id': 'Qwen3.8-Flash-Next',
     'model_repository': 'fabiogreter/Qwen3.8-Flash-Next-lily-q4',
@@ -160,24 +163,23 @@ def parse_registry(document, *, enabled_optin_profiles=()):
     if sum(p.disk_cache_bytes for p in profiles) + document['temporary_cache_reserve_bytes'] > document['total_disk_cache_cap_bytes']:
         raise DistributionError('context disk retention does not leave the shared temporary reserve')
     opt_rows = document.get('optin_profiles', [])
-    if (not isinstance(enabled_optin_profiles, (tuple, list))
-        or list(enabled_optin_profiles) not in ([], [OPT64_PROFILE])
-        or not isinstance(opt_rows, list) or len(opt_rows) > 1):
+    ids=[row[0] for row in OPT_TARGETS]
+    if (not isinstance(enabled_optin_profiles,(tuple,list)) or len(set(enabled_optin_profiles))!=len(enabled_optin_profiles)
+        or any(pid not in ids for pid in enabled_optin_profiles)
+        or list(enabled_optin_profiles)!=[pid for pid in ids if pid in enabled_optin_profiles]
+        or not isinstance(opt_rows,list) or len(opt_rows) not in (0,1,3)):
         raise DistributionError('opt-in profile authorization differs')
-    if opt_rows:
-        row = opt_rows[0]
-        expected = {'profile_id':OPT64_PROFILE, 'public_alias':OPT64_ALIAS, 'context_tokens':65536,
-                    'default_output_tokens':65536, 'total_deadline_seconds':3672, 'queue_wait_seconds':300,
-                    'idle_ttl_seconds':1800, 'cache_bytes':8*1024**3, 'max_sessions':1, 'disk_cache_bytes':0,
-                    'cache_namespace':'lily-q4-afde8b8e-13f7b540-pc123-split-scalar-bf16-mtp2-ctx64k',
-                    'production_enabled':False, 'validation_only':False, 'minimum_ram_headroom_gib':15,
-                    'engine_id':OPT64_ENGINE}
-        if not isinstance(row, dict) or set(row)!=set(expected) or any(not _same(row[k],v) for k,v in expected.items()):
-            raise DistributionError('opt-in profile differs from the finite 64K contract')
-        selected = {**row, 'production_enabled': bool(enabled_optin_profiles)}
-        profiles.append(RuntimeProfile(runtime_model_id=SHARED['runtime_model_id'], **selected))
-    elif enabled_optin_profiles:
-        raise DistributionError('authorized opt-in profile is missing from the trusted registry')
+    for row,(pid,alias,context,deadline,wait,headroom) in zip(opt_rows,OPT_TARGETS):
+        expected={'profile_id':pid,'public_alias':alias,'context_tokens':context,'default_output_tokens':65536,
+                  'total_deadline_seconds':deadline,'queue_wait_seconds':wait,'idle_ttl_seconds':1800,
+                  'cache_bytes':8*1024**3,'max_sessions':1,'disk_cache_bytes':0,
+                  'cache_namespace':'lily-q4-afde8b8e-13f7b540-pc123-split-scalar-bf16-mtp2-'+pid.removesuffix('-mtp2'),
+                  'production_enabled':False,'validation_only':False,'minimum_ram_headroom_gib':headroom,'engine_id':OPT64_ENGINE}
+        if not isinstance(row,dict) or set(row)!=set(expected) or any(not _same(row[k],v) for k,v in expected.items()):
+            raise DistributionError('opt-in profile differs from the finite context contract')
+        profiles.append(RuntimeProfile(runtime_model_id=SHARED['runtime_model_id'],**{**row,'production_enabled':pid in enabled_optin_profiles}))
+    if any(pid not in {p.profile_id for p in profiles} for pid in enabled_optin_profiles):
+        raise DistributionError('authorized opt-in profile is absent from trusted source')
     return ProfileRegistry(tuple(profiles))
 
 

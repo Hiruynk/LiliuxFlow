@@ -174,7 +174,7 @@ def configs(trusted, *, validation_profile_ids=()):
             'model_info':{'id':'liliuxflow-'+profile.profile_id,'mode':'chat','max_tokens':profile.context_tokens,
                           'max_input_tokens':profile.context_tokens,'max_output_tokens':min(profile.context_tokens,65536),
                           'default_output_tokens':profile.default_output_tokens,'context_profile_id':profile.profile_id}})
-        if profile.profile_id=='ctx64k-mtp2':manager['models'][alias]['name']+=' · MTP2 opt-in'
+        if profile.profile_id in ('ctx64k-mtp2','ctx128k-mtp2','ctx262k-mtp2'):manager['models'][alias]['name']+=' · MTP2 opt-in'
         metadata=profile.as_dict()
         for name in ('engine_id','mtp_drafts','kv_cache','max_batch','qsa_route','qsa_scores'):
             if name in metadata:routes[-1]['model_info'][name]=metadata[name]
@@ -327,17 +327,18 @@ def profile_route_inventory(yaml_models, db_models, registry):
 
 
 OPTIN_ALIAS='qwen3.8-flash-next-lily-q4-mtp2-64k'
+OPTIN_ALIASES=frozenset('qwen3.8-flash-next-lily-q4-mtp2-'+size for size in ('64k','128k','262k'))
 def _owner_grant_models(enabled,authorized_opt_in_aliases=()):
-    if not isinstance(authorized_opt_in_aliases,tuple) or authorized_opt_in_aliases not in ((),(OPTIN_ALIAS,)):raise DistributionError('opt-in caller grant must name the exact finite alias')
+    if not isinstance(authorized_opt_in_aliases,tuple) or len(set(authorized_opt_in_aliases))!=len(authorized_opt_in_aliases) or any(alias not in OPTIN_ALIASES for alias in authorized_opt_in_aliases):raise DistributionError('opt-in caller grant must name the exact finite alias')
     if any(alias not in enabled for alias in authorized_opt_in_aliases):raise DistributionError('opt-in profile is not enabled in the trusted registry')
-    return [alias for alias in enabled if alias!=OPTIN_ALIAS or alias in authorized_opt_in_aliases]
+    return [alias for alias in enabled if alias not in OPTIN_ALIASES or alias in authorized_opt_in_aliases]
 
 def _expanded_owner_models(current, enabled, authorized_opt_in_aliases=()):
     # LiteLLM treats [] as unrestricted. Refuse to infer a restricted grant from
     # wildcard/unrestricted ACLs, and never change another user's key here.
     if not isinstance(current,list) or not current or any(not isinstance(x,str) for x in current):
         raise DistributionError('designated owner model ACL must be explicit')
-    if any('*' in x or x in ('all-proxy-models','all-team-models') for x in current):
+    if any('*' in x or x in ('all-proxy-models','all-team-models','all-router-models') for x in current):
         raise DistributionError('designated owner wildcard ACL requires explicit review')
     return list(dict.fromkeys([*current,*_owner_grant_models(enabled,authorized_opt_in_aliases)]))
 

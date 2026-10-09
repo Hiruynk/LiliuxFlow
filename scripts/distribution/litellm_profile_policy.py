@@ -22,7 +22,8 @@ LONG_PROFILE_MODELS = frozenset((
 ))
 DEFAULT_MODEL = "qwen3.8-flash-next-lily-q4-64k"
 OPTIN_MODEL = 'qwen3.8-flash-next-lily-q4-mtp2-64k'
-EXPLICIT_PROFILE_MODELS = LONG_PROFILE_MODELS | {OPTIN_MODEL}
+OPTIN_MODELS=frozenset('qwen3.8-flash-next-lily-q4-mtp2-'+size for size in ('64k','128k','262k'))
+EXPLICIT_PROFILE_MODELS = LONG_PROFILE_MODELS | OPTIN_MODELS
 CANONICAL_MODELS = EXPLICIT_PROFILE_MODELS | {DEFAULT_MODEL}
 
 
@@ -39,7 +40,7 @@ def parse_policy(document):
     if not isinstance(enabled, list) or any(not isinstance(model, str) or model not in CANONICAL_MODELS for model in enabled) or len(set(enabled)) != len(enabled) or enabled and DEFAULT_MODEL not in enabled:
         raise ValueError("context profile access enablement differs")
     validation = document["validation_keys"]
-    if not isinstance(validation, dict) or any(model not in LONG_PROFILE_MODELS for model in validation) or not enabled and validation:
+    if not isinstance(validation, dict) or any(model not in EXPLICIT_PROFILE_MODELS for model in validation) or not enabled and validation:
         raise ValueError("context profile validation models differ")
     rows = []
     for model, fingerprints in validation.items():

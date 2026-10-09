@@ -76,8 +76,17 @@ class ActualWiringTests(unittest.TestCase):
  def test_generated_engine_trust_rejects_wrong_or_missing_bindings(self):
   lock=json.loads((ROOT/'manifests/distribution/native-sources.json').read_text());record={'optin_engines':{e.OPT64:self.record()},'enabled_optin_profiles':['ctx64k-mtp2']}
   self.assertEqual(e.validate_engine_records(record,lock)[e.OPT64].source_commit,e.LATEST_COMMIT)
-  for mutation in [lambda x:x['optin_engines'][e.OPT64].update(default=True),lambda x:x['optin_engines'][e.OPT64].update(source_inventory_sha256='b'*64),lambda x:x.update(enabled_optin_profiles=[]),lambda x:x.update(enabled_optin_profiles=['ctx262k']),lambda x:x['optin_engines'][e.OPT64].update(extra_args=['--memory-limit-gb','8'])]:
+  for mutation in [lambda x:x['optin_engines'][e.OPT64].update(default=True),lambda x:x['optin_engines'][e.OPT64].update(source_inventory_sha256='b'*64),lambda x:x.update(enabled_optin_profiles=[]),lambda x:x.pop('enabled_optin_profiles'),lambda x:x.update(optin_engines={}),lambda x:x.pop('optin_engines'),lambda x:x.update(enabled_optin_profiles=['ctx262k']),lambda x:x.update(enabled_optin_profiles=['ctx64k-mtp2','ctx64k-mtp2']),lambda x:x.update(enabled_optin_profiles=[{}]),lambda x:x['optin_engines'][e.OPT64].update(extra_args=['--memory-limit-gb','8'])]:
    value=copy.deepcopy(record);mutation(value)
+   with self.assertRaises(DistributionError):e.validate_engine_records(value,lock)
+ def test_generated_engine_trust_accepts_only_ordered_finite_nonempty_profile_selection(self):
+  lock=json.loads((ROOT/'manifests/distribution/native-sources.json').read_text())
+  for selected in [['ctx64k-mtp2'],['ctx128k-mtp2'],['ctx64k-mtp2','ctx128k-mtp2'],list(e.OPT_CONTEXTS)]:
+   value={'optin_engines':{e.OPT64:self.record()},'enabled_optin_profiles':selected}
+   self.assertEqual(e.validate_engine_records(value,lock)[e.OPT64].binary_sha256,'a'*64)
+  self.assertEqual(e.validate_engine_records({},lock),{})
+  for selected in [['ctx128k-mtp2','ctx64k-mtp2'],['ctx128k-mtp2','ctx128k-mtp2'],['ctx128k'],['*']]:
+   value={'optin_engines':{e.OPT64:self.record()},'enabled_optin_profiles':selected}
    with self.assertRaises(DistributionError):e.validate_engine_records(value,lock)
  def test_source_registry_cannot_enable_candidate_without_generated_trust(self):
   document=self.document();registry=profiles.parse_registry(document)

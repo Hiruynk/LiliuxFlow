@@ -36,7 +36,10 @@ class Wiring(unittest.TestCase):
         for alias in ('qwen3.8-flash-next-lily-q4-128k','qwen3.8-flash-next-lily-q4-262k'):
             self.assertTrue(policy.explicit_profile_access(alias,[alias],policy=p));self.assertFalse(policy.explicit_profile_access(alias,['*'],policy=p))
         disabled=policy.parse_policy({'schema_version':1,'enabled_models':[BASE],'validation_keys':{}});self.assertFalse(policy.explicit_profile_access(OPT,[OPT],policy=disabled))
-        with self.assertRaises(ValueError):policy.parse_policy({'schema_version':1,'enabled_models':enabled,'validation_keys':{OPT:['a'*64]}})
+        scoped=policy.parse_policy({'schema_version':1,'enabled_models':[BASE],'validation_keys':{OPT:['a'*64]}})
+        self.assertTrue(policy.explicit_profile_access(OPT,[OPT],key_fingerprint='a'*64,policy=scoped))
+        self.assertFalse(policy.explicit_profile_access(OPT,[OPT],key_fingerprint='b'*64,policy=scoped))
+        with self.assertRaises(ValueError):policy.parse_policy({'schema_version':1,'enabled_models':enabled,'validation_keys':{'unknown':['a'*64]}})
     def test_CLI_build_forwards_only_exact_optin_seam_without_build_or_network(self):
         calls=[];module=types.SimpleNamespace(build=lambda *a,**k:calls.append((a,k)) or {'CPU':'NO_BUILD'})
         args=types.SimpleNamespace(data_root=HERE,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manifest=None,execute=False,optin_engine=ENGINE)
@@ -56,11 +59,24 @@ class Wiring(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             data=pathlib.Path(folder).resolve();args=types.SimpleNamespace(data_root=data,profile_command='list')
             with patch.dict(sys.modules,{'profile_registry':source_registry}),patch.object(liliuxflow,'emit',side_effect=outputs.append):liliuxflow.profiles(args)
-            self.assertEqual(outputs[-1]['catalog_source'],'source_catalog');self.assertFalse(outputs[-1]['profiles'][-1]['production_enabled'])
+            self.assertEqual(outputs[-1]['catalog_source'],'source_catalog');self.assertFalse(next(p for p in outputs[-1]['profiles'] if p['profile_id']=='ctx64k-mtp2')['production_enabled'])
             (data/'install.json').write_text(json.dumps({'runtime_state':'BUILT'}));calls=[]
             trusted=types.SimpleNamespace(validate=lambda *a,**k:calls.append(k) or {'registry':registry(True)})
             with patch.dict(sys.modules,{'profile_registry':source_registry,'trust':trusted}),patch.object(liliuxflow,'emit',side_effect=outputs.append):liliuxflow.profiles(args)
-            self.assertEqual(outputs[-1]['catalog_source'],'trusted_installation');self.assertTrue(outputs[-1]['profiles'][-1]['production_enabled']);self.assertEqual(calls,[{'require_checkpoint':False}])
+            self.assertEqual(outputs[-1]['catalog_source'],'trusted_installation');self.assertTrue(next(p for p in outputs[-1]['profiles'] if p['profile_id']=='ctx64k-mtp2')['production_enabled']);self.assertEqual(calls,[{'require_checkpoint':False}])
+    def test_finite_six_rows_long_disabled_and_all_mtp_explicit(self):
+        r=registry(True)
+        self.assertEqual(len(r.profiles),6)
+        self.assertEqual(r.default.profile_id,'ctx64k')
+        for pid in ('ctx128k-mtp2','ctx262k-mtp2'):
+            profile=next(p for p in r.profiles if p.profile_id==pid)
+            self.assertFalse(profile.production_enabled)
+            with self.assertRaises(Exception):r.by_id(pid)
+        aliases=[p.public_alias for p in r.profiles]
+        enabled_policy=policy.parse_policy({'schema_version':1,'enabled_models':aliases,'validation_keys':{}})
+        for alias in aliases[3:]:
+            for models in ([],['*'],['all-router-models'],[BASE]):self.assertFalse(policy.explicit_profile_access(alias,models,policy=enabled_policy))
+            self.assertTrue(policy.explicit_profile_access(alias,[alias],policy=enabled_policy))
 class Routing(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.calls=[];r=registry();self.profiles=compat_profiles(r)

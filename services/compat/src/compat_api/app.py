@@ -105,15 +105,18 @@ class Settings:
             "qwen3.8-flash-next-lily-q4-128k": (131072, 4272),
             "qwen3.8-flash-next-lily-q4-262k": (262144, 4872),
             "qwen3.8-flash-next-lily-q4-mtp2-64k": (65536, 3672),
+            "qwen3.8-flash-next-lily-q4-mtp2-128k": (131072, 4272),
+            "qwen3.8-flash-next-lily-q4-mtp2-262k": (262144, 4872),
         }
         if any(p.public_alias not in targets or (p.context_tokens, p.total_deadline_seconds) != targets[p.public_alias]
                or p.default_output_tokens != DEFAULT_OUTPUT_BUDGET_TOKENS for p in self.profiles):
             raise ValueError("Compat profiles differ from canonical context policy")
+        mtp_profiles={'qwen3.8-flash-next-lily-q4-mtp2-'+size:'ctx'+size+'-mtp2' for size in ('64k','128k','262k')}
         for p in self.profiles:
-            if p.public_alias=='qwen3.8-flash-next-lily-q4-mtp2-64k':
-                if type(p.mtp_drafts) is not int or type(p.max_batch) is not int or (p.profile_id,p.engine_id,p.mtp_drafts,p.kv_cache,p.max_batch)!=('ctx64k-mtp2','latest13f-defer-pc123-mtp2-opt64k',2,'bf16',1):raise ValueError('Compat opt-in engine profile differs')
+            if p.public_alias in mtp_profiles:
+                if type(p.mtp_drafts) is not int or type(p.max_batch) is not int or (p.profile_id,p.engine_id,p.mtp_drafts,p.kv_cache,p.max_batch)!=(mtp_profiles[p.public_alias],'latest13f-defer-pc123-mtp2-opt64k',2,'bf16',1):raise ValueError('Compat opt-in engine profile differs')
             elif type(p.mtp_drafts) is not int or p.mtp_drafts!=0:raise ValueError('Established Compat profiles must retain MTP0')
-        if self.public_alias=='qwen3.8-flash-next-lily-q4-mtp2-64k':raise ValueError('The opt-in profile cannot replace the established default')
+        if self.public_alias in mtp_profiles:raise ValueError('The opt-in profile cannot replace the established default')
 
     def select_profile(self, alias: str) -> CompatModelProfile | None:
         if not self.model_configured:
