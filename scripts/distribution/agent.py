@@ -679,15 +679,7 @@ def _force_stop(trusted,*,dry_run=False):
     if dry_run:return {'state':'validated_force_stop_plan','force':True,'requires_idle_guard':False,'data_preserved':True}
     frozen=[];bootout=None;captured=[]
     try:
-        if not fs.send(owner,signal.SIGSTOP):raise DistributionError('owned agent exited before force capture')
-        frozen.append(owner)
-        captured=non_database_tree(fs.descendants(owner['pid']))
-        for value in captured:
-            if fs.send(value,signal.SIGSTOP):frozen.append(value)
-        second=non_database_tree(fs.descendants(owner['pid']))
-        captured=list({x['pid']:x for x in captured+second}.values())
-        for value in second:
-            if value not in frozen and fs.send(value,signal.SIGSTOP):frozen.append(value)
+        fs.freeze_tree_for_stop(owner,captured,frozen,non_database_tree)
         bypid={x['pid']:x for x in captured}
         for name,value in record.get('children',{}).items():
             fs.identity(value)

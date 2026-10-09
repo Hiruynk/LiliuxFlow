@@ -79,6 +79,11 @@ def _known_ps(row):
     return row["uid"] == 0 and row["ruid"] == os.getuid() and row["ucomm"] == "ps" and _suid_ps_identity()
 
 
+class KnownLivePsPending(DistributionError):
+    """Only two matching kernel identities of live SUID ps authorize reader retry."""
+    pass
+
+
 def descendants(parent):
     if type(parent) is not int or parent<=1:
         raise DistributionError('unsafe owned-tree parent PID')
@@ -90,6 +95,7 @@ def descendants(parent):
         parents = {parent}
         found = []
         retry = False
+        pending_live_ps = None
         rechecked = None
         while True:
             before = len(parents)
@@ -101,6 +107,7 @@ def descendants(parent):
                     if not _known_ps(row):
                         raise DistributionError("project child UID changed; refusing forced shutdown")
                     if not row["stat"].startswith("Z"):
+                        pending_live_ps = row
                         retry = True
                         break
                     # Frozen parents cannot reap a zombie. Positive kernel Z
@@ -147,6 +154,14 @@ def descendants(parent):
         if not retry:
             return found
         if time.monotonic() >= deadline:
+            if pending_live_ps is not None:
+                second = _descendant_rows()
+                current = next((item for item in second if item['pid'] == pending_live_ps['pid']), None)
+                keys = ('pid','ppid','uid','ruid','ucomm','started')
+                if (current is not None and _known_ps(current) and not current['stat'].startswith('Z')
+                        and all(current[key] == pending_live_ps[key] for key in keys)
+                        and not any(item['ppid'] == current['pid'] for item in rows + second)):
+                    raise KnownLivePsPending("project child UID changed; live ps did not settle within capture bound")
             raise DistributionError("project child UID changed; live ps did not settle within capture bound")
         time.sleep(min(.02, max(0, deadline - time.monotonic())))
 
@@ -221,3 +236,34 @@ def terminate_all(identities, *, grace=10, resume=False):
         while any(not exited(x) for x in leaves) and time.monotonic()<kill_deadline:time.sleep(.02)
         if any(not exited(x) for x in leaves):raise DistributionError('verified owned processes remain after bounded shutdown')
         for ident in leaves:pending.pop(ident['pid'])
+
+
+def freeze_tree_for_stop(owner, captured, frozen, filter_tree, *, capture=None, signaler=None, clock=None):
+    """Typed known-ps retry resumes only exact own readers, then freezes a new tree."""
+    capture=capture or descendants;signaler=signaler or send;clock=clock or time.monotonic;deadline=clock()+2
+    def remember(values):
+        merged={value['pid']:value for value in captured}
+        for value in values:
+            if value['pid'] in merged and merged[value['pid']]!=value:raise DistributionError('captured PID identity changed during refreeze')
+            merged[value['pid']]=value
+        captured[:]=merged.values()
+    def freeze(value):
+        if signaler(value,signal.SIGSTOP) and value not in frozen:frozen.append(value)
+    for attempt in range(3):
+        if not signaler(owner,signal.SIGSTOP):raise DistributionError('owned agent exited before force capture')
+        if owner not in frozen:frozen.append(owner)
+        try:
+            remember(filter_tree(capture(owner['pid'])))
+            for value in captured:freeze(value)
+            remember(filter_tree(capture(owner['pid'])))
+            for value in captured:freeze(value)
+            return
+        except KnownLivePsPending:
+            for value in reversed(frozen):
+                current=inspect(value['pid'])
+                if current is None:continue
+                if current!=value:raise DistributionError('paused reader identity changed during known ps retry')
+                signaler(value,signal.SIGCONT)
+            if attempt==2 or clock()>=deadline:raise
+            capture(owner['pid'])
+    raise DistributionError('known ps reader retry exhausted')
