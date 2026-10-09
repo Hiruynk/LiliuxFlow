@@ -116,7 +116,7 @@ def validate(data, *, require_checkpoint=True, trace=None):
     for item in trust.get('source_files', []):
         step('source_file_open',item['path'])
         verified_file(source, item)
-    required_source = {'services/compat/src/compat_api/app.py', 'services/compat/src/compat_api/profile.py', 'services/compat/src/compat_api/llama_guard.py', 'services/compat/src/compat_api/portable.py', 'services/compat/src/compat_api/__init__.py', 'scripts/distribution/trust.py', 'scripts/distribution/agent.py', 'scripts/distribution/model_runner.py', 'scripts/distribution/ownership.py'}
+    required_source = {'services/compat/src/compat_api/app.py', 'services/compat/src/compat_api/profile.py', 'services/compat/src/compat_api/llama_guard.py', 'services/compat/src/compat_api/portable.py', 'services/compat/src/compat_api/__init__.py', 'scripts/distribution/trust.py', 'scripts/distribution/agent.py', 'scripts/distribution/model_runner.py', 'scripts/distribution/ownership.py', 'scripts/distribution/forced_stop.py'}
     if registry_record is not None:
         required_source.update({'scripts/distribution/profile_registry.py', 'scripts/distribution/runtime_proof.py',
                                 'scripts/distribution/litellm_profile_policy.py', 'scripts/distribution/patch_litellm_profiles.py'})

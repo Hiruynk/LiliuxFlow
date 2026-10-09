@@ -600,8 +600,133 @@ def start(data,*,dry_run=False,controlplane_only=False,readiness_seconds=180):
     raise DistributionError('own LaunchAgent started but readiness failed; inspect private logs and ownership registry')
 
 
-def stop(data,*,dry_run=False,controlplane_only=False):
+def _force_pg_identity(trusted,registry,fs):
+    recorded=registry.get('postgres');pgdata=no_symlinks(trusted['data_root']/'postgres/data');pidfile=no_symlinks(pgdata/'postmaster.pid')
+    if recorded is None:
+        if pidfile.exists():raise DistributionError('unregistered PostgreSQL PID file; force stop refused')
+        return None,None
+    fs.identity(recorded)
+    if recorded['uid']!=os.getuid():raise DistributionError('force stop PostgreSQL owner differs')
+    if not fs.exact(recorded):raise DistributionError('registered PostgreSQL already absent; explicit record review required')
+    private_directory(pgdata);content=private_file(pidfile).read_bytes();lines=content.decode().splitlines()
+    if len(lines)<4 or int(lines[0])!=recorded['pid'] or Path(lines[1])!=pgdata or int(lines[3])!=trusted['config']['ports']['postgresql']:
+        raise DistributionError('force stop PostgreSQL PID/PGDATA/port differs')
+    pg=postgres_tools(trusted);command=fs.command(recorded);prefix=str(pg/'postgres')+' -D '+str(pgdata)
+    import datetime
+    started=datetime.datetime.strptime(recorded['started'],'%a %b %d %H:%M:%S %Y').timestamp()
+    if not (command==prefix or command.startswith(prefix+' ')) or abs(started-int(lines[2]))>5:
+        raise DistributionError('force stop PostgreSQL binary/data/start differs')
+    return recorded,content
+
+def _force_stop(trusted,*,dry_run=False):
+    import forced_stop as fs
+    cfg=trusted['config'];data=trusted['data_root'];source=trusted['source_root'];label=cfg['launchd_label']
+    if cfg.get('owner_uid')!=os.getuid() or label!='com.diurnoctra.liliuxflow.'+str(uuid.UUID(cfg['installation_id'])):
+        raise DistributionError('force stop installation label/owner differs')
+    state=no_symlinks(data/'run/agent.json');plist=no_symlinks(data/'run/stack.plist')
+    if not state.exists():raise DistributionError('force stop needs an exact owned agent registry; use normal stop for an unstarted installation')
+    record=read_object(private_file(state));decoded=plistlib.loads(private_file(plist).read_bytes())
+    arguments=decoded.get('ProgramArguments');prefix=[str(trusted['binaries']['compat_python']),str(source/'scripts/distribution/agent.py'),'--data-root',str(data)]
+    if (type(record.get('schema_version')) is not int or record['schema_version']!=1 or record.get('installation_id')!=cfg['installation_id']
+            or not isinstance(record.get('children'),dict)
+            or decoded.get('Label')!=label or decoded.get('WorkingDirectory')!=str(source)
+            or not isinstance(arguments,list) or arguments[:4]!=prefix or arguments[4:] not in ([],['--controlplane-only'])):
+        raise DistributionError('force stop owned registry/plist installation differs')
+    owner=fs.identity(record.get('agent'))
+    if not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):raise DistributionError('force stop agent identity/command differs')
+    target='gui/'+str(os.getuid())+'/'+label
+    printed=subprocess.run(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=5)
+    import re
+    match=re.search(r'^\s*pid\s*=\s*(\d+)\s*$',printed.stdout,re.M)
+    if printed.returncode or not match or int(match.group(1))!=owner['pid']:raise DistributionError('force stop exact launchd PID differs')
+    pg,pgcontent=_force_pg_identity(trusted,record,fs)
+    pgfamily={pg['pid'],*(x['pid'] for x in fs.descendants(pg['pid']))} if pg is not None else set()
+    def non_database_tree(values):
+        excluded=set(pgfamily)
+        while True:
+            new=excluded|{x['pid'] for x in values if x['ppid'] in excluded}
+            if new==excluded:break
+            excluded=new
+        return [x for x in values if x['pid'] not in excluded]
+    if dry_run:return {'state':'validated_force_stop_plan','force':True,'requires_idle_guard':False,'data_preserved':True}
+    frozen=[];bootout=None;captured=[]
+    try:
+        if not fs.send(owner,signal.SIGSTOP):raise DistributionError('owned agent exited before force capture')
+        frozen.append(owner)
+        captured=non_database_tree(fs.descendants(owner['pid']))
+        for value in captured:
+            if fs.send(value,signal.SIGSTOP):frozen.append(value)
+        second=non_database_tree(fs.descendants(owner['pid']))
+        captured=list({x['pid']:x for x in captured+second}.values())
+        for value in second:
+            if value not in frozen and fs.send(value,signal.SIGSTOP):frozen.append(value)
+        bypid={x['pid']:x for x in captured}
+        for name,value in record.get('children',{}).items():
+            fs.identity(value)
+            if fs.exact(value) and bypid.get(value['pid'])!=value:raise DistributionError('registered owned child outside frozen agent tree')
+        model=data/'run/model.json';model_record=read_object(private_file(model)) if model.exists() else None
+        if model_record is not None:
+            if type(model_record.get('schema_version')) is not int or model_record['schema_version']!=1 or model_record.get('installation_id')!=cfg['installation_id'] or model_record.get('binary_sha256')!=trusted['trust']['binaries']['lily']['sha256']:
+                raise DistributionError('force stop model installation/binary differs')
+            for key in ('runner','child'):
+                value=fs.identity(model_record.get(key))
+                if fs.exact(value) and bypid.get(value['pid'])!=value:raise DistributionError('owned model lies outside verified agent tree')
+        bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        fs.terminate_all(captured,resume=True)
+        if pg is not None:
+            if fs.exact(pg):
+                if private_file(data/'postgres/data/postmaster.pid').read_bytes()!=pgcontent:raise DistributionError('owned PGDATA PID file changed before fast stop')
+                private_run([postgres_tools(trusted)/'pg_ctl','-D',data/'postgres/data','-m','fast','-w','-t','30','stop'],env=pg_environment(trusted),timeout=40)
+            if not fs.exited(pg):raise DistributionError('owned PostgreSQL remains after normal fast stop')
+        fs.terminate_all([owner],grace=5,resume=True)
+        bootout.wait(timeout=15)
+        if bootout.returncode or any(not fs.exited(x) for x in captured+[owner]):raise DistributionError('owned force shutdown incomplete; registry retained')
+        if subprocess.run(['/bin/launchctl','print',target],capture_output=True,timeout=5).returncode==0:raise DistributionError('own launchd label remains registered')
+        _force_clear_model_records(trusted,captured,fs)
+        if state.exists():
+            if read_object(private_file(state))!=record:raise DistributionError('force stop agent registry changed; retained for review')
+            state.unlink()
+        plist.unlink(missing_ok=True)
+        return {'state':'stopped','force':True,'data_preserved':True,'model_preserved':True,'postgres_fast_stop':pg is not None}
+    finally:
+        for value in reversed(frozen):
+            try:fs.send(value,signal.SIGCONT)
+            except (DistributionError,OSError):pass
+
+def _force_clear_model_records(trusted,captured,fs):
+    # No event counters or identity fields are rewritten. Only exact exited
+    # installation-owned stale records may be removed after physical teardown.
+    data=trusted['data_root'];bypid={x['pid']:x for x in captured};lease=no_symlinks(Path.home()/'Library/Application Support/LiliuxFlow-runtime-leases/gpu.lease')
+    path=lease/'lease.json'
+    if path.exists():
+        record=read_object(private_file(path))
+        if record.get('installation_id')==trusted['config']['installation_id']:
+            if type(record.get('schema_version')) is not int or record['schema_version']!=1:raise DistributionError('owned runtime lease schema differs')
+            private_directory(lease);before=lease.stat()
+            if record.get('binary_sha256')!=trusted['trust']['binaries']['lily']['sha256']:raise DistributionError('owned runtime lease binary differs')
+            for key in ('runner','child'):
+                value=record.get(key)
+                if value is not None:
+                    fs.identity(value)
+                    if bypid.get(value['pid'])!=value or not fs.exited(value):raise DistributionError('runtime lease owner is not an exact exited captured child')
+            if {x.name for x in lease.iterdir()}!={'lease.json'} or read_object(private_file(path))!=record:raise DistributionError('owned runtime lease changed')
+            moved=lease.with_name('gpu.lease.portable-stopped-'+uuid.uuid4().hex);os.rename(lease,moved)
+            if (moved.stat().st_dev,moved.stat().st_ino)!=(before.st_dev,before.st_ino) or read_object(private_file(moved/'lease.json'))!=record:
+                if not lease.exists():os.rename(moved,lease)
+                raise DistributionError('runtime lease quarantine identity differs')
+            (moved/'lease.json').unlink();moved.rmdir()
+    model=data/'run/model.json'
+    if model.exists():
+        record=read_object(private_file(model))
+        if record.get('installation_id')!=trusted['config']['installation_id']:raise DistributionError('retained model record belongs to another installation')
+        for key in ('runner','child'):
+            value=record.get(key)
+            if value is not None and (bypid.get(fs.identity(value)['pid'])!=value or not fs.exited(value)):raise DistributionError('retained model record owner is unverified')
+        model.unlink()
+
+def stop(data,*,dry_run=False,controlplane_only=False,force=False):
     trusted=validate(data,require_checkpoint=False);state=data/'run/agent.json'
+    if force:return _force_stop(trusted,dry_run=dry_run)
     if not state.exists():
         plist=data/'run/stack.plist'
         if not plist.exists():return {'state':'already_stopped','data_preserved':True}

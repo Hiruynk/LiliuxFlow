@@ -221,7 +221,9 @@ def require_runtime(args):
         raise DistributionError('portable runtime adapter is not built; run build first')
     from agent import start, stop
     operation = start if args.command == 'start' else stop
-    emit(operation(no_symlinks(args.data_root), dry_run=args.dry_run, controlplane_only=args.controlplane_only))
+    options={'dry_run':args.dry_run,'controlplane_only':args.controlplane_only}
+    if args.command=='stop':options['force']=getattr(args,'force',False)
+    emit(operation(no_symlinks(args.data_root),**options))
     return 0
 
 def configure_runtime(args):
@@ -560,6 +562,7 @@ def main():
         command=commands.add_parser(name)
         command.add_argument('--dry-run', action='store_true')
         command.add_argument('--controlplane-only', action='store_true')
+        if name=='stop':command.add_argument('--force',action='store_true',help='cancel inference and stop only this verified installation')
     commands.add_parser('configure').add_argument('--port',action='append',type=parse_port,required=True)
     command = commands.add_parser('build')
     command.add_argument('--execute', action='store_true')

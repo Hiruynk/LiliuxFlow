@@ -299,7 +299,7 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
     source_commit=resolve_source_commit(source)
     lock=read_object(source/'manifests/distribution/native-sources.json')
     plan={'state':'plan','source_commit':source_commit,'source_commits':{k:lock[k]['commit'] for k in ('lily','litellm','llama_swap')},
-          'steps':['fetch SHA-pinned sources/toolchains','replay five canonical Lily patches and verify 45 source hashes',
+          'steps':['fetch SHA-pinned sources/toolchains',f"replay {len(lock['lily']['patches'])} canonical Lily patches and verify {len(read_object(source/'manifests/distribution/lily-source-baseline.json')['files'])} source hashes",
                    'uv sync --locked to installation runtime venvs','install finite LiteLLM context policy and catalog filters',
                    'npm ci and two static UI builds','cargo locked Lily native build','Go embed_ui llama-swap build','write release trust'],
           'ui':'localized recipe supplied' if ui_manifest else 'upstream UI only; final locale acceptance false',
@@ -422,7 +422,7 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
             shutil.copyfile(actual,interpreter)
             interpreter.chmod(0o700)
         binaries[name]=interpreter
-    source_paths=['services/compat/src/compat_api/'+p for p in ('app.py','profile.py','llama_guard.py','portable.py','__init__.py')]+['scripts/distribution/'+p for p in ('trust.py','agent.py','model_runner.py','ownership.py','common.py','backup_native.py','liliuxflow.py','profile_registry.py','runtime_proof.py','litellm_profile_policy.py','patch_litellm_profiles.py','welcome_native.py','welcome_profiles.py','model_catalog.py','model_installer.py')]+['patches/litellm-welcome/runtime.py','services/model-installer/pyproject.toml','services/model-installer/uv.lock','manifests/distribution/native-sources.json','manifests/distribution/checkpoint-files.json']
+    source_paths=['services/compat/src/compat_api/'+p for p in ('app.py','profile.py','llama_guard.py','portable.py','__init__.py')]+['scripts/distribution/'+p for p in ('trust.py','agent.py','model_runner.py','ownership.py','forced_stop.py','common.py','backup_native.py','liliuxflow.py','profile_registry.py','runtime_proof.py','litellm_profile_policy.py','patch_litellm_profiles.py','welcome_native.py','welcome_profiles.py','model_catalog.py','model_installer.py')]+['patches/litellm-welcome/runtime.py','services/model-installer/pyproject.toml','services/model-installer/uv.lock','manifests/distribution/native-sources.json','manifests/distribution/checkpoint-files.json']
     from model_catalog import load_catalog
     load_catalog(source)
     from profile_registry import load_registry

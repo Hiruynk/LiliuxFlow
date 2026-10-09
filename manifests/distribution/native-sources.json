@@ -44,6 +44,12 @@
         "path": "scripts/distribution/patches/lily/05-cancelled-session-no-lru-release.patch",
         "sha256": "298e454fc2cee655f80451ed3260b8702ecc70f62e86f3ce185d46959311a260",
         "unidiff_zero": true
+      },
+      {
+        "path": "scripts/distribution/patches/lily/06-snapshot-batch-copy.patch",
+        "sha256": "c56c8b0480e0c48dace10c03d59bc0647430d3217b8489f8b3cc94f0d70a5334",
+        "unidiff_zero": false,
+        "upstream_fix_commit": "44807f28f65711fbf06a68ee874310bdca323fbf"
       }
     ]
   },
