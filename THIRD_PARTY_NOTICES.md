@@ -4,7 +4,7 @@ LiliuxFlow by Diurnoctra integrates a management UI **powered by LiteLLM**, mode
 
 | Component | Exact source/version | Original notice included |
 | --- | --- | --- |
-| Lily | `fabiogreter/lily-qwen3.8-flash-next`, `db3f8a7cdb33f1e88b68c6889331abd31098c923`, with five separately pinned safety patches | [Apache-2.0 LICENSE](docs/productization/licenses/lily/LICENSE), [NOTICE](docs/productization/licenses/lily/NOTICE). The original NOTICE includes Perplexity AI attribution and the MLX/MLX-LM notices. |
+| Lily | `fabiogreter/lily-qwen3.8-flash-next`, `db3f8a7cdb33f1e88b68c6889331abd31098c923`, with five separately pinned safety patches and the snapshot batch-copy backport from `44807f28f65711fbf06a68ee874310bdca323fbf` | [Apache-2.0 LICENSE](docs/productization/licenses/lily/LICENSE), [NOTICE](docs/productization/licenses/lily/NOTICE). The original NOTICE includes Perplexity AI attribution and the MLX/MLX-LM notices. |
 | LiteLLM | `BerriAI/litellm`, `d09bbae1c6df463e425558f60d460437193635da` (`v1.102.1`) | [Original LICENSE](docs/productization/licenses/litellm/LICENSE), including its MIT text and Enterprise-directory restriction. No blanket relicensing or Enterprise grant is asserted. |
 | llama-swap | `mostlygeek/llama-swap`, `fcefa7b7bebc326790937bbebc32ae87a958747c` (`v260`) | [MIT LICENSE.md](docs/productization/licenses/llama_swap/LICENSE.md), preserving Benson Wong's attribution. |
 | i18next | `26.4.2`, exact npm lock integrity in the provenance manifest | [MIT LICENSE](docs/productization/licenses/i18next/LICENSE) |

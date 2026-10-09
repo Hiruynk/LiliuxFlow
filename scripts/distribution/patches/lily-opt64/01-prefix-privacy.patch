@@ -1,0 +1,86 @@
+diff --git a/src/serve/request.rs b/src/serve/request.rs
+--- a/src/serve/request.rs
++++ b/src/serve/request.rs
+@@ -44,6 +44,18 @@
+ use crate::qwen4exp::{ImageEmbeds, VisionInput, positions_for_prompt};
+ use crate::stats::{Counters, TaskMemory, VmCounters};
+ use crate::thinking::{ClosedBy, ThinkingControl, opens_thinking};
++
++fn prompt_cache_divergence_summary(
++    agreement_tokens: usize,
++    reused_tokens: usize,
++    prompt_tokens: usize,
++    cached_tail_tokens: usize,
++) -> String {
++    format!(
++        "prompt/cache divergence: agreement_tokens={agreement_tokens} reused_tokens={reused_tokens} \
++         prompt_tokens={prompt_tokens} cached_tail_tokens={cached_tail_tokens}"
++    )
++}
+ 
+ /// What a request's admission measured, for its timings and log line.
+ #[derive(Debug, Clone, Default)]
+@@ -798,35 +810,22 @@
+         let counters_prefill = crate::stats::counters();
+         let vm_prefill = crate::stats::vm_counters();
+ 
+-        // A long shared prefix that nothing could resume from: show the seam
+-        // once, as the text either side of it in this prompt and what the
+-        // cached lineage continued with. This is how a client that renders
+-        // the same preamble differently between runs is found at a glance.
+-        // Unlike the durable boundary, the threshold here is absolute: a
+-        // short fork inside one conversation (a re-rendered tool call, a
+-        // re-tokenized answer) is exactly what this line should surface.
+-        // An ordinary hit (`agreement == reused`) diverges too, at the user's
+-        // message, and says nothing worth a line of prompt text in the log.
++        // A long shared prefix that nothing could resume from: report token
++        // counts only. Prompt text can include prior reasoning and tool
++        // arguments, so it must never be written to the service log.
+         if min_tokens > 0
+             && agreement >= min_tokens
+             && agreement > reused
+             && agreement < n - 1
+         {
+-            let tokenizer = generator.tokenizer();
+-            let text = |ids: &[u32]| {
+-                tokenizer
+-                    .decode(ids, false)
+-                    .unwrap_or_else(|e| format!("<undecodable: {e}>"))
+-            };
+-            let window = 12;
+             eprintln!(
+-                "divergence at {agreement}: prompt {:?} | {:?}, cached lineage continued {:?}",
+-                text(&p.prompt[agreement.saturating_sub(window)..agreement]),
+-                text(&p.prompt[agreement..(agreement + window).min(n)]),
+-                text(
+-                    &acquired.divergent_tail
+-                        [..acquired.divergent_tail.len().min(window)]
+-                ),
++                "{}",
++                prompt_cache_divergence_summary(
++                    agreement,
++                    reused,
++                    n,
++                    acquired.divergent_tail.len(),
++                )
+             );
+         }
+ 
+diff --git a/tests/unit/serve/request.rs b/tests/unit/serve/request.rs
+--- a/tests/unit/serve/request.rs
++++ b/tests/unit/serve/request.rs
+@@ -16,6 +16,14 @@
+ // stood (6bb3057), only with its inputs as parameters, so these tests pin
+ // the timings, the log lines and the response bodies to what the server
+ // produced then.
++
++#[test]
++fn prompt_cache_divergence_diagnostic_contains_counters_only() {
++    assert_eq!(
++        prompt_cache_divergence_summary(42, 35, 100, 12),
++        "prompt/cache divergence: agreement_tokens=42 reused_tokens=35 prompt_tokens=100 cached_tail_tokens=12"
++    );
++}
+ 
+ fn counters(chunks: u64, secs: f64, batches: u64, pages: u64) -> Counters {
+     Counters {

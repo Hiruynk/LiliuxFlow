@@ -33,9 +33,10 @@ def create_compat_app():
                         public_alias=profile['public_alias'], runtime_model_id=profile['runtime_model_id'],
                         context_limit_tokens=profile['context_tokens'], checkpoint_revision=manifest['revision'] if checkpoint is not None else None,
                         checkpoint_manifest_sha256=manifest['checkpoint_manifest_sha256'] if checkpoint is not None else None, checkpoint_file_count=len(checkpoint['files']) if checkpoint is not None else 0,
-                        profile_id=profile['public_alias'],
+                        profile_id=profile.get('profile_id'),
                         model_configured=trusted.get('model_configured') is not False,
-                        profiles=tuple(CompatModelProfile(p.public_alias, p.context_tokens, p.total_deadline_seconds, p.default_output_tokens)
+                        profiles=tuple(CompatModelProfile(p.public_alias, p.context_tokens, p.total_deadline_seconds, p.default_output_tokens,
+                                       profile_id=p.profile_id,engine_id=p.as_dict().get('engine_id'),mtp_drafts=p.as_dict().get('mtp_drafts',0),kv_cache=p.as_dict().get('kv_cache'),max_batch=p.as_dict().get('max_batch'))
                                        for p in (*trusted['registry'].enabled_profiles, *validation)) if trusted.get('model_configured') is not False else ())
     return create_app(settings=settings)
 

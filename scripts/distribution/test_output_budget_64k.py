@@ -71,8 +71,10 @@ class OutputBudgetTests(unittest.IsolatedAsyncioTestCase):
     def test_registry_defaults_allow_64k_output_with_unchanged_total_contexts(self):
         registry = load_registry(ROOT)
         self.assertEqual(MAX_OUTPUT_TOKENS, 65536)
-        self.assertEqual([p.default_output_tokens for p in registry.profiles], [65536] * 3)
-        self.assertEqual([p.context_tokens for p in registry.profiles], [65536, 131072, 262144])
+        self.assertEqual([p.default_output_tokens for p in registry.profiles], [65536] * 6)
+        self.assertEqual([p.context_tokens for p in registry.enabled_profiles], [65536, 131072, 262144])
+        self.assertEqual([p.context_tokens for p in registry.profiles if p.engine_id != 'legacy-db3-mtp0'], [65536, 131072, 262144])
+        self.assertTrue(all(not p.production_enabled for p in registry.profiles if p.engine_id != 'legacy-db3-mtp0'))
 
     async def test_omitted_budgets_are_64k_without_changing_caller_or_thinking(self):
         responses = await asyncio.gather(*(self.chat(profile, token=str(index)) for index, profile in enumerate(PROFILES)))

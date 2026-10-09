@@ -84,8 +84,23 @@ LiliuxFlow 的自有实现包括安装监督程序、模型运行器、生命周
 | `qwen3.8-flash-next-lily-q4-64k` | 65,536 tokens | 已启用；默认模型 |
 | `qwen3.8-flash-next-lily-q4-128k` | 131,072 tokens | 已启用；可选 |
 | `qwen3.8-flash-next-lily-q4-262k` | 262,144 tokens | 已启用；可选 |
+| `qwen3.8-flash-next-lily-q4-mtp2-64k` | 65,536 tokens | 可选；已在本机验证 |
+| `qwen3.8-flash-next-lily-q4-mtp2-128k` | 131,072 tokens | 可选；已在本机验证 |
+| `qwen3.8-flash-next-lily-q4-mtp2-262k` | 262,144 tokens | 可选；已在本机验证 |
 
-各配置共用同一份外置 Q4 checkpoint，保留 checkpoint 默认 high thinking、QSA Split 和 MTP0。输入与输出共同受总上下文上限约束。应用使用长上下文模型前，须为其虚拟密钥明确授予该模型的访问权限。请求采用有界队列；切换配置会等待当前生成结束并完成资源释放。
+上述三个 MTP0 配置共用同一份外置 Q4 checkpoint，保留 checkpoint 默认 high thinking、QSA Split 和 MTP0。输入与输出共同受总上下文上限约束。应用使用长上下文模型前，须为其虚拟密钥明确授予该模型的访问权限。请求采用有界队列；切换配置会等待当前生成结束并完成资源释放。
+
+### 可选的 MTP2 配置
+
+三个可选的 MTP2 别名分别对应 `ctx64k-mtp2`、`ctx128k-mtp2` 和 `ctx262k-mtp2`，总上下文为 65,536、131,072 和 262,144 tokens。它们共用同一引擎和 Q4 checkpoint，采用 HIGH thinking、QSA Split 和 BF16 KV。各配置的最大输出预算均为 65,536 tokens，包含推理。API 默认仍为 64K MTP0 模型。
+
+三个 MTP2 配置均已在上述 M5 Max／128 GiB 主机完成验证并启用。这是本机验证结果；全新安装不会自动启用它们。源码目录中的所有 MTP2 配置初始均为停用。
+
+在已停止的安装中，使用“快速开始”的 `lf` 函数执行 `lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute`。此可选引擎构建最初只启用 MTP2 64K。128K 和 262K 须由操作者分别验证，再在可信的已安装配置中启用；启用其中一档不会启用另一档。`lf profiles list` 和 `lf profiles info ctx128k-mtp2` 可查看配置目录，不加载模型。
+
+配置启用后，可用 `lf profiles grant-owner ctx128k-mtp2 --dry-run` 预览指定 owner caller 的授权，再在需要时加上 `--execute` 追加该别名。其他两档分别使用 `ctx64k-mtp2` 或 `ctx262k-mtp2`。其他 caller 须分别显式获得模型权限；空白或通配授权不允许使用 MTP2。授予 caller 权限不会启用已停用的配置。
+
+API 请求须使用已启用的精确别名；[API](docs/API.md) 提供直接使用 128K 和 262K 别名的示例。请求 body 不能修改引擎、路径、内存、KV 精度或 context。JSON／JSON Schema 响应格式和工具执行仍不支持。
 
 ## 相同工作负载的性能
 

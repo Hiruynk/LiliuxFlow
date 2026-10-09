@@ -87,13 +87,41 @@ def _control_body(status: int, code: str, detail: str) -> JSONResponse:
     )
 
 
+def _pre_admission_validation_rejection(status, content_type, body):
+    """Only pinned native HTTP400 invalid_request_error, fully received."""
+    if status != 400 or content_type.split(';', 1)[0].strip().lower() != 'application/json' or len(body) > 4096:
+        return False
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate error key')
+            result[key] = value
+        return result
+    try:
+        value = json.loads(body, object_pairs_hook=unique_object)
+    except (ValueError, UnicodeError):
+        return False
+    if not isinstance(value, dict) or set(value) != {'error'}:
+        return False
+    error = value['error']
+    if not isinstance(error, dict) or set(error) != {'message', 'type'} or error['type'] != 'invalid_request_error':
+        return False
+    message = error['message']
+    if not isinstance(message, str):
+        return False
+    return isinstance(message, str)
+
+
+
 class _GuardError(Exception):
     def __init__(self, status: int, code: str, detail: str):
         self.status, self.code, self.detail = status, code, detail
 
 
 class _CallerGone(Exception):
-    pass
+    def __init__(self):
+        self.generation_failed = False
 
 
 async def _stage(awaitable: Any, *, deadline: float, disconnect: asyncio.Task | None = None):
@@ -108,12 +136,23 @@ async def _stage(awaitable: Any, *, deadline: float, disconnect: asyncio.Task | 
         if task not in done:
             raise _GuardError(504, 'request_deadline', 'request exceeded its selected profile deadline')
         return await task
-    except BaseException:
+    except BaseException as error:
         if not task.done():
             task.cancel()
         outcome = await asyncio.gather(task, return_exceptions=True)
+        if isinstance(error,_CallerGone) and outcome:
+            value = outcome[0]
+            if (isinstance(value,httpx.Response) and not value.is_success
+                or isinstance(value,BaseException) and not isinstance(value,asyncio.CancelledError)):
+                error.generation_failed = True
         if outcome and isinstance(outcome[0], httpx.Response):
-            await outcome[0].aclose()
+            try:
+                await outcome[0].aclose()
+            except Exception:
+                if isinstance(error,_CallerGone):
+                    error.generation_failed = True
+                else:
+                    raise
         raise
 
 
@@ -125,25 +164,43 @@ class _ProfileTicket:
     forwarded: bool = False
     cleanup_profile: Any = None
     stage: str = 'loading'
+    pre_admission_rejected: bool = False
+    caller_cancelled: bool = False
+    generation_failed: bool = False
 
 
 class _ProfileStreamingResponse(StreamingResponse):
     """One disconnect reader, with cleanup even when ASGI send itself fails."""
-    def __init__(self, content: Any, *, disconnect: asyncio.Task, cleanup: Callable, **kwargs):
+    def __init__(self, content: Any, *, disconnect: asyncio.Task, cleanup: Callable, ticket=None, **kwargs):
         super().__init__(content, **kwargs)
         self.disconnect = disconnect
         self.cleanup = cleanup
+        self.ticket = ticket
 
     async def __call__(self, scope, receive, send):
         streaming = asyncio.create_task(self.stream_response(send))
         try:
             done, _ = await asyncio.wait({streaming, self.disconnect}, return_when=asyncio.FIRST_COMPLETED)
             if self.disconnect in done:
+                if self.ticket is not None:
+                    if not self.disconnect.cancelled() and self.disconnect.exception() is None:
+                        self.ticket.caller_cancelled = True
+                    else:
+                        self.ticket.generation_failed = True
                 if not streaming.done():
                     streaming.cancel()
-                await asyncio.gather(streaming, return_exceptions=True)
+                outcome = await asyncio.gather(streaming, return_exceptions=True)
+                if self.ticket is not None and any(isinstance(value,BaseException) and
+                    not isinstance(value,(asyncio.CancelledError,_CallerGone)) for value in outcome):
+                    self.ticket.generation_failed = True
+                if self.ticket is not None and any(isinstance(value,_CallerGone) and value.generation_failed for value in outcome):
+                    self.ticket.generation_failed = True
             else:
                 await streaming
+        except BaseException:
+            if self.ticket is not None:
+                self.ticket.generation_failed = True
+            raise
         finally:
             streaming.cancel()
             self.disconnect.cancel()
@@ -711,11 +768,13 @@ class _ContextLifecycleGuard(_LifecycleGuard):
         ticket.cleanup_profile = None
 
     async def _finish(self, ticket, response, *, complete):
+        close_failed = False
         if response is not None:
             try:
                 await response.aclose()
             except Exception:
                 complete = False
+                close_failed = True
         ticket.stage = 'cleanup'
         safe = not ticket.forwarded and ticket.cleanup_profile is None
         deadline = asyncio.get_running_loop().time() + self.cleanup_seconds
@@ -724,7 +783,17 @@ class _ContextLifecycleGuard(_LifecycleGuard):
                 await self._stop_and_prove(ticket.cleanup_profile, deadline)
                 ticket.cleanup_profile = None
                 safe = True
-            if ticket.forwarded:
+            if ticket.forwarded and ticket.pre_admission_rejected:
+                try:
+                    proven = await _stage(self.resource_probe(ticket.profile, 'pre_admission_rejected'),
+                                          deadline=min(deadline, asyncio.get_running_loop().time() + self.proof_wait_seconds))
+                    if proven is True:
+                        safe = True
+                        self._resident_profile = ticket.profile
+                        self._last_release_method = 'native_pre_admission_rejected'
+                except (Exception, asyncio.CancelledError):
+                    pass  # Unknown state still requires the existing owned exit path.
+            if ticket.forwarded and not safe:
                 if complete:
                     try:
                         await self._proof(ticket.profile, 'generation_complete',
@@ -732,6 +801,19 @@ class _ContextLifecycleGuard(_LifecycleGuard):
                         safe = True
                         self._resident_profile = ticket.profile
                         self._last_release_method = 'native_lane'
+                    except (Exception, asyncio.CancelledError):
+                        await self._stop_and_prove(ticket.profile, deadline)
+                        safe = True
+                        self._last_release_method = 'owned_child_exit'
+                elif (getattr(ticket.profile,'engine_id',None)=='latest13f-defer-pc123-mtp2-opt64k'
+                      and ticket.caller_cancelled and not ticket.generation_failed and not close_failed
+                      and (response is None or response.is_success)):
+                    try:
+                        await self._proof(ticket.profile, 'generation_cancelled',
+                                          deadline=min(deadline, asyncio.get_running_loop().time() + self.proof_wait_seconds))
+                        safe = True
+                        self._resident_profile = ticket.profile
+                        self._last_release_method = 'native_cancelled_session_drop'
                     except (Exception, asyncio.CancelledError):
                         await self._stop_and_prove(ticket.profile, deadline)
                         safe = True
@@ -778,13 +860,21 @@ class _ContextLifecycleGuard(_LifecycleGuard):
             raise _GuardError(503 if known else 404, 'profile_disabled' if known else 'model_not_found',
                               'requested model is disabled' if known else 'model is outside the finite registry') from error
         forbidden = {'num_ctx', 'max_seq', 'context_tokens', 'context_length', 'profile_path',
-                     'model_path', 'extra_args', 'truncate', 'truncation'}
+                     'model_path', 'extra_args', 'truncate', 'truncation', 'max_images'}
         if forbidden.intersection(value):
             raise _GuardError(400, 'invalid_request', 'request cannot override the selected context profile')
         for field in ('options', 'extra_body'):
             nested = value.get(field)
             if isinstance(nested, dict) and forbidden.intersection(nested):
                 raise _GuardError(400, 'invalid_request', 'request cannot override the selected context profile')
+        # Count the whole conversation before acquiring a permit or lazy loading.
+        # The immutable registry policy is not an inference-body override.
+        messages = value.get('messages', [])
+        image_count = sum(1 for message in messages if isinstance(message, dict)
+                          for part in (message.get('content') if isinstance(message.get('content'), list) else [])
+                          if isinstance(part, dict) and part.get('type') in ('image_url', 'input_image')) if isinstance(messages, list) else 0
+        if image_count > self.registry.maximum_images:
+            raise _GuardError(400, 'too_many_images', 'request image count exceeds the 64-image limit')
         budgets = [value[k] for k in ('max_tokens', 'max_completion_tokens') if k in value and value[k] is not None]
         if any(type(budget) is not int or not 0 < budget <= min(profile.context_tokens, 65536) for budget in budgets):
             raise _GuardError(400, 'invalid_request', 'output budget must not exceed 65536 tokens')
@@ -848,13 +938,22 @@ class _ContextLifecycleGuard(_LifecycleGuard):
                 iterator = response.aiter_raw().__aiter__()
                 terminal_seen = False
                 tail = b''
+                rejected_body = bytearray() if response.status_code == 400 and response.headers.get('content-type', '').split(';', 1)[0].strip().lower() == 'application/json' else None
                 try:
                     while True:
                         try:
                             chunk = await _stage(iterator.__anext__(), deadline=deadline, disconnect=disconnect)
                         except StopAsyncIteration:
                             complete = response.is_success
+                            if rejected_body is not None:
+                                ticket.pre_admission_rejected = _pre_admission_validation_rejection(
+                                    response.status_code, response.headers.get('content-type', ''), bytes(rejected_body))
                             return
+                        if rejected_body is not None:
+                            if len(rejected_body) + len(chunk) <= 4096:
+                                rejected_body.extend(chunk)
+                            else:
+                                rejected_body = None
                         if 'text/event-stream' in response.headers.get('content-type', ''):
                             examined = tail + chunk
                             terminal_seen = terminal_seen or b'data: [DONE]\n' in examined or b'data: [DONE]\r\n' in examined
@@ -863,27 +962,39 @@ class _ContextLifecycleGuard(_LifecycleGuard):
                         if terminal_seen:
                             complete = response.is_success
                             return
-                except _CallerGone:
+                except _CallerGone as error:
+                    ticket.caller_cancelled = True
+                    ticket.generation_failed = ticket.generation_failed or error.generation_failed
                     return
                 except _GuardError as error:
+                    ticket.generation_failed = True
                     if not terminal_seen and 'text/event-stream' in response.headers.get('content-type', ''):
                         packet = {'error': {'type': error.code, 'message': error.detail}}
                         yield ('data: ' + json.dumps(packet, separators=(',', ':')) + '\n\ndata: [DONE]\n\n').encode()
                     return
                 except httpx.HTTPError:
+                    ticket.generation_failed = True
                     if not terminal_seen and 'text/event-stream' in response.headers.get('content-type', ''):
                         yield b'data: {"error":{"type":"manager_unavailable","message":"upstream stream failed"}}\n\ndata: [DONE]\n\n'
                     return
+                except Exception:
+                    ticket.generation_failed = True
+                    raise
 
             async def cleanup():
                 await self._finish(ticket, response, complete=complete)
 
             delegated = True
-            return _ProfileStreamingResponse(chunks(), disconnect=disconnect, cleanup=cleanup,
+            return _ProfileStreamingResponse(chunks(), disconnect=disconnect, cleanup=cleanup, ticket=ticket,
                                              status_code=response.status_code, headers=headers, media_type=None)
-        except _CallerGone:
+        except _CallerGone as error:
+            if ticket is not None:
+                ticket.caller_cancelled = True
+                ticket.generation_failed = ticket.generation_failed or error.generation_failed
             return _ClientGoneResponse()
         except ClientDisconnect:
+            if ticket is not None:
+                ticket.caller_cancelled = True
             return _ClientGoneResponse()
         except _GuardError as error:
             result = _control_body(error.status, error.code, error.detail)

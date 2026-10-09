@@ -292,16 +292,24 @@ def install_project_node(data, node):
     return {name:{'path':str(file.relative_to(data)),'sha256':sha256(file)} for name,file in {
         'node':target/'bin/node','npm':launcher,'npm_cli':target/'lib/node_modules/npm/bin/npm-cli.js'}.items()}
 
-def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manifest=None,execute=False):
+def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manifest=None,execute=False,optin_engine=None):
     data=no_symlinks(data)
     config=installation(data)
     source=no_symlinks(Path(config['source_root']))
     source_commit=resolve_source_commit(source)
     lock=read_object(source/'manifests/distribution/native-sources.json')
+    from native_recipe import LEGACY_ENGINE, OPT64_ENGINE, select_lily_recipe
+    select_lily_recipe(lock)
+    if optin_engine not in (None, OPT64_ENGINE):
+        raise DistributionError('native opt-in engine selector is outside the finite allowlist')
+    opt_pin, opt_baseline = select_lily_recipe(lock, OPT64_ENGINE) if optin_engine else (None, None)
     plan={'state':'plan','source_commit':source_commit,'source_commits':{k:lock[k]['commit'] for k in ('lily','litellm','llama_swap')},
-          'steps':['fetch SHA-pinned sources/toolchains','replay five canonical Lily patches and verify 45 source hashes',
+          'steps':['fetch SHA-pinned sources/toolchains',f"replay {len(lock['lily']['patches'])} canonical Lily patches and verify {len(read_object(source/'manifests/distribution/lily-source-baseline.json')['files'])} source hashes",
                    'uv sync --locked to installation runtime venvs','install finite LiteLLM context policy and catalog filters',
                    'npm ci and two static UI builds','cargo locked Lily native build','Go embed_ui llama-swap build','write release trust'],
+          'optin_engine':optin_engine, 'existing_default_engine':LEGACY_ENGINE,
+          'optin_source_commit':opt_pin['commit'] if opt_pin else None,
+          'optin_archive_sha256':opt_pin['archive_sha256'] if opt_pin else None,
           'ui':'localized recipe supplied' if ui_manifest else 'upstream UI only; final locale acceptance false',
           'live_services_started':False,'weights_downloaded_or_loaded':False,'database_initialized':False}
     if not execute:
@@ -368,17 +376,18 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
         files=extract(archive,target,select=select)
         upstream['llama-swap' if name=='llama_swap' else name]=target
         fetch_receipts[name]={'commit':item['commit'],'archive_sha256':item['archive_sha256'],'file_count':len(files)}
-    from ui_recipe import git_environment
+    from native_recipe import apply_lily_source_patches
     lily=upstream['lily']
-    for item in lock['lily']['patches']:
-        patch=verified_file(source,item)
-        argv=['git','apply']+(['--unidiff-zero'] if item['unidiff_zero'] else [])
-        for check in (True,False):
-            result=subprocess.run(argv+(['--check'] if check else [])+[str(patch)],cwd=lily,env=git_environment(lily),capture_output=True)
-            if result.returncode:raise DistributionError('canonical Lily source patch replay failed')
-    baseline=read_object(source/'manifests/distribution/lily-source-baseline.json')
-    for item in baseline['files']:
-        verified_file(lily,item)
+    apply_lily_source_patches(source,lily,lock)
+    opt_recipe=None
+    if opt_pin:
+        archive=download('https://codeload.github.com/'+opt_pin['repository']+'/tar.gz/'+opt_pin['commit'],
+                         archives/'lily-opt64.tar.gz',opt_pin['archive_sha256'],cap=32*1024**2)
+        opt_source=work/'lily-opt64'
+        upstream['lily_opt64']=opt_source
+        files=extract(archive,opt_source)
+        opt_recipe=apply_lily_source_patches(source,opt_source,lock,OPT64_ENGINE)
+        fetch_receipts['lily_opt64']={'commit':opt_pin['commit'],'archive_sha256':opt_pin['archive_sha256'],'file_count':len(files)}
     from native_recipe import apply_manager_source_patches
     manager_recipe=apply_manager_source_patches(source,upstream['llama-swap'],lock['llama_swap'])
     ui_recipe=None
@@ -401,6 +410,9 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
         steps.append(command([node,npm_cli,'run','build'],cwd=target,env=env,log=logs/(name+'-ui.txt')))
     steps.append(command([cargo,'build','--release','--locked','--bin','lily','--target-dir',work/'cargo-target'],cwd=lily,env=env,log=logs/'lily-build.txt'))
     shutil.copyfile(work/'cargo-target/release/lily',native/'lily');(native/'lily').chmod(0o700)
+    if opt_pin:
+        steps.append(command([cargo,'build','--release','--locked','--bin','lily','--target-dir',work/'cargo-opt64-target'],cwd=opt_source,env=env,log=logs/'lily-opt64-build.txt'))
+        shutil.copyfile(work/'cargo-opt64-target/release/lily',native/'lily-opt64');(native/'lily-opt64').chmod(0o700)
     steps.append(command([go,'build','-mod=readonly','-trimpath','-tags','embed_ui','-ldflags','-X main.version=v260 -X main.commit='+lock['llama_swap']['commit']+' -X main.date=2026-10-01T00:00:00Z','-o',native/'llama-swap','.'],cwd=upstream['llama-swap'],env=env,log=logs/'llama-swap-build.txt'))
     (native/'llama-swap').chmod(0o700)
     ui=runtime/'litellm/lib/python3.12/site-packages/litellm/proxy/_experimental/out'
@@ -414,6 +426,7 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
             file=target/filename
             if file.is_file():shutil.copyfile(file,notices/(name+'-'+filename))
     binaries={'lily':native/'lily','llama_swap':native/'llama-swap'}
+    if opt_pin:binaries['lily_opt64']=native/'lily-opt64'
     for name,service in (('compat_python','compat'),('litellm_python','litellm')):
         interpreter=runtime/service/'bin/python'
         actual=interpreter.resolve()
@@ -422,7 +435,10 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
             shutil.copyfile(actual,interpreter)
             interpreter.chmod(0o700)
         binaries[name]=interpreter
-    source_paths=['services/compat/src/compat_api/'+p for p in ('app.py','profile.py','llama_guard.py','portable.py','__init__.py')]+['scripts/distribution/'+p for p in ('trust.py','agent.py','model_runner.py','ownership.py','common.py','backup_native.py','liliuxflow.py','profile_registry.py','runtime_proof.py','litellm_profile_policy.py','patch_litellm_profiles.py','welcome_native.py','welcome_profiles.py','model_catalog.py','model_installer.py')]+['patches/litellm-welcome/runtime.py','services/model-installer/pyproject.toml','services/model-installer/uv.lock','manifests/distribution/native-sources.json','manifests/distribution/checkpoint-files.json']
+    source_paths=['services/compat/src/compat_api/'+p for p in ('app.py','profile.py','llama_guard.py','portable.py','__init__.py')]+['scripts/distribution/'+p for p in ('trust.py','agent.py','model_runner.py','ownership.py','forced_stop.py','common.py','backup_native.py','liliuxflow.py','profile_registry.py','runtime_proof.py','litellm_profile_policy.py','patch_litellm_profiles.py','welcome_native.py','welcome_profiles.py','model_catalog.py','model_installer.py')]+['patches/litellm-welcome/runtime.py','services/model-installer/pyproject.toml','services/model-installer/uv.lock','manifests/distribution/native-sources.json','manifests/distribution/checkpoint-files.json']
+    source_paths += ['scripts/distribution/native_recipe.py','scripts/distribution/optin_engine.py','scripts/distribution/native_metadata.py','scripts/distribution/build_native.py']
+    future_opt, future_baseline=select_lily_recipe(lock,OPT64_ENGINE)
+    source_paths += [future_baseline]+[row['path'] for row in future_opt['patches']]
     from model_catalog import load_catalog
     load_catalog(source)
     from profile_registry import load_registry
@@ -430,6 +446,7 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
     welcome_sources=read_object(source/'manifests/distribution/welcome-assets.json')
     source_paths+=['manifests/distribution/welcome-assets.json']+[item['path'] for item in welcome_sources['assets']]
     trust={'schema_version':1,'installation_id':config['installation_id'],'source_commit':source_commit,
+           'engine_contract_support':{'schema_version':1},
            'lily_source_commit':lock['lily']['commit'],'llama_swap_source_commit':lock['llama_swap']['commit'],
            'lily_patch_sha256':[x['sha256'] for x in lock['lily']['patches']],
            'llama_swap_patch_sha256':[x['sha256'] for x in lock['llama_swap'].get('patches',[])],
@@ -441,9 +458,14 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
            'binaries':{name:{'path':str(path.relative_to(data)),'sha256':sha256(path)} for name,path in binaries.items()},'build_tools':runtime_node,
            'postgresql_bin':str(pg_bin),'postgresql_sha256':sha256(pg_bin/'postgres'),'postgresql_tools':{name:sha256(pg_bin/name) for name in ('postgres','initdb','pg_ctl','psql','pg_dump','pg_restore')},'ui_recipe_sha256':ui_recipe,'ui_locale_acceptance':False,
            'build_steps':steps,'fetches':fetch_receipts,'toolchains':{'rust':rust.stdout.strip(),'go':gv.stdout.strip(),'node':nv.stdout.strip(),'postgresql':pv.stdout.strip()}}
+    if opt_pin:
+        from optin_engine import generated_record
+        trust['optin_engines']={OPT64_ENGINE:generated_record(opt_recipe,sha256(native/'lily-opt64'))}
+        trust['enabled_optin_profiles']=['ctx64k-mtp2']
     runtime_source,source_copy=install_source_view(source,data,trust['source_commit'])
     trust['runtime_source_copy']=source_copy
     dependency_paths=[work/'lily/Cargo.toml',work/'lily/Cargo.lock',work/'llama_swap/go.mod',work/'llama_swap/go.sum',work/'litellm/ui/litellm-dashboard/package.json',work/'litellm/ui/litellm-dashboard/package-lock.json',work/'llama_swap/ui/package.json',work/'llama_swap/ui/package-lock.json']
+    if opt_pin:dependency_paths += [opt_source/'Cargo.toml',opt_source/'Cargo.lock']
     dependency_manifest={'schema_version':1,'installation_id':config['installation_id'],'source_commit':trust['source_commit'],'build_root':str(work.relative_to(data)),'inputs':[{'path':str(file.relative_to(data)),'sha256':sha256(file)} for file in dependency_paths],'scope':'actual successful build lock inputs; retain until native inventory collected'}
     write_json_new(runtime/'dependency-inputs.json',dependency_manifest);trust['dependency_inputs']={'path':'runtime/dependency-inputs.json','sha256':sha256(runtime/'dependency-inputs.json')}
     config['package_source_root']=str(source)
@@ -451,3 +473,126 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
     write_json_new(runtime/'release-trust.json',trust)
     config['runtime_state']='BUILT';atomic_private_json(data/'install.json',config)
     return {'state':'built','source_commit':trust['source_commit'],'steps':steps,'ui_locale_acceptance':False,'live_services_started':False}
+
+
+def build_optin_candidate(data, *, cargo=None, execute=False):
+    """Add one generated opt64 engine to a versioned installation; no UI/DB/model operation.
+
+    This only adds the fixed native executable and trust record. Applying the
+    resulting catalog/manager configuration is an explicit later lifecycle step.
+    Existing binaries, profiles, credentials and cached payloads stay bound.
+    """
+    from trust import validate, private_file
+    from native_recipe import OPT64_ENGINE, select_lily_recipe, apply_lily_source_patches
+    from optin_engine import generated_record
+    import copy
+    data=no_symlinks(data);trusted=validate(data,require_checkpoint=False)
+    old=copy.deepcopy(trusted['trust']);source=trusted['source_root']
+    if old.get('engine_contract_support')!={'schema_version':1} or trusted['engines']:
+        raise DistributionError('native-only opt-in build requires the versioned disabled engine contract')
+    lock=read_object(source/'manifests/distribution/native-sources.json')
+    pin,baseline=select_lily_recipe(lock,OPT64_ENGINE)
+    # The default build binds all recipe inputs even before this engine is enabled.
+    source_records={row['path']:row for row in old['source_files']}
+    for path in [baseline,*[row['path'] for row in pin['patches']]]:
+        if path not in source_records:raise DistributionError('native-only engine recipe input is not trusted')
+        verified_file(source,source_records[path])
+    from profile_registry import parse_registry
+    registry=parse_registry(read_object(verified_file(source,old['profile_registry'])),enabled_optin_profiles=['ctx64k-mtp2'])
+    if registry.default.profile_id!='ctx64k':raise DistributionError('native-only engine changed the default profile')
+    destination=no_symlinks(data/'runtime/bin/lily-opt64')
+    if destination.exists():raise DistributionError('opt-in executable already exists; owner left untouched')
+    plan={'state':'plan','engine_id':OPT64_ENGINE,'source_commit':old['source_commit'],
+          'native_source_commit':pin['commit'],'archive_sha256':pin['archive_sha256'],
+          'patch_sha256':[row['sha256'] for row in pin['patches']],
+          'source_inventory_sha256':pin['source_inventory_sha256'],'enabled_optin_profiles':['ctx64k-mtp2'],
+          'existing_default_engine':'legacy-db3-mtp0','frontend_build':False,'model_loaded':False,
+          'live_services_started':False,'keys_or_database_changed':False}
+    if not execute:return plan
+    if platform.system()!='Darwin' or platform.machine()!='arm64':
+        raise DistributionError('native serving build requires Darwin arm64')
+    import secrets as rng
+    work=private_directory(data/'build'/('opt64-'+rng.token_hex(6)));logs=private_directory(work/'logs')
+    env={'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','HOME':str(Path.home()),
+         'TMPDIR':str(private_directory(work/'tmp')),'LANG':'en_US.UTF-8','CARGO_BUILD_JOBS':'2','RUSTUP_TOOLCHAIN':'1.97.0'}
+    cargo=Path(cargo or shutil.which('cargo') or Path.home()/'.cargo/bin/cargo')
+    version=subprocess.run([str(cargo),'--version'],capture_output=True,text=True,env=env)
+    if version.returncode or '1.97.0' not in version.stdout:
+        raise DistributionError('native-only Rust toolchain differs from the build contract')
+    archive=download('https://codeload.github.com/'+pin['repository']+'/tar.gz/'+pin['commit'],work/'lily-opt64.tar.gz',
+                     pin['archive_sha256'],cap=32*1024**2)
+    target=work/'source';extract(archive,target)
+    replay=apply_lily_source_patches(source,target,lock,OPT64_ENGINE)
+    step=command([cargo,'build','--release','--locked','--bin','lily','--target-dir',work/'cargo-target'],
+                 cwd=target,env=env,log=logs/'lily-opt64-build.txt',resource_roots=[work])
+    candidate=work/'cargo-target/release/lily';binary_sha=sha256(candidate)
+    # Revalidate before publishing. Never overwrite an installed trust changed by another owner.
+    current=validate(data,require_checkpoint=False)
+    if current['trust']!=old or current['config']!=trusted['config']:
+        raise DistributionError('installation changed during native-only build')
+    receipt=generated_record(replay,binary_sha)
+    trust_path=private_file(data/'runtime/release-trust.json')
+    stamp=trust_path.stat()
+    write_json_new(work/'previous-release-trust.json',old)
+    with destination.open('xb') as output, candidate.open('rb') as input:shutil.copyfileobj(input,output)
+    destination.chmod(0o700)
+    new=copy.deepcopy(old);new['binaries']['lily_opt64']={'path':'runtime/bin/lily-opt64','sha256':binary_sha}
+    new['optin_engines']={OPT64_ENGINE:receipt};new['enabled_optin_profiles']=['ctx64k-mtp2']
+    new['optin_native_build']={'source_commit':pin['commit'],'archive_sha256':pin['archive_sha256'],
+                             'source_inventory_sha256':replay['source_inventory_sha256'],'step':step}
+    now=trust_path.stat()
+    if (now.st_dev,now.st_ino,now.st_size,now.st_mtime_ns)!=(stamp.st_dev,stamp.st_ino,stamp.st_size,stamp.st_mtime_ns) or read_object(trust_path)!=old:
+        raise DistributionError('installation trust changed before opt-in publication; candidate retained')
+    atomic_private_json(trust_path,new)
+    validate(data,require_checkpoint=False)
+    return {**plan,'state':'built','binary_sha256':binary_sha,'source_replay':'PASS',
+            'services_reconfigured':False,'runtime_acceptance':False}
+
+
+def build_optin_source_candidate(data, *, cargo=None, execute=False):
+    """Compile only a fixed native candidate from a fresh normal installation.
+
+    A build-only receipt cannot stand in for an installed manager/UI trust or
+    enable an alias. Source identity comes from the existing normal resolver.
+    """
+    from native_recipe import OPT64_ENGINE, select_lily_recipe, apply_lily_source_patches
+    from optin_engine import generated_record
+    data=no_symlinks(data);config=installation(data);source=no_symlinks(Path(config['source_root']))
+    source_commit=resolve_source_commit(source)
+    if config.get('runtime_state')!='NOT_BUILT' or (data/'runtime/release-trust.json').exists():
+        raise DistributionError('build-only candidate requires a fresh not-built installation')
+    lock=read_object(source/'manifests/distribution/native-sources.json');pin,baseline=select_lily_recipe(lock,OPT64_ENGINE)
+    for row in pin['patches']:verified_file(source,row)
+    from profile_registry import load_registry
+    registry=load_registry(source)
+    if not any(p.profile_id=='ctx64k-mtp2' and not p.production_enabled for p in registry.profiles):
+        raise DistributionError('build-only candidate requires the finite disabled opt64 source profile')
+    plan={'state':'plan','engine_id':OPT64_ENGINE,'source_commit':source_commit,'native_source_commit':pin['commit'],
+          'archive_sha256':pin['archive_sha256'],'patch_sha256':[r['sha256'] for r in pin['patches']],
+          'source_inventory_sha256':pin['source_inventory_sha256'],'frontend_build':False,'model_loaded':False,
+          'production_enabled':False,'default':False,'installed_runtime_ready':False,'runtime_acceptance':False}
+    if not execute:return plan
+    if platform.system()!='Darwin' or platform.machine()!='arm64':
+        raise DistributionError('native serving build requires Darwin arm64')
+    import secrets as rng
+    work=private_directory(data/'build'/('native-opt64-'+rng.token_hex(6)));logs=private_directory(work/'logs')
+    env={'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','HOME':str(Path.home()),'TMPDIR':str(private_directory(work/'tmp')),
+         'LANG':'en_US.UTF-8','CARGO_BUILD_JOBS':'2','RUSTUP_TOOLCHAIN':'1.97.0'}
+    cargo=Path(cargo or shutil.which('cargo') or Path.home()/'.cargo/bin/cargo')
+    version=subprocess.run([str(cargo),'--version'],capture_output=True,text=True,env=env)
+    if version.returncode or '1.97.0' not in version.stdout:
+        raise DistributionError('build-only Rust toolchain differs')
+    archive=download('https://codeload.github.com/'+pin['repository']+'/tar.gz/'+pin['commit'],work/'lily-opt64.tar.gz',
+                     pin['archive_sha256'],cap=32*1024**2)
+    target=work/'source';extract(archive,target);replay=apply_lily_source_patches(source,target,lock,OPT64_ENGINE)
+    controls=['scripts/distribution/'+name for name in ('build_native.py','native_recipe.py','trust.py','common.py','optin_engine.py','profile_registry.py')]
+    inputs={path:sha256(source/path) for path in controls+[baseline,'manifests/distribution/native-sources.json','profiles/distribution/context-registry.json']}
+    step=command([cargo,'build','--release','--locked','--bin','lily','--target-dir',work/'cargo-target'],
+                 cwd=target,env=env,log=logs/'lily-opt64-build.txt',resource_roots=[work])
+    if installation(data)!=config or any(sha256(source/path)!=digest for path,digest in inputs.items()):
+        raise DistributionError('candidate installation or recipe source changed during compilation')
+    binary=work/'cargo-target/release/lily';record=generated_record(replay,sha256(binary))
+    receipt={**plan,'state':'built','engine':record,'binary':{'path':str(binary.relative_to(data)),'sha256':sha256(binary)},
+             'source_files_sha256':inputs,'step':step,'source_replay':'PASS','native_build_only':True}
+    write_json_new(work/'native-candidate.json',receipt)
+    return {**receipt,'receipt_path':str((work/'native-candidate.json').relative_to(data))}

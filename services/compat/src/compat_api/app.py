@@ -11,7 +11,7 @@ from typing import Any, AsyncIterator, Literal
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 
@@ -42,6 +42,7 @@ LEGACY_METRIC_KEYS = (
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra='allow')
     model: str
     messages: list[dict[str, Any]]
     stream: bool = True
@@ -60,6 +61,18 @@ class CompatModelProfile:
     context_tokens: int
     total_deadline_seconds: int
     default_output_tokens: int = DEFAULT_OUTPUT_BUDGET_TOKENS
+    profile_id: str | None = None
+    engine_id: str | None = None
+    mtp_drafts: int = 0
+    kv_cache: str | None = None
+    max_batch: int | None = None
+
+    def public_info(self):
+        value={'model':self.public_alias,'context_tokens':self.context_tokens,'default_output_tokens':self.default_output_tokens,'total_deadline_seconds':self.total_deadline_seconds,'mtp_drafts':self.mtp_drafts}
+        for key in ('profile_id','engine_id','kv_cache','max_batch'):
+            item=getattr(self,key)
+            if item is not None:value[key]=item
+        return value
 
 @dataclass(frozen=True)
 class Settings:
@@ -91,10 +104,19 @@ class Settings:
             "qwen3.8-flash-next-lily-q4-64k": (65536, 3672),
             "qwen3.8-flash-next-lily-q4-128k": (131072, 4272),
             "qwen3.8-flash-next-lily-q4-262k": (262144, 4872),
+            "qwen3.8-flash-next-lily-q4-mtp2-64k": (65536, 3672),
+            "qwen3.8-flash-next-lily-q4-mtp2-128k": (131072, 4272),
+            "qwen3.8-flash-next-lily-q4-mtp2-262k": (262144, 4872),
         }
         if any(p.public_alias not in targets or (p.context_tokens, p.total_deadline_seconds) != targets[p.public_alias]
                or p.default_output_tokens != DEFAULT_OUTPUT_BUDGET_TOKENS for p in self.profiles):
             raise ValueError("Compat profiles differ from canonical context policy")
+        mtp_profiles={'qwen3.8-flash-next-lily-q4-mtp2-'+size:'ctx'+size+'-mtp2' for size in ('64k','128k','262k')}
+        for p in self.profiles:
+            if p.public_alias in mtp_profiles:
+                if type(p.mtp_drafts) is not int or type(p.max_batch) is not int or (p.profile_id,p.engine_id,p.mtp_drafts,p.kv_cache,p.max_batch)!=(mtp_profiles[p.public_alias],'latest13f-defer-pc123-mtp2-opt64k',2,'bf16',1):raise ValueError('Compat opt-in engine profile differs')
+            elif type(p.mtp_drafts) is not int or p.mtp_drafts!=0:raise ValueError('Established Compat profiles must retain MTP0')
+        if self.public_alias in mtp_profiles:raise ValueError('The opt-in profile cannot replace the established default')
 
     def select_profile(self, alias: str) -> CompatModelProfile | None:
         if not self.model_configured:
@@ -887,6 +909,7 @@ def create_app(
         generation_profile = profile or default_profile
         result: dict[str, Any] = {
             "protocol_version": "anif_llm_gateway_v2",
+            "models": [p.public_info() for p in settings.profiles if p.public_alias in caller.allowed_models],
             "features": {
                 "thinking_stream_passthrough": True,
                 "done_reason": True,
@@ -932,6 +955,7 @@ def create_app(
                     "processor": None,
                 }
                 result["model"] = {
+                    **profile.public_info(),
                     "requested_model": profile.public_alias,
                     "exists": True,
                     "capabilities": ["completion", "vision"],
@@ -995,6 +1019,9 @@ def create_app(
             return Response(content="Model Not Found", status_code=404, media_type="text/plain; charset=utf-8")
         if req.model not in caller.allowed_models:
             raise HTTPException(status_code=403, detail="Model is not allowed for this key")
+        forbidden={'engine_id','engine_path','model_path','path','args','extra_args','memory','kv_cache','context','context_tokens','context_length','num_ctx','profile_id','max_seq','max_batch','mtp_drafts','qsa_route','qsa_scores','cache_bytes','disk_cache_bytes'}
+        if forbidden.intersection(req.model_extra or {}):
+            return JSONResponse(status_code=400,content=_protocol_body('Runtime overrides require a trusted installation profile'))
         received_at = request.scope.get("compat_received_at", asyncio.get_running_loop().time())
         request_deadline = received_at + profile.total_deadline_seconds
         if asyncio.get_running_loop().time() >= request_deadline:

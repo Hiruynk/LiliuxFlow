@@ -174,6 +174,10 @@ def configs(trusted, *, validation_profile_ids=()):
             'model_info':{'id':'liliuxflow-'+profile.profile_id,'mode':'chat','max_tokens':profile.context_tokens,
                           'max_input_tokens':profile.context_tokens,'max_output_tokens':min(profile.context_tokens,65536),
                           'default_output_tokens':profile.default_output_tokens,'context_profile_id':profile.profile_id}})
+        if profile.profile_id in ('ctx64k-mtp2','ctx128k-mtp2','ctx262k-mtp2'):manager['models'][alias]['name']+=' · MTP2 opt-in'
+        metadata=profile.as_dict()
+        for name in ('engine_id','mtp_drafts','kv_cache','max_batch','qsa_route','qsa_scores'):
+            if name in metadata:routes[-1]['model_info'][name]=metadata[name]
     lp={'model_list':routes,
         'general_settings':{'master_key':'os.environ/LITELLM_MASTER_KEY','database_url':'os.environ/DATABASE_URL',
          'allow_client_side_credentials':False,'store_prompts_in_spend_logs':False,'background_health_checks':False,'cancel_on_disconnect':True,
@@ -322,17 +326,24 @@ def profile_route_inventory(yaml_models, db_models, registry):
     return {'rows':rows,'conflicts':conflicts,'requires_review':bool(conflicts)}
 
 
-def _expanded_owner_models(current, enabled):
+OPTIN_ALIAS='qwen3.8-flash-next-lily-q4-mtp2-64k'
+OPTIN_ALIASES=frozenset('qwen3.8-flash-next-lily-q4-mtp2-'+size for size in ('64k','128k','262k'))
+def _owner_grant_models(enabled,authorized_opt_in_aliases=()):
+    if not isinstance(authorized_opt_in_aliases,tuple) or len(set(authorized_opt_in_aliases))!=len(authorized_opt_in_aliases) or any(alias not in OPTIN_ALIASES for alias in authorized_opt_in_aliases):raise DistributionError('opt-in caller grant must name the exact finite alias')
+    if any(alias not in enabled for alias in authorized_opt_in_aliases):raise DistributionError('opt-in profile is not enabled in the trusted registry')
+    return [alias for alias in enabled if alias not in OPTIN_ALIASES or alias in authorized_opt_in_aliases]
+
+def _expanded_owner_models(current, enabled, authorized_opt_in_aliases=()):
     # LiteLLM treats [] as unrestricted. Refuse to infer a restricted grant from
     # wildcard/unrestricted ACLs, and never change another user's key here.
     if not isinstance(current,list) or not current or any(not isinstance(x,str) for x in current):
         raise DistributionError('designated owner model ACL must be explicit')
-    if any('*' in x or x in ('all-proxy-models','all-team-models') for x in current):
+    if any('*' in x or x in ('all-proxy-models','all-team-models','all-router-models') for x in current):
         raise DistributionError('designated owner wildcard ACL requires explicit review')
-    return list(dict.fromkeys([*current,*enabled]))
+    return list(dict.fromkeys([*current,*_owner_grant_models(enabled,authorized_opt_in_aliases)]))
 
 
-def reconcile_designated_owner_caller(*, caller_path, expected_user_id, api_base, master_key, registry, backup_root, dry_run=False):
+def reconcile_designated_owner_caller(*, caller_path, expected_user_id, api_base, master_key, registry, backup_root, dry_run=False,authorized_opt_in_aliases=()):
     """Add enabled profiles to only the installation's designated existing key.
 
     Official models-only update endpoints preserve key identity, budget, expiry
@@ -361,8 +372,8 @@ def reconcile_designated_owner_caller(*, caller_path, expected_user_id, api_base
     if key_info.get('user_id')!=user or user_info.get('user_id')!=user:
         raise DistributionError('designated caller API ownership differs')
     enabled=[p.public_alias for p in registry.enabled_profiles]
-    key_models=_expanded_owner_models(key_info.get('models'),enabled)
-    user_models=_expanded_owner_models(user_info.get('models'),enabled)
+    key_models=_expanded_owner_models(key_info.get('models'),enabled,authorized_opt_in_aliases)
+    user_models=_expanded_owner_models(user_info.get('models'),enabled,authorized_opt_in_aliases)
     changes={'key_models':key_models,'user_models':user_models,'enabled_profiles':enabled,
              'key_changed':key_models!=key_info['models'],'user_changed':user_models!=user_info['models']}
     if dry_run:return changes
@@ -394,16 +405,68 @@ def reconcile_designated_owner_caller(*, caller_path, expected_user_id, api_base
             if changes['user_changed']:
                 http_json(base+'/user/update',method='POST',payload={'user_id':user,'models':user_info['models']},token=master)
             raise DistributionError('designated owner ACL verification failed; private rollback snapshot retained')
-    caller['models']=enabled
+    caller['models']=key_models
     atomic_private_json(destination,caller)
     return changes
 
 
-def reconcile_owner_caller(trusted, *, dry_run=False):
+
+UI_USER_STABLE=('user_id','user_role','max_budget','budget_duration','tpm_limit','rpm_limit','user_email',
+                'team_id','organization_id','max_parallel_requests','model_max_budget','model_rpm_limit',
+                'model_tpm_limit','permissions','allowed_routes','blocked','metadata','sso_user_id')
+def reconcile_designated_ui_user(*,user_id,api_base,master_key,registry,backup_root,dry_run=True,authorized_opt_in_aliases=()):
+    """Append explicit enabled models to one named UI user; never inspect session keys."""
+    if not isinstance(user_id,str) or not 1<=len(user_id)<=256 or any(ord(c)<32 for c in user_id) or type(dry_run) is not bool:
+        raise DistributionError('UI user selection must be explicit and bounded')
+    parsed=urlsplit(api_base)
+    if parsed.scheme!='http' or parsed.hostname!='127.0.0.1' or parsed.username or parsed.password or parsed.path!='/v1' or parsed.query or parsed.fragment:
+        raise DistributionError('UI user API must be the owned loopback v1 endpoint')
+    base=api_base.removesuffix('/v1');enabled=[p.public_alias for p in registry.enabled_profiles]
+    _owner_grant_models(enabled,authorized_opt_in_aliases)  # Reject disabled/unknown opt-ins before any API operation.
+    def inventory():
+        status,body=http_json(base+'/user/info?user_id='+quote(user_id,safe=''),token=master_key)
+        user=body.get('user_info') if isinstance(body,dict) else None
+        if status!=200 or not isinstance(user,dict) or user.get('user_id')!=user_id:
+            raise DistributionError('selected UI user identity could not be verified')
+        return user
+    before=inventory();old=before.get('models');models=_expanded_owner_models(old,[alias for alias in enabled if alias in authorized_opt_in_aliases],authorized_opt_in_aliases)
+    result={'user_id':user_id,'models_before':old,'models_after':models,'changed':models!=old,'writes':False,
+            'roles_or_limits_changed':False,'other_users_changed':False,'session_keys_read_or_updated':False,
+            'existing_sessions':'sign out and sign in again to inherit the updated user models'}
+    if dry_run or models==old:return result
+    archive=private_directory(Path(backup_root)/str(time.time_ns()));write_json_new(archive/'before.json',{'schema_version':1,'user_info':before})
+    def stable(user):return all(user.get(k)==before.get(k) for k in UI_USER_STABLE)
+    def update(values):
+        status,_=http_json(base+'/user/update',method='POST',payload={'user_id':user_id,'models':values},token=master_key)
+        if status!=200:raise DistributionError('selected UI user models update was refused')
+    try:
+        update(models);after=inventory()
+        if after.get('models')!=models or not stable(after):raise DistributionError('selected UI user models verification failed')
+    except Exception:
+        # A timeout or refused response may follow a committed update. Restore
+        # only a proven old/expected state; concurrent identity/limit drift refuses.
+        try:
+            current=inventory()
+            if not stable(current) or current.get('models') not in (old,models):raise DistributionError('UI user ACL rollback refuses concurrent drift')
+            if current['models']==models:update(old)
+            restored=inventory()
+            if restored.get('models')!=old or not stable(restored):raise DistributionError('UI user ACL rollback is unproven')
+        except Exception:raise DistributionError('UI user ACL update failed; private rollback retained for explicit review') from None
+        raise DistributionError('UI user ACL update failed; original models restored') from None
+    return {**result,'writes':True,'rollback_snapshot':str(archive/'before.json')}
+
+
+def reconcile_ui_user(trusted,user_id,*,dry_run=True,authorized_opt_in_aliases=()):
+    if trusted.get('model_configured') is False:raise DistributionError('UI user model grant requires a configured model')
+    return reconcile_designated_ui_user(user_id=user_id,api_base='http://127.0.0.1:'+str(trusted['config']['ports']['litellm'])+'/v1',
+        master_key=trusted['secrets']['LITELLM_MASTER_KEY'],registry=trusted['registry'],backup_root=trusted['data_root']/'backups/ui-user-acl',
+        dry_run=dry_run,authorized_opt_in_aliases=authorized_opt_in_aliases)
+
+def reconcile_owner_caller(trusted, *, dry_run=False,authorized_opt_in_aliases=()):
     data=trusted['data_root'];cfg=trusted['config']
     return reconcile_designated_owner_caller(caller_path=data/'secrets/caller.json',
         expected_user_id='local-'+cfg['installation_id'],api_base='http://127.0.0.1:'+str(cfg['ports']['litellm'])+'/v1',
-        master_key=trusted['secrets']['LITELLM_MASTER_KEY'],registry=trusted['registry'],backup_root=data/'backups/context-acl',dry_run=dry_run)
+        master_key=trusted['secrets']['LITELLM_MASTER_KEY'],registry=trusted['registry'],backup_root=data/'backups/context-acl',dry_run=dry_run,authorized_opt_in_aliases=authorized_opt_in_aliases)
 
 
 def make_caller(trusted):
@@ -412,7 +475,7 @@ def make_caller(trusted):
         if trusted.get('model_configured') is not False:
             reconcile_owner_caller(trusted)
         return
-    cfg=trusted['config'];alias=trusted['registry'].default.public_alias;models=[p.public_alias for p in trusted['registry'].enabled_profiles] if trusted.get('model_configured') is not False else ['liliuxflow:model-not-configured'];base='http://127.0.0.1:'+str(cfg['ports']['litellm']);master=trusted['secrets']['LITELLM_MASTER_KEY']
+    cfg=trusted['config'];alias=trusted['registry'].default.public_alias;models=_owner_grant_models([p.public_alias for p in trusted['registry'].enabled_profiles]) if trusted.get('model_configured') is not False else ['liliuxflow:model-not-configured'];base='http://127.0.0.1:'+str(cfg['ports']['litellm']);master=trusted['secrets']['LITELLM_MASTER_KEY']
     # LiteLLM [] means unrestricted. A management-only caller receives an
     # explicit unavailable grant; the empty installed catalog hides it.
     user='local-'+cfg['installation_id']
@@ -600,8 +663,142 @@ def start(data,*,dry_run=False,controlplane_only=False,readiness_seconds=180):
     raise DistributionError('own LaunchAgent started but readiness failed; inspect private logs and ownership registry')
 
 
-def stop(data,*,dry_run=False,controlplane_only=False):
+def _force_pg_identity(trusted,registry,fs):
+    recorded=registry.get('postgres');pgdata=no_symlinks(trusted['data_root']/'postgres/data');pidfile=no_symlinks(pgdata/'postmaster.pid')
+    if recorded is None:
+        if pidfile.exists():raise DistributionError('unregistered PostgreSQL PID file; force stop refused')
+        return None,None
+    fs.identity(recorded)
+    if recorded['uid']!=os.getuid():raise DistributionError('force stop PostgreSQL owner differs')
+    if not fs.exact(recorded):raise DistributionError('registered PostgreSQL already absent; explicit record review required')
+    private_directory(pgdata);content=private_file(pidfile).read_bytes();lines=content.decode().splitlines()
+    if len(lines)<4 or int(lines[0])!=recorded['pid'] or Path(lines[1])!=pgdata or int(lines[3])!=trusted['config']['ports']['postgresql']:
+        raise DistributionError('force stop PostgreSQL PID/PGDATA/port differs')
+    pg=postgres_tools(trusted);command=fs.command(recorded);prefix=str(pg/'postgres')+' -D '+str(pgdata)
+    import datetime
+    started=datetime.datetime.strptime(recorded['started'],'%a %b %d %H:%M:%S %Y').timestamp()
+    if not (command==prefix or command.startswith(prefix+' ')) or abs(started-int(lines[2]))>5:
+        raise DistributionError('force stop PostgreSQL binary/data/start differs')
+    return recorded,content
+
+def _wait_launchd_removed(target, released, *, seconds=5, runner=subprocess.run, clock=time.monotonic, sleep=time.sleep):
+    """A read-only bounded settle for the already validated installation label."""
+    deadline=clock()+seconds
+    while True:
+        if released() is not True:raise DistributionError('owned force shutdown incomplete; registry retained')
+        remaining=deadline-clock()
+        if remaining<=0:raise DistributionError('own launchd label remains registered')
+        status=runner(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=max(.01,min(1,remaining)))
+        if status.returncode:
+            diagnostic=(status.stderr or '').lower()
+            if 'could not find service' not in diagnostic and 'no such process' not in diagnostic:
+                raise DistributionError('own launchd removal status is unknown')
+            if released() is not True:raise DistributionError('owned resources changed during launchd removal')
+            return
+        sleep(min(.05,max(0,deadline-clock())))
+
+
+def _force_stop(trusted,*,dry_run=False):
+    import forced_stop as fs
+    cfg=trusted['config'];data=trusted['data_root'];source=trusted['source_root'];label=cfg['launchd_label']
+    if cfg.get('owner_uid')!=os.getuid() or label!='com.diurnoctra.liliuxflow.'+str(uuid.UUID(cfg['installation_id'])):
+        raise DistributionError('force stop installation label/owner differs')
+    state=no_symlinks(data/'run/agent.json');plist=no_symlinks(data/'run/stack.plist')
+    if not state.exists():raise DistributionError('force stop needs an exact owned agent registry; use normal stop for an unstarted installation')
+    record=read_object(private_file(state));decoded=plistlib.loads(private_file(plist).read_bytes())
+    arguments=decoded.get('ProgramArguments');prefix=[str(trusted['binaries']['compat_python']),str(source/'scripts/distribution/agent.py'),'--data-root',str(data)]
+    if (type(record.get('schema_version')) is not int or record['schema_version']!=1 or record.get('installation_id')!=cfg['installation_id']
+            or not isinstance(record.get('children'),dict)
+            or decoded.get('Label')!=label or decoded.get('WorkingDirectory')!=str(source)
+            or not isinstance(arguments,list) or arguments[:4]!=prefix or arguments[4:] not in ([],['--controlplane-only'])):
+        raise DistributionError('force stop owned registry/plist installation differs')
+    owner=fs.identity(record.get('agent'))
+    if not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):raise DistributionError('force stop agent identity/command differs')
+    target='gui/'+str(os.getuid())+'/'+label
+    printed=subprocess.run(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=5)
+    import re
+    match=re.search(r'^\s*pid\s*=\s*(\d+)\s*$',printed.stdout,re.M)
+    if printed.returncode or not match or int(match.group(1))!=owner['pid']:raise DistributionError('force stop exact launchd PID differs')
+    pg,pgcontent=_force_pg_identity(trusted,record,fs)
+    pgfamily={pg['pid'],*(x['pid'] for x in fs.descendants(pg['pid']))} if pg is not None else set()
+    def non_database_tree(values):
+        excluded=set(pgfamily)
+        while True:
+            new=excluded|{x['pid'] for x in values if x['ppid'] in excluded}
+            if new==excluded:break
+            excluded=new
+        return [x for x in values if x['pid'] not in excluded]
+    if dry_run:return {'state':'validated_force_stop_plan','force':True,'requires_idle_guard':False,'data_preserved':True}
+    frozen=[];bootout=None;captured=[]
+    try:
+        fs.freeze_tree_for_stop(owner,captured,frozen,non_database_tree)
+        bypid={x['pid']:x for x in captured}
+        for name,value in record.get('children',{}).items():
+            fs.identity(value)
+            if fs.exact(value) and bypid.get(value['pid'])!=value:raise DistributionError('registered owned child outside frozen agent tree')
+        model=data/'run/model.json';model_record=read_object(private_file(model)) if model.exists() else None
+        if model_record is not None:
+            if type(model_record.get('schema_version')) is not int or model_record['schema_version']!=1 or model_record.get('installation_id')!=cfg['installation_id'] or model_record.get('binary_sha256')!=trusted['trust']['binaries']['lily']['sha256']:
+                raise DistributionError('force stop model installation/binary differs')
+            for key in ('runner','child'):
+                value=fs.identity(model_record.get(key))
+                if fs.exact(value) and bypid.get(value['pid'])!=value:raise DistributionError('owned model lies outside verified agent tree')
+        bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        fs.terminate_all(captured,resume=True)
+        if pg is not None:
+            if fs.exact(pg):
+                if private_file(data/'postgres/data/postmaster.pid').read_bytes()!=pgcontent:raise DistributionError('owned PGDATA PID file changed before fast stop')
+                private_run([postgres_tools(trusted)/'pg_ctl','-D',data/'postgres/data','-m','fast','-w','-t','30','stop'],env=pg_environment(trusted),timeout=40)
+            if not fs.exited(pg):raise DistributionError('owned PostgreSQL remains after normal fast stop')
+        fs.terminate_all([owner],grace=5,resume=True)
+        bootout.wait(timeout=15)
+        if bootout.returncode or any(not fs.exited(x) for x in captured+[owner]):raise DistributionError('owned force shutdown incomplete; registry retained')
+        _wait_launchd_removed(target,lambda:all(fs.exited(x) for x in captured+[owner]+([pg] if pg is not None else [])),runner=subprocess.run)
+        _force_clear_model_records(trusted,captured,fs)
+        if state.exists():
+            if read_object(private_file(state))!=record:raise DistributionError('force stop agent registry changed; retained for review')
+            state.unlink()
+        plist.unlink(missing_ok=True)
+        return {'state':'stopped','force':True,'data_preserved':True,'model_preserved':True,'postgres_fast_stop':pg is not None}
+    finally:
+        for value in reversed(frozen):
+            try:fs.send(value,signal.SIGCONT)
+            except (DistributionError,OSError):pass
+
+def _force_clear_model_records(trusted,captured,fs):
+    # No event counters or identity fields are rewritten. Only exact exited
+    # installation-owned stale records may be removed after physical teardown.
+    data=trusted['data_root'];bypid={x['pid']:x for x in captured};lease=no_symlinks(Path.home()/'Library/Application Support/LiliuxFlow-runtime-leases/gpu.lease')
+    path=lease/'lease.json'
+    if path.exists():
+        record=read_object(private_file(path))
+        if record.get('installation_id')==trusted['config']['installation_id']:
+            if type(record.get('schema_version')) is not int or record['schema_version']!=1:raise DistributionError('owned runtime lease schema differs')
+            private_directory(lease);before=lease.stat()
+            if record.get('binary_sha256')!=trusted['trust']['binaries']['lily']['sha256']:raise DistributionError('owned runtime lease binary differs')
+            for key in ('runner','child'):
+                value=record.get(key)
+                if value is not None:
+                    fs.identity(value)
+                    if bypid.get(value['pid'])!=value or not fs.exited(value):raise DistributionError('runtime lease owner is not an exact exited captured child')
+            if {x.name for x in lease.iterdir()}!={'lease.json'} or read_object(private_file(path))!=record:raise DistributionError('owned runtime lease changed')
+            moved=lease.with_name('gpu.lease.portable-stopped-'+uuid.uuid4().hex);os.rename(lease,moved)
+            if (moved.stat().st_dev,moved.stat().st_ino)!=(before.st_dev,before.st_ino) or read_object(private_file(moved/'lease.json'))!=record:
+                if not lease.exists():os.rename(moved,lease)
+                raise DistributionError('runtime lease quarantine identity differs')
+            (moved/'lease.json').unlink();moved.rmdir()
+    model=data/'run/model.json'
+    if model.exists():
+        record=read_object(private_file(model))
+        if record.get('installation_id')!=trusted['config']['installation_id']:raise DistributionError('retained model record belongs to another installation')
+        for key in ('runner','child'):
+            value=record.get(key)
+            if value is not None and (bypid.get(fs.identity(value)['pid'])!=value or not fs.exited(value)):raise DistributionError('retained model record owner is unverified')
+        model.unlink()
+
+def stop(data,*,dry_run=False,controlplane_only=False,force=False):
     trusted=validate(data,require_checkpoint=False);state=data/'run/agent.json'
+    if force:return _force_stop(trusted,dry_run=dry_run)
     if not state.exists():
         plist=data/'run/stack.plist'
         if not plist.exists():return {'state':'already_stopped','data_preserved':True}
@@ -633,17 +830,23 @@ def stop(data,*,dry_run=False,controlplane_only=False):
         raise DistributionError('owned agent identity differs; no process signaled')
     if dry_run:return {'state':'validated_stop_plan','requires_idle_guard':True,'data_preserved':True}
     drain(trusted)
-    # Remove only the exact own label first, so no manager auto-reload occurs during cleanup.
-    result=subprocess.run(['/bin/launchctl','bootout','gui/'+str(os.getuid())+'/'+trusted['config']['launchd_label']],capture_output=True)
-    if result.returncode:raise DistributionError('own LaunchAgent removal failed; model already drained')
-    deadline=time.monotonic()+60
-    while time.monotonic()<deadline:
-        if not unchanged(registry['agent']):
-            if state.exists():raise DistributionError('agent exited with retained ownership registry; inspect before restart')
-            (data/'run/stack.plist').unlink(missing_ok=True)
-            return {'state':'stopped','data_preserved':True,'model_preserved':True}
-        time.sleep(.25)
-    raise DistributionError('owned agent did not finish stop; registry preserved')
+    held=guard_admission_status(trusted)
+    if (held.get('admission_paused') is not True or held.get('pause_reason')!='session_maintenance'
+        or type(held.get('active_inferences')) is not int or held['active_inferences']!=0
+        or type(held.get('pending_inferences')) is not int or held['pending_inferences']!=0):
+        raise DistributionError('normal stop atomic idle hold was not proven')
+    from runtime_proof import RunnerResourceProbe
+    probe=RunnerResourceProbe(trusted);native=probe._state()
+    profile=trusted['registry'].default if native is None else probe.profiles.get(native.get('profile_id'))
+    if profile is None or not probe._probe(profile,'before_unload') or not probe._probe(profile,'unloaded'):
+        raise DistributionError('normal stop native ownership/exit is unverified')
+    # Reuse existing exact owned shutdown/normal PG fast stop after idle drain.
+    result=_force_stop(trusted,dry_run=False)
+    if result.get('state')!='stopped' or result.get('data_preserved') is not True:
+        raise DistributionError('normal stop owned shutdown did not complete')
+    if trusted['config'].get('database_initialized') is True and result.get('postgres_fast_stop') is not True:
+        raise DistributionError('normal stop initialized PostgreSQL exit is unverified')
+    return {**result,'force':False,'normal_idle_drain':True,'native_exit_proven':True}
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--data-root',type=Path,required=True);parser.add_argument('--controlplane-only',action='store_true');args=parser.parse_args();os.umask(0o077)

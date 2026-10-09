@@ -140,7 +140,7 @@
     },
     {
       "path": "src/qwen4exp/model.rs",
-      "sha256": "cd1f9ff902b6994ea0c3455e66e10cb4d3c7bbd92956b6ded9c0b6c174027e52"
+      "sha256": "485ab9b3c76afa24241a6f512b8ef912dad0a69a2b1f5771a35b62951c78f77f"
     },
     {
       "path": "src/qwen4exp/ngram.rs",
