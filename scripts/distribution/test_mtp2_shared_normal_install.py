@@ -14,7 +14,7 @@ from unittest.mock import Mock,patch
 ROOT=Path(__file__).resolve().parents[2]
 sys.dont_write_bytecode=True
 sys.path.insert(0,str(ROOT/'scripts/distribution'))
-import agent,build_native as build,forced_stop as fs,liliuxflow as cli,profile_registry,trust,ui_recipe
+import agent,build_native as build,forced_stop as fs,liliuxflow as cli,notices,profile_registry,trust,ui_recipe
 import mtp2_shared_runtime as shared,mtp2_shared_runner as runner
 from mtp2_shared_recipe import serving_inputs
 from common import DistributionError
@@ -34,6 +34,9 @@ def fixture_source(root):
     """Small declared source graph, never executed as Python or UI code."""
     source=root/'source';source.mkdir(mode=0o700)
     for name in serving_inputs(True)|{'scripts/distribution/package.py'}:put(source,name,'# inert CPU source fixture\n')
+    for name in ('LICENSE','NOTICE','docs/productization/licenses/lily/NOTICE',
+                 'manifests/distribution/original-notices.json'):
+        put(source,name,(ROOT/name).read_bytes())
     pins={'litellm':{'commit':'a'*40,'archive_sha256':'b'*64},'llama_swap':{'commit':'c'*40,'archive_sha256':'d'*64}}
     obj(source,'manifests/distribution/native-sources.json',pins)
     extras=[];apps={}
@@ -108,6 +111,39 @@ class UIAndSourceTests(unittest.TestCase):
             self.assertEqual((view/name).read_bytes(),(self.source/name).read_bytes())
         for name in ('secrets.env','private/raw.json'):self.assertFalse((view/name).exists())
         self.assertFalse((view/'.ui-input-preflight').exists())
+    def test_shared_source_view_copies_real_firstparty_originals_with_hash_bound_verifier(self):
+        record=self.record();view,copied=build.install_shared_source_view(self.source,self.data('notices'),record)
+        expected={'LICENSE','NOTICE','docs/productization/licenses/lily/NOTICE',
+                  'manifests/distribution/original-notices.json','scripts/distribution/notices.py'}
+        self.assertTrue(expected.issubset(serving_inputs(True)))
+        by_path={row['path']:row for row in copied}
+        for name in expected:
+            self.assertEqual((view/name).read_bytes(),(self.source/name).read_bytes())
+            self.assertEqual(by_path[name]['sha256'],trust.sha256(self.source/name))
+        self.assertTrue(notices.verify_first_party(view)['first_party_license_adopted'])
+    def test_shared_firstparty_missing_drift_or_symlink_rejects_before_source_target_creation(self):
+        for index,kind in enumerate(('missing_license','missing_notice','drift','symlink')):
+            record=self.record();data=self.data('notice-bad'+str(index));name='NOTICE' if kind=='missing_notice' else 'LICENSE'
+            file=self.source/name;old=file.read_bytes()
+            try:
+                if kind.startswith('missing'):file.unlink()
+                elif kind=='drift':file.write_bytes(old+b'changed')
+                else:file.unlink();file.symlink_to(put(self.root,'outside-license',old))
+                with self.subTest(kind=kind),patch.object(build,'private_directory') as target,self.assertRaises(DistributionError):
+                    build.install_shared_source_view(self.source,data,record)
+                target.assert_not_called();self.assertFalse((data/'runtime/source').exists())
+            finally:
+                if file.is_symlink():file.unlink()
+                file.write_bytes(old);file.chmod(0o600)
+    def test_shared_corrupted_copied_firstparty_original_rejects_before_provenance_publication(self):
+        record=self.record();data=self.data('notice-corrupt');real=shutil.copyfile
+        def corrupt(source,target,*args,**kwargs):
+            result=real(source,target,*args,**kwargs)
+            if Path(target).name=='LICENSE':Path(target).write_bytes(b'inert corrupt original')
+            return result
+        with patch.object(build.shutil,'copyfile',side_effect=corrupt),self.assertRaises(DistributionError):
+            build.install_shared_source_view(self.source,data,record)
+        self.assertFalse((data/'runtime/source/SOURCE_COMMIT.json').exists())
     def test_missing_lock_false_boolean_duplicate_hash_or_secret_record_refuse(self):
         original=self.record()
         for index,kind in enumerate(('lock','bool','duplicate','hash','secret')):
@@ -133,11 +169,13 @@ class UIAndSourceTests(unittest.TestCase):
         with patch.object(build.shutil,'copyfile',side_effect=corrupt),self.assertRaises(DistributionError):
             build.install_shared_source_view(self.source,self.data('copied'),record)
     def test_default_source_view_never_copies_shared_LP_locks_or_UI(self):
-        view,rows=build.install_source_view(self.source,self.data('plain'),'a'*40)
+        with patch.object(notices,'verify_first_party',side_effect=AssertionError('unshared must preserve original path')):
+            view,rows=build.install_source_view(self.source,self.data('plain'),'a'*40)
         paths={r['path'] for r in rows}
         self.assertNotIn('services/litellm/uv.lock',paths)
         self.assertFalse((view/'patches/ui/cpu/litellm/Fixture.tsx').exists())
         self.assertFalse((view/'secrets.env').exists())
+        for name in ('LICENSE','NOTICE','docs/productization/licenses/lily/NOTICE'):self.assertFalse((view/name).exists())
 
 
 class ParserAndDefaultTests(unittest.TestCase):

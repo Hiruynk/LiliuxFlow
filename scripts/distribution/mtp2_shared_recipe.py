@@ -24,7 +24,9 @@ SERVING_INPUTS = BOUNDARY_SOURCES | NATIVE_BUILD_INPUTS | frozenset(
         'litellm_profile_policy.py', 'patch_litellm_profiles.py')) | frozenset(
     'services/compat/src/compat_api/' + name for name in (
         'portable.py', 'app.py', 'profile.py', 'llama_guard.py', '__init__.py')) | {
-    'services/litellm/pyproject.toml', 'services/litellm/uv.lock'}
+    'services/litellm/pyproject.toml', 'services/litellm/uv.lock',
+    'LICENSE', 'NOTICE', 'docs/productization/licenses/lily/NOTICE',
+    'manifests/distribution/original-notices.json', 'scripts/distribution/notices.py'}
 
 def native_build_inputs(performance_candidate=False):
     expected = candidate_expectation(performance_candidate)

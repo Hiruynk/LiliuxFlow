@@ -238,6 +238,8 @@ def install_source_view(source, data, commit, *, destination_name='source', shar
             or type(shared_source_files) is not list or any(type(row) is not dict
                 or type(row.get('path')) is not str for row in shared_source_files)):
             raise DistributionError('shared source-view selector or generated records differ')
+        from notices import verify_first_party
+        verify_first_party(source)
         from mtp2_shared_recipe import serving_inputs
         required=serving_inputs(True)
         if shared_ui_source is not None:
@@ -292,6 +294,7 @@ def install_source_view(source, data, commit, *, destination_name='source', shar
                 private_directory(dest.parent);shutil.copyfile(file,dest);dest.chmod(0o600)
                 selected.append({'path':name,'sha256':sha256(dest)})
             verified_file(target,row)
+        verify_first_party(target)
     write_json_new(target/'SOURCE_COMMIT.json',{'schema_version':1,'commit':commit,'runtime_source_view':True})
     return target,selected
 
