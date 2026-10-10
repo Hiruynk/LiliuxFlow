@@ -96,11 +96,34 @@ LiliuxFlow 的自有实现包括安装监督程序、模型运行器、生命周
 
 三个 MTP2 配置均已在上述 M5 Max／128 GiB 主机完成验证并启用。这是本机验证结果；全新安装不会自动启用它们。源码目录中的所有 MTP2 配置初始均为停用。
 
-在已停止的安装中，使用“快速开始”的 `lf` 函数执行 `lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute`。此可选引擎构建最初只启用 MTP2 64K。128K 和 262K 须由操作者分别验证，再在可信的已安装配置中启用；启用其中一档不会启用另一档。`lf profiles list` 和 `lf profiles info ctx128k-mtp2` 可查看配置目录，不加载模型。
+独立的 `latest13f-defer-pc123-mtp2-opt64k` 构建只启用 MTP2 64K。若要使用三档上下文，下方的共享模式构建会通过正常流程生成包含三个 MTP2 配置的同一扩展。通过此构建和明确的启动选项选用即可，无需另外执行配置启用命令或手动修改 trust 文件。
 
-配置启用后，可用 `lf profiles grant-owner ctx128k-mtp2 --dry-run` 预览指定 owner caller 的授权，再在需要时加上 `--execute` 追加该别名。其他两档分别使用 `ctx64k-mtp2` 或 `ctx262k-mtp2`。其他 caller 须分别显式获得模型权限；空白或通配授权不允许使用 MTP2。授予 caller 权限不会启用已停用的配置。
+生成共享扩展后，可用 `lf profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --dry-run` 预览指定 owner caller 的授权，再在确实需要时使用 `--execute`。其他两档分别使用 `ctx64k-mtp2` 或 `ctx262k-mtp2`。其他 caller 也须分别明确获得模型权限；空白或通配授权不允许使用 MTP2。授予 caller 权限不会选择服务模式。
 
 API 请求须使用已启用的精确别名；[API](docs/API.md) 提供直接使用 128K 和 262K 别名的示例。请求 body 不能修改引擎、路径、内存、KV 精度或 context。JSON／JSON Schema 响应格式和工具执行仍不支持。
+
+### 共享 MTP2 候选方案
+
+源码另含共享 MTP2 候选方案：三档逻辑 context 共用一个常驻 262K 引擎，最多同时处理两个请求，并使用有界队列。64K MTP0 默认与现有 MTP0 配置保持不变。每位 caller 使用自己的 LiteLLM virtual key 和明确的模型授权；租户缓存仅保留于常驻内存，共享磁盘缓存层停用。
+
+共享模式 CLI 目前仍是待审候选，最终全链和浏览器验收尚待完成；它尚未在已发布版本中启用，源码构建成功也不代表已启用。下方示例会在新的数据目录创建全新安装，请沿用“快速开始”的 `lf` 函数和 `MODEL_DIR` 设置。先构建，再初始化数据库。已构建的安装不能用 `build` 覆盖；请按[升级与回滚说明](docs/OPERATIONS.md#upgrade-and-rollback)另行准备候选安装。选择共享构建会安装三个 MTP2 配置；`start --mtp2-shared-context` 明确选用共享服务模式。单用 `lf start` 则保持现有 MTP0 模式和 API 默认值。
+
+如果现有服务仍在运行，请按[独立安装与端口冲突说明](docs/INSTALLATION.md#separate-installations-and-port-conflicts)，使用 setup 的 `--port` 选项选择未占用的服务端口。指定 caller key 会在启动时创建，因此须先启动服务，再预览 caller 授权；确实需要时才用 `--execute` 应用授权。
+
+```sh
+SHARED_DATA="$HOME/Library/Application Support/LiliuxFlow shared"
+lf --data-root "$SHARED_DATA" setup --model-dir "$MODEL_DIR"
+lf --data-root "$SHARED_DATA" build --optin-engine latest13f-defer-pc123-mtp2-shared-context-v1 --ui-manifest manifests/distribution/ui-recipe-mtp2-shared.json --execute
+lf --data-root "$SHARED_DATA" verify-model
+lf --data-root "$SHARED_DATA" initialize --execute
+lf --data-root "$SHARED_DATA" profiles list --mtp2-shared-context
+lf --data-root "$SHARED_DATA" profiles info ctx128k-mtp2 --mtp2-shared-context
+lf --data-root "$SHARED_DATA" start --mtp2-shared-context
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --dry-run
+lf --data-root "$SHARED_DATA" status
+lf --data-root "$SHARED_DATA" doctor
+lf --data-root "$SHARED_DATA" stop
+```
 
 ## 相同工作负载的性能
 

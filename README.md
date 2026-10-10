@@ -96,11 +96,34 @@ The three optional MTP2 aliases select `ctx64k-mtp2`, `ctx128k-mtp2` and `ctx262
 
 All three MTP2 profiles have been validated and enabled on the tested M5 Max / 128 GiB host. This is a local validation result; a fresh installation does not automatically enable them. The source catalog starts with all MTP2 profiles disabled.
 
-On a stopped installation, use the `lf` helper from Quick start with `lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute`. This optional-engine build initially enables only MTP2 64K. The 128K and 262K profiles require separate operator validation and enablement in the trusted installed configuration; enabling one does not enable the other. `lf profiles list` and `lf profiles info ctx128k-mtp2` inspect the catalog without loading a model.
+The standalone `latest13f-defer-pc123-mtp2-opt64k` build enables only MTP2 64K. For all three contexts, the shared-mode build below generates one extension containing all three MTP2 profiles. Selection is made through that build and the explicit start option; no separate profile-enable command or manual trust-file edit is required.
 
-Once a profile is enabled, preview its designated owner caller grant with `lf profiles grant-owner ctx128k-mtp2 --dry-run`; apply that exact append-only grant with `--execute` when wanted. Use `ctx64k-mtp2` or `ctx262k-mtp2` for the other profiles. Other callers need their own explicit model grant; empty or wildcard grants do not authorize MTP2. A caller grant does not enable a disabled profile.
+With the generated shared extension, use `lf profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --dry-run` to preview a grant for the specified owner caller, then use `--execute` only if the grant is wanted. Use `ctx64k-mtp2` or `ctx262k-mtp2` for the other aliases. Every other caller also needs its own explicit model grant; empty or wildcard grants do not authorize MTP2. A caller grant does not select the service mode.
 
 Select the exact enabled alias in each API request; [API](docs/API.md) includes direct 128K and 262K examples. Request bodies cannot change engines, paths, memory, KV precision or context. JSON/JSON Schema response formats and tool execution remain unsupported.
+
+### Shared MTP2 candidate
+
+The source also includes a shared MTP2 candidate: the three logical contexts use one resident 262K engine, with at most two active requests and a bounded queue. The 64K MTP0 default and existing MTP0 profiles stay unchanged. Each caller uses its own LiteLLM virtual key and explicit model grants; tenant caching is confined to resident memory, with the shared disk tier disabled.
+
+This shared-mode CLI is a staged candidate, and final fullchain and browser acceptance is still pending. It is not enabled in the published release or by a successful source build. The example below creates a fresh installation in a new data directory; use the `lf` helper and set `MODEL_DIR` as in Quick start. Build before initializing the database. An already built installation cannot be overwritten with `build`; prepare a separate candidate as described in [Upgrade and rollback](docs/OPERATIONS.md#upgrade-and-rollback). The selected shared build installs all three MTP2 profiles; `start --mtp2-shared-context` selects the service mode. Plain `lf start` keeps the existing MTP0 mode and API default.
+
+If an existing stack is still running, choose free service ports with the setup `--port` options in [Separate installations and port conflicts](docs/INSTALLATION.md#separate-installations-and-port-conflicts). Start the services before previewing caller grants; the designated caller key is created during startup. Apply a grant with `--execute` only when wanted.
+
+```sh
+SHARED_DATA="$HOME/Library/Application Support/LiliuxFlow shared"
+lf --data-root "$SHARED_DATA" setup --model-dir "$MODEL_DIR"
+lf --data-root "$SHARED_DATA" build --optin-engine latest13f-defer-pc123-mtp2-shared-context-v1 --ui-manifest manifests/distribution/ui-recipe-mtp2-shared.json --execute
+lf --data-root "$SHARED_DATA" verify-model
+lf --data-root "$SHARED_DATA" initialize --execute
+lf --data-root "$SHARED_DATA" profiles list --mtp2-shared-context
+lf --data-root "$SHARED_DATA" profiles info ctx128k-mtp2 --mtp2-shared-context
+lf --data-root "$SHARED_DATA" start --mtp2-shared-context
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --dry-run
+lf --data-root "$SHARED_DATA" status
+lf --data-root "$SHARED_DATA" doctor
+lf --data-root "$SHARED_DATA" stop
+```
 
 ## Shared workload performance
 

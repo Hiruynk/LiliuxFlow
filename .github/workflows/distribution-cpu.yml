@@ -51,6 +51,11 @@ jobs:
           uv run --locked --no-dev --project services/compat python -m unittest discover -s scripts/distribution -p test_context_stall_recovery.py -v
           uv run --locked --no-dev --project services/compat python -m unittest discover -s scripts/distribution -p test_output_budget_64k.py -v
           uv run --locked --no-dev --project services/compat python -m unittest discover -s scripts/distribution -p test_portable_product.py -v
+      - name: Check opt-in shared MTP2 boundaries with simulated inference only
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/liliuxflow-litellm-cpu
+        run: |
+          uv run --locked --no-dev --project services/litellm python -m unittest discover -s scripts/distribution -p 'test_mtp2_shared_*.py' -v
       - name: Exercise the pinned model installer SDK with simulated HTTP only
         env:
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/liliuxflow-model-installer

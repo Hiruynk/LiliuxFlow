@@ -186,9 +186,70 @@ def apply_ui(source_root,upstream_roots,manifest):
     from ui_recipe import replay
     return replay(source_root,upstream_roots,manifest)['recipe_sha256']
 
-def install_source_view(source, data, commit, *, destination_name='source'):
+SHARED_UI_MANIFEST='manifests/distribution/ui-recipe-mtp2-shared.json'
+
+def checked_shared_ui_recipe(source,manifest=None):
+    """Normal source-input check; real upstream preimages are checked at replay."""
+    from ui_recipe import UI_ROOTS,validate_recipe
+    source=no_symlinks(Path(source));canonical=no_symlinks(source/SHARED_UI_MANIFEST)
+    if manifest is not None:
+        selected=Path(manifest)
+        if not selected.is_absolute():selected=source/selected
+        if no_symlinks(selected)!=canonical:
+            raise DistributionError('shared MTP2 requires its canonical UI source recipe')
+    # No upstream scratch/download exists yet. These unopened paths let the
+    # normal validator check schema, pin identities and the complete source
+    # graph. Normal replay later checks the actual fetched target preimages,
+    # resulting tree and package locks again before compilation.
+    roots={name:source/'.ui-input-preflight'/name for name in UI_ROOTS}
+    if any(path.exists() for path in roots.values()):
+        raise DistributionError('UI source-input preflight target unexpectedly exists')
+    recipe,plan=validate_recipe(source,roots,canonical)
+    files={canonical,source/'scripts/distribution/ui_recipe.py',source/'scripts/distribution/package.py',
+        source/'manifests/distribution/source-allowlist.json',source/'manifests/distribution/native-sources.json'}
+    for _name,_target,patches,extras,_locks in plan:
+        files.update(file for file,_strip in patches)
+        files.update(file for file,_dest in extras)
+    files={no_symlinks(file) for file in files}
+    records=[{'path':file.relative_to(source).as_posix(),'sha256':sha256(file)} for file in sorted(files)]
+    for row in records:verified_file(source,row)
+    return canonical,{'manifest':{'path':SHARED_UI_MANIFEST,'sha256':sha256(canonical)},
+        'source_files':records,'source_tree_sha256':{name:recipe['apps'][name].get('source_tree_sha256') for name in UI_ROOTS},
+        'bundlers':{'litellm':'webpack','llama-swap':'original npm build'},'ui_locale_acceptance':False}
+
+def append_shared_ui_sources(source,record,checked):
+    _manifest,actual=checked_shared_ui_recipe(source)
+    if actual!=checked:raise DistributionError('shared UI source graph changed')
+    rows=list(record['source_files']);existing={row['path']:row for row in rows}
+    if len(existing)!=len(rows):raise DistributionError('shared UI source records are duplicated')
+    for row in checked['source_files']:
+        if row['path'] in existing and existing[row['path']]!=row:
+            raise DistributionError('shared UI source conflicts with existing trust')
+        if row['path'] not in existing:rows.append(row)
+    result=dict(record);result['source_files']=rows;result['shared_ui_source']=checked
+    return result
+
+def install_source_view(source, data, commit, *, destination_name='source', shared_selected=False, shared_source_files=None, shared_ui_source=None):
     relative_path(destination_name)
     if '/' in destination_name:raise DistributionError('source-view name must be one directory component')
+    shared_records=None
+    if shared_selected is not False or shared_source_files is not None or shared_ui_source is not None:
+        if (type(shared_selected) is not bool or shared_selected is not True
+            or type(shared_source_files) is not list or any(type(row) is not dict
+                or type(row.get('path')) is not str for row in shared_source_files)):
+            raise DistributionError('shared source-view selector or generated records differ')
+        from mtp2_shared_recipe import serving_inputs
+        required=serving_inputs(True)
+        if shared_ui_source is not None:
+            _manifest,checked=checked_shared_ui_recipe(source)
+            if shared_ui_source!=checked:raise DistributionError('shared installed UI graph differs')
+            required=required|{row['path'] for row in checked['source_files']}
+        paths=[row['path'] for row in shared_source_files]
+        if len(paths)!=len(set(paths)) or not required.issubset(paths):
+            raise DistributionError('shared source-view generated serving closure differs')
+        records=dict(zip(paths,shared_source_files))
+        shared_records={name:records[name] for name in required}
+        for row in shared_records.values():verified_file(source,row)
     optional_inputs = ('scripts/distribution/model_installer.py', 'services/model-installer/pyproject.toml',
                        'services/model-installer/uv.lock', 'docs/productization/MODEL_LICENSE.txt')
     if (source/'scripts/distribution/model_catalog.py').is_file():
@@ -223,8 +284,23 @@ def install_source_view(source, data, commit, *, destination_name='source'):
             file=verified_file(source,item);rel=Path(item['path']);dest=target/rel
             private_directory(dest.parent);shutil.copyfile(file,dest);dest.chmod(0o600)
             selected.append({'path':rel.as_posix(),'sha256':sha256(dest)})
+    if shared_records is not None:
+        copied={row['path'] for row in selected}
+        for name,row in sorted(shared_records.items()):
+            file=verified_file(source,row);dest=target/name
+            if name not in copied:
+                private_directory(dest.parent);shutil.copyfile(file,dest);dest.chmod(0o600)
+                selected.append({'path':name,'sha256':sha256(dest)})
+            verified_file(target,row)
     write_json_new(target/'SOURCE_COMMIT.json',{'schema_version':1,'commit':commit,'runtime_source_view':True})
     return target,selected
+
+def install_shared_source_view(source,data,record):
+    """Normal producer's finite graph, rechecked at the installed source root."""
+    view,copied=install_source_view(source,data,record['source_commit'],shared_selected=True,
+        shared_source_files=record['source_files'],shared_ui_source=record.get('shared_ui_source'))
+    for row in record['source_files']:verified_file(view,row)
+    return view,copied
 
 NODE_INTERNAL_BIN_LINKS={
     'bin/nodejs':'bin/node',
@@ -298,11 +374,24 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
     source=no_symlinks(Path(config['source_root']))
     source_commit=resolve_source_commit(source)
     lock=read_object(source/'manifests/distribution/native-sources.json')
-    from native_recipe import LEGACY_ENGINE, OPT64_ENGINE, select_lily_recipe
+    from native_recipe import LEGACY_ENGINE, OPT64_ENGINE, SHARED_ENGINE as SHARED_ENGINE_ID, select_lily_recipe
     select_lily_recipe(lock)
-    if optin_engine not in (None, OPT64_ENGINE):
+    shared_selected=optin_engine==SHARED_ENGINE_ID
+    if optin_engine not in (None, OPT64_ENGINE, SHARED_ENGINE_ID):
         raise DistributionError('native opt-in engine selector is outside the finite allowlist')
-    opt_pin, opt_baseline = select_lily_recipe(lock, OPT64_ENGINE) if optin_engine else (None, None)
+    opt_pin, opt_baseline = select_lily_recipe(lock, OPT64_ENGINE) if optin_engine==OPT64_ENGINE else (None, None)
+    shared_plan=None;shared_ui=None
+    if shared_selected:
+        ui_manifest,shared_ui=checked_shared_ui_recipe(source,ui_manifest)
+        from trust import model_configured
+        if not model_configured(config):
+            raise DistributionError('shared MTP2 build requires the configured external Q4 checkpoint')
+        from mtp2_shared_runner import RELEASE_EXPECTATION
+        from mtp2_shared_runtime import BOUNDED_OUTPUT_EXPECTATION
+        if RELEASE_EXPECTATION != BOUNDED_OUTPUT_EXPECTATION:
+            raise DistributionError('shared MTP2 normal release recipe is unavailable')
+        shared_model_preflight(source,config)
+        shared_plan=build_shared_source_candidate(data,cargo=cargo,enable_shared=True,performance_candidate=True)
     plan={'state':'plan','source_commit':source_commit,'source_commits':{k:lock[k]['commit'] for k in ('lily','litellm','llama_swap')},
           'steps':['fetch SHA-pinned sources/toolchains',f"replay {len(lock['lily']['patches'])} canonical Lily patches and verify {len(read_object(source/'manifests/distribution/lily-source-baseline.json')['files'])} source hashes",
                    'uv sync --locked to installation runtime venvs','install finite LiteLLM context policy and catalog filters',
@@ -312,6 +401,10 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
           'optin_archive_sha256':opt_pin['archive_sha256'] if opt_pin else None,
           'ui':'localized recipe supplied' if ui_manifest else 'upstream UI only; final locale acceptance false',
           'live_services_started':False,'weights_downloaded_or_loaded':False,'database_initialized':False}
+    if shared_selected:
+        plan['shared_native_build']=shared_plan
+        plan['shared_start_requires_explicit_selection']=True
+        plan['shared_ui_recipe']=shared_ui
     if not execute:
         return plan
     if platform.system()!='Darwin' or platform.machine()!='arm64':
@@ -407,7 +500,10 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
     # No Node listener: both upstream applications produce static files.
     for name,target in (('litellm',upstream['litellm']/'ui/litellm-dashboard'),('llama-swap',upstream['llama-swap']/'ui')):
         steps.append(command([node,npm_cli,'ci','--cache',work/'npm-cache','--no-fund','--no-audit'],cwd=target,env=env,log=logs/(name+'-npm.txt')))
-        steps.append(command([node,npm_cli,'run','build'],cwd=target,env=env,log=logs/(name+'-ui.txt')))
+        if shared_selected and name=='litellm':
+            steps.append(command([node,npm_cli,'run','build','--','--webpack'],cwd=target,env=env,log=logs/(name+'-ui.txt')))
+        else:
+            steps.append(command([node,npm_cli,'run','build'],cwd=target,env=env,log=logs/(name+'-ui.txt')))
     steps.append(command([cargo,'build','--release','--locked','--bin','lily','--target-dir',work/'cargo-target'],cwd=lily,env=env,log=logs/'lily-build.txt'))
     shutil.copyfile(work/'cargo-target/release/lily',native/'lily');(native/'lily').chmod(0o700)
     if opt_pin:
@@ -462,10 +558,21 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
         from optin_engine import generated_record
         trust['optin_engines']={OPT64_ENGINE:generated_record(opt_recipe,sha256(native/'lily-opt64'))}
         trust['enabled_optin_profiles']=['ctx64k-mtp2']
-    runtime_source,source_copy=install_source_view(source,data,trust['source_commit'])
+    shared_build=None
+    if shared_selected:
+        shared_build=build_shared_source_candidate(data,cargo=cargo,enable_shared=True,performance_candidate=True,execute=True)
+        trust=install_generated_shared_extension(source,data,trust,shared_build)
+        trust=append_shared_ui_sources(source,trust,shared_ui)
+    if shared_selected:
+        runtime_source,source_copy=install_shared_source_view(source,data,trust)
+    else:
+        runtime_source,source_copy=install_source_view(source,data,trust['source_commit'])
     trust['runtime_source_copy']=source_copy
     dependency_paths=[work/'lily/Cargo.toml',work/'lily/Cargo.lock',work/'llama_swap/go.mod',work/'llama_swap/go.sum',work/'litellm/ui/litellm-dashboard/package.json',work/'litellm/ui/litellm-dashboard/package-lock.json',work/'llama_swap/ui/package.json',work/'llama_swap/ui/package-lock.json']
     if opt_pin:dependency_paths += [opt_source/'Cargo.toml',opt_source/'Cargo.lock']
+    if shared_build:
+        shared_source=data/Path(shared_build['receipt_path']).parent/'source'
+        dependency_paths += [shared_source/'Cargo.toml',shared_source/'Cargo.lock']
     dependency_manifest={'schema_version':1,'installation_id':config['installation_id'],'source_commit':trust['source_commit'],'build_root':str(work.relative_to(data)),'inputs':[{'path':str(file.relative_to(data)),'sha256':sha256(file)} for file in dependency_paths],'scope':'actual successful build lock inputs; retain until native inventory collected'}
     write_json_new(runtime/'dependency-inputs.json',dependency_manifest);trust['dependency_inputs']={'path':'runtime/dependency-inputs.json','sha256':sha256(runtime/'dependency-inputs.json')}
     config['package_source_root']=str(source)
@@ -473,6 +580,88 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
     write_json_new(runtime/'release-trust.json',trust)
     config['runtime_state']='BUILT';atomic_private_json(data/'install.json',config)
     return {'state':'built','source_commit':trust['source_commit'],'steps':steps,'ui_locale_acceptance':False,'live_services_started':False}
+
+
+def shared_model_preflight(source,config):
+    """Existing external Q4 only; metadata hashes/stat, no payload load/download."""
+    from trust import model_configured
+    from profile_registry import SHARED
+    if not model_configured(config):
+        raise DistributionError('shared MTP2 build requires the configured external Q4 checkpoint')
+    model=no_symlinks(Path(config['model_dir']))
+    expected=read_object(no_symlinks(Path(source)/'manifests/distribution/checkpoint-files.json'))
+    if not model.is_dir() or expected.get('revision')!=SHARED['model_revision']:
+        raise DistributionError('shared MTP2 external checkpoint source differs')
+    records=expected.get('files')
+    if type(records) is not list or not records:
+        raise DistributionError('shared MTP2 external checkpoint inventory is unavailable')
+    metadata={'config.json','model.safetensors.index.json','tokenizer.json','tokenizer_config.json',
+              'generation_config.json','chat_template.jinja'}
+    paths=[]
+    for row in records:
+        relative_path(row['path']);paths.append(row['path'])
+        path=no_symlinks(model/row['path'])
+        if not path.is_file() or type(row.get('size_bytes')) is not int or path.stat().st_size!=row['size_bytes']:
+            raise DistributionError('shared MTP2 external checkpoint file is missing or changed')
+        if row['path'] in metadata and sha256(path)!=row['sha256']:
+            raise DistributionError('shared MTP2 external checkpoint metadata differs')
+    if len(paths)!=len(set(paths)) or not metadata.issubset(paths):
+        raise DistributionError('shared MTP2 external checkpoint metadata inventory is incomplete')
+    return {'file_count':len(records),'revision':expected['revision'],'validation':'metadata_and_payload_stat_only',
+            'tensor_payload_verified':False,'model_loaded':False,'weights_downloaded':False}
+
+
+def install_generated_shared_extension(source,data,base_trust,built):
+    """Normal builder's in-memory output; no public receipt/admission parameter.
+
+    Verify fixed native source replay, complete serving closure and actual
+    binary bytes before copying the separate extension into a fresh install.
+    Original engine/binary/profile/grant records are retained byte for byte.
+    """
+    from mtp2_shared_runner import RELEASE_EXPECTATION
+    from mtp2_shared_runtime import (BOUNDED_OUTPUT_EXPECTATION,BINARY_PATH,PROFILE_IDS,
+        from_generated_trust,verify_source_inventory,runtime_policy)
+    from mtp2_shared_recipe import source_preflight
+    from trust import append_shared_serving_sources
+    expected=RELEASE_EXPECTATION
+    if expected != BOUNDED_OUTPUT_EXPECTATION:
+        raise DistributionError('shared MTP2 normal release recipe is unavailable')
+    if (type(built) is not dict or built.get('state')!='built'
+        or built.get('native_build_only') is not True or built.get('source_replay')!='PASS'
+        or built.get('runtime_acceptance') is not False or built.get('production_enabled') is not False):
+        raise DistributionError('shared MTP2 normal builder output differs')
+    source=no_symlinks(Path(source));data=no_symlinks(Path(data))
+    relative_path(built['receipt_path']);relative_path(built['binary']['path'])
+    receipt=no_symlinks(data/built['receipt_path']);native_source=no_symlinks(receipt.parent/'source')
+    if (not receipt.is_file() or receipt.name!='native-candidate.json'
+        or receipt.parent.parent!=data/'build' or not receipt.parent.name.startswith('native-shared-')):
+        raise DistributionError('shared MTP2 builder work origin differs')
+    expected_receipt=dict(built);expected_receipt.pop('receipt_path')
+    if read_object(receipt)!=expected_receipt:
+        raise DistributionError('shared MTP2 builder output changed')
+    engine=from_generated_trust(built['engine'],expected)
+    _pin,_baseline,inputs=source_preflight(source,performance_candidate=True)
+    if (built.get('source_files_sha256')!=inputs or built.get('source_commit')!=base_trust['source_commit']
+        or built.get('source_inventory_sha256')!=expected.source_inventory_sha256
+        or built.get('source_file_count')!=expected.source_file_count):
+        raise DistributionError('shared MTP2 builder source binding changed')
+    verify_source_inventory(source,native_source,expected)
+    binary=no_symlinks(data/built['binary']['path'])
+    if (not binary.is_relative_to(receipt.parent) or built['binary']['sha256']!=engine.binary_sha256
+        or not os.access(binary,os.X_OK) or sha256(binary)!=engine.binary_sha256):
+        raise DistributionError('shared MTP2 builder executable differs')
+    if 'mtp2_shared_runtime' in base_trust or (data/BINARY_PATH).exists():
+        raise DistributionError('shared MTP2 extension already exists; explicit stopped upgrade required')
+    records=append_shared_serving_sources(source,base_trust['source_files'],performance_candidate=True)
+    target=no_symlinks(data/BINARY_PATH);private_directory(target.parent)
+    shutil.copyfile(binary,target);target.chmod(0o700)
+    if sha256(target)!=engine.binary_sha256:
+        raise DistributionError('shared MTP2 copied executable differs')
+    result=dict(base_trust);result['source_files']=records
+    result['mtp2_shared_runtime']={'schema_version':1,'engine':dict(built['engine']),
+        'binary':{'path':BINARY_PATH,'sha256':engine.binary_sha256},
+        'enabled_profiles':list(PROFILE_IDS),'runtime_policy':runtime_policy()}
+    return result
 
 
 def build_optin_candidate(data, *, cargo=None, execute=False):
@@ -594,5 +783,97 @@ def build_optin_source_candidate(data, *, cargo=None, execute=False):
     binary=work/'cargo-target/release/lily';record=generated_record(replay,sha256(binary))
     receipt={**plan,'state':'built','engine':record,'binary':{'path':str(binary.relative_to(data)),'sha256':sha256(binary)},
              'source_files_sha256':inputs,'step':step,'source_replay':'PASS','native_build_only':True}
+    write_json_new(work/'native-candidate.json',receipt)
+    return {**receipt,'receipt_path':str((work/'native-candidate.json').relative_to(data))}
+
+
+def _shared_rust_toolchain(cargo, env):
+    """Use actual rustc/rustdoc siblings and record the target SDK before build."""
+    if cargo is None:
+        rustup=Path(shutil.which('rustup') or Path.home()/'.cargo/bin/rustup')
+        located=subprocess.run([str(rustup),'which','--toolchain','1.97.0','cargo'],
+                               capture_output=True,text=True,env=env,timeout=10)
+        if located.returncode:
+            raise DistributionError('shared native Rust1.97 toolchain is not installed')
+        cargo=Path(located.stdout.strip())
+    cargo=Path(cargo).resolve(strict=True)
+    rustc=(cargo.parent/'rustc').resolve(strict=True);rustdoc=(cargo.parent/'rustdoc').resolve(strict=True)
+    tool_env={**env,'RUSTC':str(rustc),'RUSTDOC':str(rustdoc)}
+    records={}
+    for name,path,args in [('cargo',cargo,['--version']),('rustc',rustc,['-Vv']),('rustdoc',rustdoc,['--version'])]:
+        result=subprocess.run([str(path),*args],capture_output=True,text=True,env=tool_env,timeout=10)
+        if result.returncode:raise DistributionError('shared native compiler identity is unreadable')
+        value=result.stdout.strip()
+        valid=('release: 1.97.0' in value.splitlines() and 'host: aarch64-apple-darwin' in value.splitlines()) if name=='rustc' else value.startswith(name+' 1.97.0 ')
+        if not valid:raise DistributionError('shared native actual Rust compiler/version/target differs')
+        records[name]={'version':value,'sha256':sha256(path)}
+    sdk=subprocess.run(['/usr/bin/xcrun','--sdk','macosx','--show-sdk-version'],
+                       capture_output=True,text=True,env=tool_env,timeout=10)
+    if sdk.returncode or not re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,2}',sdk.stdout.strip()):
+        raise DistributionError('shared native macOS SDK identity is unavailable')
+    records['sdk_version']=sdk.stdout.strip();records['target']='aarch64-apple-darwin';records['jobs']=2
+    return cargo,tool_env,records
+
+
+def build_shared_source_candidate(data, *, cargo=None, enable_shared=False, execute=False, performance_candidate=False):
+    """Additive build-only generator entry; never alter installed runtime trust.
+
+    A fresh normal installation supplies source identity through the existing
+    resolver. The finite native recipe is code-bound, not supplied by a receipt.
+    Serving/gateway release hashes are a separate final generator step.
+    """
+    if type(enable_shared) is not bool or type(execute) is not bool or type(performance_candidate) is not bool:
+        raise DistributionError('shared native build flags must be exact booleans')
+    if not enable_shared:
+        if performance_candidate:
+            raise DistributionError('shared performance source requires explicit shared build opt-in')
+        if execute:
+            raise DistributionError('shared native build requires explicit opt-in')
+        return {'state':'NOT_REQUESTED','default':False,'runtime_acceptance':False}
+    from native_recipe import SHARED_ENGINE, SHARED_CPU_COPY_ENGINE, apply_lily_source_patches
+    from mtp2_shared_recipe import source_preflight
+    from mtp2_shared_runtime import verify_source_inventory, candidate_expectation
+    EXPECTED = candidate_expectation(performance_candidate)
+    source_selector = SHARED_CPU_COPY_ENGINE if performance_candidate else SHARED_ENGINE
+    from trust import shared_native_build_record
+    data=no_symlinks(data);config=installation(data);source=no_symlinks(Path(config['source_root']))
+    source_commit=resolve_source_commit(source)
+    if config.get('runtime_state')!='NOT_BUILT' or (data/'runtime/release-trust.json').exists():
+        raise DistributionError('shared native candidate requires a fresh not-built installation')
+    pin,baseline,inputs=source_preflight(source, performance_candidate=performance_candidate)
+    lock=read_object(source/'manifests/distribution/native-sources.json')
+    plan={'state':'plan','engine_id':SHARED_ENGINE,'source_commit':source_commit,
+          'native_source_commit':pin['commit'],'archive_sha256':pin['archive_sha256'],
+          'patch_sha256':[row['sha256'] for row in pin['patches']],
+          'source_inventory_sha256':pin['source_inventory_sha256'],'source_file_count':pin['source_file_count'],
+          'frontend_build':False,'model_loaded':False,'production_enabled':False,'default':False,
+          'installed_runtime_ready':False,'runtime_acceptance':False,'serving_source_binding':'DEFERRED_TO_FINAL_GENERATOR'}
+    if not execute:return plan
+    if platform.system()!='Darwin' or platform.machine()!='arm64':
+        raise DistributionError('shared native build requires Darwin arm64')
+    import secrets as rng
+    work=private_directory(data/'build'/('native-shared-'+rng.token_hex(6)));logs=private_directory(work/'logs')
+    env={'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','HOME':str(Path.home()),'TMPDIR':str(private_directory(work/'tmp')),
+         'LANG':'en_US.UTF-8','CARGO_BUILD_JOBS':'2','RUSTUP_TOOLCHAIN':'1.97.0'}
+    cargo,env,toolchain=_shared_rust_toolchain(cargo,env)
+    archive=download('https://codeload.github.com/'+pin['repository']+'/tar.gz/'+pin['commit'],
+                     work/'lily-mtp2-shared.tar.gz',pin['archive_sha256'],cap=32*1024**2)
+    target=work/'source';extract(archive,target)
+    replay=apply_lily_source_patches(source,target,lock,source_selector)
+    if installation(data)!=config or any(sha256(source/path)!=digest for path,digest in inputs.items()):
+        raise DistributionError('shared native build source changed before compilation')
+    step=command([cargo,'build','--release','--locked','-j','2','--bin','lily','--target-dir',work/'cargo-target'],
+                 cwd=target,env=env,log=logs/'lily-mtp2-shared-build.txt',resource_roots=[work])
+    if _shared_rust_toolchain(cargo,env)[2]!=toolchain:
+        raise DistributionError('shared native actual compiler or SDK changed during compilation')
+    verify_source_inventory(source,target,EXPECTED)
+    if (installation(data)!=config or resolve_source_commit(source)!=source_commit
+        or any(sha256(source/path)!=digest for path,digest in inputs.items())):
+        raise DistributionError('shared native installation or source changed during compilation')
+    binary=work/'cargo-target/release/lily'
+    record=shared_native_build_record(replay,sha256(binary),performance_candidate=performance_candidate)
+    receipt={**plan,'state':'built','engine':record,
+             'binary':{'path':str(binary.relative_to(data)),'sha256':record['binary_sha256']},
+             'source_files_sha256':inputs,'step':step,'toolchain':toolchain,'source_replay':'PASS','native_build_only':True}
     write_json_new(work/'native-candidate.json',receipt)
     return {**receipt,'receipt_path':str((work/'native-candidate.json').relative_to(data))}

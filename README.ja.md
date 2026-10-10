@@ -96,11 +96,34 @@ LiliuxFlow 独自の実装には、インストール環境の監督プログラ
 
 3つの MTP2 設定は、上記の M5 Max／128 GiB ホストで検証し、有効化しています。この結果はそのローカル環境での検証によるもので、新規インストールで自動的に有効になるわけではありません。ソースの設定一覧では、すべての MTP2 設定が初期状態で無効です。
 
-停止中のインストールで「クイックスタート」の `lf` 関数を使い、`lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute` を実行します。この追加エンジンのビルドが最初に有効化するのは MTP2 64K のみです。128K と262K は、運用者がそれぞれ検証し、信頼されたインストール設定で有効化する必要があります。一方の有効化で他方が有効になることはありません。`lf profiles list` と `lf profiles info ctx128k-mtp2` はモデルを読み込まず、設定一覧を参照します。
+単独の `latest13f-defer-pc123-mtp2-opt64k` ビルドで有効になるのは MTP2 64K のみです。3つのコンテキストを利用する場合は、下記の共有モードのビルドで、3つの MTP2 プロファイルを含む1つの拡張を通常の手順で生成します。このビルドと明示的な起動オプションで選択するため、別のプロファイル有効化コマンドや trust ファイルの手動編集は不要です。
 
-設定を有効化した後、`lf profiles grant-owner ctx128k-mtp2 --dry-run` で指定 owner caller への権限追加を確認し、必要な場合だけ `--execute` で適用します。他の2設定には `ctx64k-mtp2` または `ctx262k-mtp2` を指定してください。他の caller にも対象モデルへの明示的な権限が必要です。空またはワイルドカードの権限では MTP2 を利用できません。caller への権限追加だけでは、無効な設定は有効になりません。
+共有拡張を生成した後、`lf profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --dry-run` で指定 owner caller への権限追加を確認し、必要な場合だけ `--execute` で適用します。他の2設定には `ctx64k-mtp2` または `ctx262k-mtp2` を指定してください。他の caller にも個別の明示的なモデル権限が必要です。空またはワイルドカードの権限では MTP2 を利用できません。caller への権限追加だけでは、サービスモードは選択されません。
 
 API リクエストには、有効化済みの正確なエイリアスを指定します。[API](docs/API.md) に128K と262K を直接指定する例があります。リクエスト body からエンジン、パス、メモリ、KV 精度、context を変更することはできません。JSON／JSON Schema 形式の応答とツール実行は引き続き非対応です。
+
+### 共有 MTP2 の候補実装
+
+ソースには、共有 MTP2 の候補実装も含まれています。3つの論理コンテキストは、常駐する1つの262Kエンジンを共有し、最大2件のリクエストと上限付きキューを扱います。既定の64K MTP0と既存のMTP0設定は変わりません。各 caller は自分の LiteLLM virtual key と明示的なモデル権限を使います。テナントのキャッシュは常駐メモリ内に限定し、共有ディスクキャッシュ層は無効です。
+
+共有モードの CLI は現在レビュー待ちの候補で、実サービス経路とブラウザーの最終検証はまだ完了していません。公開済みのリリースでは有効になっておらず、ソースのビルド成功だけでも有効になりません。下の例では新しいデータディレクトリに新規インストールを作成します。「クイックスタート」の `lf` 関数と `MODEL_DIR` の設定を使い、ビルド後にデータベースを初期化してください。ビルド済みのインストールは `build` で上書きできません。[アップグレードとロールバック](docs/OPERATIONS.md#upgrade-and-rollback)に従って別の候補インストールを準備します。共有ビルドを選択すると3つの MTP2 プロファイルがインストールされ、`start --mtp2-shared-context` で共有サービスモードを明示的に選択します。通常の `lf start` は既存の MTP0 モードと API の既定値を維持します。
+
+既存のサービスが稼働中の場合は、[個別インストールとポート競合](docs/INSTALLATION.md#separate-installations-and-port-conflicts)に従い、setup の `--port` オプションで空いているサービス用ポートを指定してください。指定 caller のキーは起動時に作成されるため、サービスを起動してから権限追加を確認します。必要な場合だけ `--execute` で適用してください。
+
+```sh
+SHARED_DATA="$HOME/Library/Application Support/LiliuxFlow shared"
+lf --data-root "$SHARED_DATA" setup --model-dir "$MODEL_DIR"
+lf --data-root "$SHARED_DATA" build --optin-engine latest13f-defer-pc123-mtp2-shared-context-v1 --ui-manifest manifests/distribution/ui-recipe-mtp2-shared.json --execute
+lf --data-root "$SHARED_DATA" verify-model
+lf --data-root "$SHARED_DATA" initialize --execute
+lf --data-root "$SHARED_DATA" profiles list --mtp2-shared-context
+lf --data-root "$SHARED_DATA" profiles info ctx128k-mtp2 --mtp2-shared-context
+lf --data-root "$SHARED_DATA" start --mtp2-shared-context
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --dry-run
+lf --data-root "$SHARED_DATA" status
+lf --data-root "$SHARED_DATA" doctor
+lf --data-root "$SHARED_DATA" stop
+```
 
 ## 同一ワークロードの性能
 

@@ -24,7 +24,7 @@ git clone https://github.com/Hiruynk/LiliuxFlow.git
 cd LiliuxFlow
 ```
 
-You can also extract an official LiliuxFlow source release asset containing `SOURCE_COMMIT.json`. GitHub’s automatic **Source code (zip/tar.gz)** archives omit that record and cannot be used directly for the default build. The builder checks the source identity before downloading or compiling dependencies. While the repository is private, cloning requires your own GitHub access.
+You can also extract an official LiliuxFlow source release asset containing `SOURCE_COMMIT.json`. GitHub’s automatic **Source code (zip/tar.gz)** archives omit that record and cannot be used directly for the default build. The builder checks the source identity before downloading or compiling dependencies. The repository is public and can be cloned without signing in.
 
 ## Choose a model setup
 

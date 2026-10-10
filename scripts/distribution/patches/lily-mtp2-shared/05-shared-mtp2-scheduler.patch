@@ -1,0 +1,1845 @@
+diff --git a/src/engine.rs b/src/engine.rs
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -7,9 +7,93 @@
+ 
+ use anyhow::Result;
+ 
+-use crate::kernels::sample::SamplingParams;
++use crate::kernels::sample::{DraftDists, SAMPLE_K_CAP, SamplingParams};
+ use crate::metal::{EncodedPass, MetalContext, PassTiming, PendingPass, SharedEvent};
+ use crate::tensor::Tensor;
++
++pub const SPEC_CONTINUATION_SLOTS: usize = 2;
++pub const SPEC_CONTINUATION_LOGICAL_BYTES: usize = 2 * (SAMPLE_K_CAP * 8 + 4);
++/// Each small MTL resource is conservatively charged one64KiB page.
++/// Actual MTL allocatedSize must fit before use.
++pub const SPEC_CONTINUATION_RESERVED_BYTES: usize = 3 * 65_536;
++
++#[derive(Clone, PartialEq, Eq)]
++pub struct SpecContinuationScope {
++    request_id: String,
++    epoch: String,
++    slot: usize,
++}
++impl SpecContinuationScope {
++    pub fn new(request_id: &str, epoch: &str, slot: usize) -> Result<Self> {
++        anyhow::ensure!(!request_id.is_empty() && request_id.len() <= 128
++            && !epoch.is_empty() && epoch.len() <= 128 && slot < 2,
++            "invalid MTP2 continuation identity");
++        Ok(Self { request_id: request_id.into(), epoch: epoch.into(), slot })
++    }
++}
++
++#[derive(Clone)]
++pub struct SpecContinuationHeader {
++    scope: SpecContinuationScope,
++    position: usize,
++    draw_index: usize,
++    last_unfed: u32,
++    sampling: SamplingParams,
++}
++impl SpecContinuationHeader {
++    pub fn new(scope: &SpecContinuationScope, position: usize, draw_index: usize,
++        last_unfed: u32, sampling: &SamplingParams) -> Self {
++        Self { scope: scope.clone(), position, draw_index, last_unfed, sampling: *sampling }
++    }
++    pub fn validate(&self, expected: &Self) -> Result<()> {
++        anyhow::ensure!(self.scope == expected.scope && self.position == expected.position
++            && self.draw_index == expected.draw_index && self.last_unfed == expected.last_unfed
++            && self.sampling == expected.sampling, "stale MTP2 continuation");
++        Ok(())
++    }
++}
++
++/// Tiny row-owned proposals/distributions, never views into shared scratch.
++/// Storage is reused; only the Ready header is consumed or invalidated.
++pub struct SpecContinuation {
++    scope: SpecContinuationScope,
++    ready: Option<(SpecContinuationHeader, [u32; 2])>,
++    distributions: DraftDists,
++}
++impl SpecContinuation {
++    pub fn new(ctx: &MetalContext, scope: SpecContinuationScope) -> Result<Self> {
++        let distributions = DraftDists::new(ctx, SPEC_CONTINUATION_SLOTS)?;
++        anyhow::ensure!(distributions.allocated_bytes() <= SPEC_CONTINUATION_RESERVED_BYTES,
++            "MTP2 continuation allocation exceeds reserved pages");
++        Ok(Self { scope, ready: None, distributions })
++    }
++    pub fn invalidate(&mut self) { self.ready = None; }
++    pub fn is_ready(&self) -> bool { self.ready.is_some() }
++    pub fn allocated_bytes(&self) -> usize { self.distributions.allocated_bytes() }
++    pub fn check_scope(&self, scope: &SpecContinuationScope) -> Result<()> {
++        anyhow::ensure!(&self.scope == scope, "MTP2 continuation ownership mismatch"); Ok(())
++    }
++    pub(crate) fn capture(&mut self, ctx: &MetalContext, source: &DraftDists,
++        header: SpecContinuationHeader, proposals: Vec<u32>) -> Result<()> {
++        self.check_scope(&header.scope)?;
++        anyhow::ensure!(proposals.len() == SPEC_CONTINUATION_SLOTS,
++            "MTP2 continuation requires exactly two proposals");
++        source.validate_two_slots(!header.sampling.is_greedy())?;
++        self.distributions.copy_two_slots_from(ctx, source)?;
++        self.ready = Some((header, [proposals[0], proposals[1]]));
++        Ok(())
++    }
++    pub(crate) fn restore(&mut self, ctx: &MetalContext, target: &DraftDists,
++        expected: &SpecContinuationHeader) -> Result<Option<Vec<u32>>> {
++        self.check_scope(&expected.scope)?;
++        let Some((header, proposals)) = &self.ready else { return Ok(None) };
++        header.validate(expected)?;
++        self.distributions.validate_two_slots(!header.sampling.is_greedy())?;
++        target.copy_two_slots_from(ctx, &self.distributions)?;
++        let proposals = proposals.to_vec(); self.ready = None;
++        Ok(Some(proposals))
++    }
++}
+ 
+ /// One piece of a persisted layout (a disk-tier file): bytes the layout
+ /// computes, such as a position header, or a range of a shared-storage
+@@ -1050,6 +1134,28 @@
+         anyhow::bail!("this model has no draft head")
+     }
+ 
++    fn supports_spec_continuation(&self) -> bool { false }
++    fn require_spec_continuation(&self) -> Result<()> {
++        anyhow::ensure!(self.supports_spec_continuation(),
++            "model does not support settled MTP2 continuations"); Ok(())
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn finish_speculation_yield<'a>(&self, ctx: &'a MetalContext, state: &mut Self::State,
++        scratch: &mut Self::Scratch, accepted: usize, next: NextStep<'_>,
++        draft: PendingPass<'a>, continuation: &mut SpecContinuation,
++        header: SpecContinuationHeader) -> Result<()> {
++        let _ = (ctx, state, scratch, accepted, next, draft, continuation, header);
++        anyhow::bail!("model does not support settled MTP2 continuations")
++    }
++
++    fn restore_speculation_continuation(&self, ctx: &MetalContext, state: &Self::State,
++        scratch: &Self::Scratch, continuation: &mut SpecContinuation,
++        expected: &SpecContinuationHeader) -> Result<Option<Vec<u32>>> {
++        let _ = (ctx, state, scratch, continuation, expected);
++        anyhow::bail!("model does not support settled MTP2 continuations")
++    }
++
+     /// Completes a verify pass: keeps `pending` plus the first `accepted`
+     /// drafts as fed. `accepted` may not exceed the number of drafts the
+     /// draws confirmed (which is what `draft` rolled back to); it is smaller
+diff --git a/src/generate.rs b/src/generate.rs
+--- a/src/generate.rs
++++ b/src/generate.rs
+@@ -25,7 +25,8 @@
+ use anyhow::{Result, ensure};
+ 
+ use crate::chat::Conversation;
+-use crate::engine::{DecodeStateApi, Draw, LanguageModel, NextStep, ScratchApi};
++use crate::engine::{DecodeStateApi, Draw, LanguageModel, NextStep, ScratchApi,
++    SpecContinuation, SpecContinuationHeader, SpecContinuationScope};
+ use crate::kernels::sample::SamplingParams;
+ use std::time::Instant;
+ 
+@@ -240,6 +241,55 @@
+     /// that step drew (a valid next draw, already counted by the sampler).
+     /// `None` when the final draw is not fed.
+     pub parked_draw: Option<u32>,
++}
++
++/// A cooperative stop is internal; it never becomes a response terminal.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SpecYield { Quantum, PhysicalTail }
++
++pub enum ControlledSpec {
++    Finished(Speculated),
++    Yield { kind: SpecYield, drafted: usize, accepted: usize },
++}
++
++/// Numeric evidence from a complete verify/accept/rollback step, no token data.
++#[derive(Debug, Clone, Copy)]
++pub struct SpecStep {
++    pub produced_ns: u64,
++    pub generated_start: usize,
++    pub generated_count: usize,
++    pub generated_total: usize,
++    pub draft_count: usize,
++    pub proposed: usize,
++    pub accepted: usize,
++    pub cumulative_drafted: usize,
++    pub cumulative_accepted: usize,
++    pub position: usize,
++    pub thinking_control: bool,
++}
++
++pub trait SpecStepControl {
++    /// Called before choosing the next pass; no peer runs yet.
++    fn wants_yield(&self) -> bool;
++    /// Called only after the committed draft and selected rollback settled.
++    fn settled(&mut self, step: SpecStep) -> Result<()>;
++}
++
++fn spec_observe(
++    control: &mut Option<&mut dyn SpecStepControl>,
++    step: SpecStep,
++) -> Result<()> {
++    if let Some(control) = control.as_mut() { control.settled(step)?; }
++    Ok(())
++}
++
++fn spec_yield_kind(control: &Option<&mut dyn SpecStepControl>, position: usize) -> Option<SpecYield> {
++    control.as_ref().and_then(|control| {
++        if crate::kernels::attention::MAX_SEQ.saturating_sub(position)
++            < crate::serve::mtp2::PHYSICAL_TAIL_RESERVE {
++            Some(SpecYield::PhysicalTail)
++        } else if control.wants_yield() { Some(SpecYield::Quantum) } else { None }
++    })
+ }
+ 
+ /// Speculative decoding through a model's draft head, from a state that has
+@@ -303,7 +353,41 @@
+     thinking: Option<&ThinkingHook<'_>>,
+     on_token: &mut dyn FnMut(u32) -> Result<bool>,
+ ) -> Result<Speculated> {
++    match speculate_controlled(ctx, model, state, scratch, params, drafts,
++        max_tokens, tokens, is_stop, checkpoints, thinking, on_token, None, None)? {
++        ControlledSpec::Finished(outcome) => Ok(outcome),
++        ControlledSpec::Yield { .. } => anyhow::bail!("uncontrolled generation yielded"),
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++fn speculate_controlled<M: LanguageModel>(
++    ctx: &MetalContext,
++    model: &M,
++    state: &mut M::State,
++    scratch: &mut M::Scratch,
++    params: &SamplingParams,
++    drafts: usize,
++    max_tokens: usize,
++    tokens: &mut Vec<u32>,
++    is_stop: &dyn Fn(u32) -> bool,
++    mut checkpoints: Option<&mut dyn DecodeCheckpointer<M::State>>,
++    thinking: Option<&ThinkingHook<'_>>,
++    on_token: &mut dyn FnMut(u32) -> Result<bool>,
++    mut control: Option<&mut dyn SpecStepControl>,
++    mut continuation: Option<(&mut SpecContinuation, &SpecContinuationScope)>,
++) -> Result<ControlledSpec> {
+     let k = drafts.min(model.max_drafts()).max(1);
++    if control.is_some() {
++        model.require_spec_continuation()?;
++        ensure!(continuation.is_some(), "cooperative generation needs row-owned continuation storage");
++        ensure!(k == crate::serve::mtp2::DRAFTS, "cooperative generation requires two drafts");
++        if crate::kernels::attention::MAX_SEQ.saturating_sub(state.pos())
++            < crate::serve::mtp2::PHYSICAL_TAIL_RESERVE {
++            if let Some((saved, _)) = continuation.as_mut() { saved.invalidate(); }
++            return Ok(ControlledSpec::Yield { kind: SpecYield::PhysicalTail, drafted: 0, accepted: 0 });
++        }
++    }
+     // The last drawn token is the one not yet fed: the prefill's draw for a
+     // new request, or where a resumed request left off.
+     let last =
+@@ -315,8 +399,14 @@
+         .checked_sub(tokens.len() - 1)
+         .ok_or_else(|| anyhow::anyhow!("speculation from a state behind its draws"))?;
+     let (mut drafted, mut accepted) = (0usize, 0usize);
+-    let mut proposals =
+-        model.draft_initial(ctx, state, scratch, last, k, params, tokens.len())?;
++    let restored = if let Some((saved, scope)) = continuation.as_mut() {
++        let expected = SpecContinuationHeader::new(scope, state.pos(), tokens.len(), last, params);
++        model.restore_speculation_continuation(ctx, state, scratch, saved, &expected)?
++    } else { None };
++    let mut proposals = match restored {
++        Some(proposals) => proposals,
++        None => model.draft_initial(ctx, state, scratch, last, k, params, tokens.len())?,
++    };
+     // The next verify pass, committed by finish_speculation and parked on the
+     // GPU until verify stages its n-gram rows.
+     let mut parked: Option<PendingPass<'_>> = None;
+@@ -334,6 +424,9 @@
+             parked.take(),
+             k,
+         )?;
++        // Verify outputs are available now. Read no token/logit observer; clock
++        // capture is only for the explicit cooperative candidate.
++        let produced_ns = if control.is_some() { crate::serve::mtp2::monotonic_ns() } else { 0 };
+         if std::env::var_os("LILY_TRACE_SPEC").is_some() {
+             eprintln!(
+                 "trace step0={step0} pending={pending} proposals={proposals:?} sampled={sampled:?}"
+@@ -395,14 +488,25 @@
+             );
+         }
+         if let Some(group) = group {
++            if let Some((saved, _)) = continuation.as_mut() { saved.invalidate(); }
+             // At rest with the kept rows fed, as at the end of a generation.
+             model.finish_speculation(ctx, state, scratch, kept, None, draft)?;
+             if let Some(end) = push_group(tokens, &group, max_tokens, on_token)? {
+                 finish.get_or_insert(end);
+             }
+             feed_inserted(ctx, model, state, scratch, tokens, base)?;
++            let group_yield = spec_yield_kind(&control, state.pos());
++            spec_observe(&mut control, SpecStep { produced_ns, generated_start: step0 + 1,
++                generated_count: tokens.len() - step0, generated_total: tokens.len(),
++                draft_count: k, proposed: proposals.len(), accepted: kept,
++                cumulative_drafted: drafted, cumulative_accepted: accepted,
++                position: state.pos(), thinking_control: true })?;
+             if let Some(finish) = finish {
+-                return Ok(Speculated { finish, drafted, accepted });
++                return Ok(ControlledSpec::Finished(Speculated { finish, drafted, accepted }));
++            }
++            if let Some(kind) = group_yield {
++                if let Some(c) = checkpoints.as_mut() && c.due(state.pos()) { c.take(ctx, &*state)?; }
++                return Ok(ControlledSpec::Yield { kind, drafted, accepted });
+             }
+             if let Some(c) = checkpoints.as_mut()
+                 && c.due(state.pos())
+@@ -424,12 +528,44 @@
+         }
+         match finish {
+             Some(finish) => {
++                if let Some((saved, _)) = continuation.as_mut() { saved.invalidate(); }
+                 model.finish_speculation(ctx, state, scratch, kept, None, draft)?;
+-                return Ok(Speculated { finish, drafted, accepted });
++                spec_observe(&mut control, SpecStep { produced_ns, generated_start: step0 + 1,
++                    generated_count: tokens.len() - step0, generated_total: tokens.len(),
++                    draft_count: k, proposed: proposals.len(), accepted: kept,
++                    cumulative_drafted: drafted, cumulative_accepted: accepted,
++                    position: state.pos(), thinking_control: false })?;
++                return Ok(ControlledSpec::Finished(Speculated { finish, drafted, accepted }));
+             }
+             None => {
+                 let rest = base + tokens.len() - 1;
++                let step = SpecStep { produced_ns, generated_start: step0 + 1,
++                    generated_count: tokens.len() - step0, generated_total: tokens.len(),
++                    draft_count: k, proposed: proposals.len(), accepted: kept,
++                    cumulative_drafted: drafted, cumulative_accepted: accepted,
++                    position: rest, thinking_control: false };
++                if let Some(kind) = spec_yield_kind(&control, rest) {
++                    // A checkpoint takes priority over continuation capture.
++                    // Match the reference's finishNone/checkpoint/reproposal;
++                    // its next draft_initial is merely delayed until resume.
++                    let checkpoint_due = checkpoints.as_mut().is_some_and(|c| c.due(rest));
++                    if kind == SpecYield::Quantum && !checkpoint_due {
++                        let (saved, scope) = continuation.as_mut().expect("controlled storage");
++                        let header = SpecContinuationHeader::new(scope, rest, tokens.len(), sampled[kept], params);
++                        model.finish_speculation_yield(ctx, state, scratch, kept,
++                            NextStep { token: sampled[kept], params, step0: tokens.len() },
++                            draft, saved, header)?;
++                    } else {
++                        if let Some((saved, _)) = continuation.as_mut() { saved.invalidate(); }
++                        model.finish_speculation(ctx, state, scratch, kept, None, draft)?;
++                        if checkpoint_due && let Some(c) = checkpoints.as_mut() { c.take(ctx, &*state)?; }
++                    }
++                    ensure!(state.pos() == rest, "yielded speculative state is not at rest");
++                    spec_observe(&mut control, step)?;
++                    return Ok(ControlledSpec::Yield { kind, drafted, accepted });
++                }
+                 if checkpoints.as_mut().is_some_and(|c| c.due(rest)) {
++                    if let Some((saved, _)) = continuation.as_mut() { saved.invalidate(); }
+                     model.finish_speculation(ctx, state, scratch, kept, None, draft)?;
+                     ensure!(
+                         state.pos() == rest,
+@@ -439,6 +575,7 @@
+                     if let Some(c) = checkpoints.as_mut() {
+                         c.take(ctx, &*state)?;
+                     }
++                    spec_observe(&mut control, step)?;
+                     proposals = model.draft_initial(
+                         ctx,
+                         state,
+@@ -464,6 +601,7 @@
+                 )?;
+                 proposals = next_proposals;
+                 parked = next_parked;
++                spec_observe(&mut control, step)?;
+             }
+         }
+     }
+@@ -475,6 +613,32 @@
+ }
+ 
+ impl Generator {
++    /// Candidate-only MTP2 resume. Yield is returned only after a full settled
++    /// step; the original max_tokens and seed draw index are never rewritten.
++    #[allow(clippy::too_many_arguments)]
++    pub fn resume_mtp2_controlled<M: LanguageModel>(
++        &self, ctx: &MetalContext, model: &M, state: &mut M::State,
++        scratch: &mut M::Scratch, tokens: &mut Vec<u32>,
++        options: &GenerateOptions<'_>, checkpoints: Option<&mut dyn DecodeCheckpointer<M::State>>,
++        on_token: &mut dyn FnMut(u32) -> Result<bool>, control: &mut dyn SpecStepControl,
++        continuation: &mut SpecContinuation, scope: &SpecContinuationScope,
++    ) -> Result<ControlledSpec> {
++        ensure!(!tokens.is_empty(), "cooperative resume needs its first draw");
++        ensure!(options.drafts == crate::serve::mtp2::DRAFTS && model.max_drafts() >= options.drafts,
++            "cooperative resume requires two available drafts");
++        continuation.check_scope(scope)?;
++        model.require_spec_continuation()?;
++        if tokens.len() >= options.max_tokens {
++            continuation.invalidate();
++            return Ok(ControlledSpec::Finished(Speculated { finish: FinishReason::Length, drafted: 0, accepted: 0 }));
++        }
++        let hook = self.thinking_hook(options);
++        let result = speculate_controlled(ctx, model, state, scratch, options.sampling,
++            options.drafts, options.max_tokens, tokens, &|t| self.is_stop(t, options),
++            checkpoints, hook.as_ref(), on_token, Some(control), Some((continuation, scope)));
++        if result.is_err() { continuation.invalidate(); }
++        result
++    }
+     pub fn from_model_dir(dir: &Path) -> Result<Self> {
+         let tokenizer = Tokenizer::from_model_dir(dir)?;
+         let stop_tokens = tokenizer.stop_tokens().to_vec();
+diff --git a/src/kernels/sample.rs b/src/kernels/sample.rs
+--- a/src/kernels/sample.rs
++++ b/src/kernels/sample.rs
+@@ -2,10 +2,11 @@
+ //! draw itself, so pipelined decode never moves logits to the host.
+ 
+ use anyhow::{Result, ensure};
++use objc2_metal::{MTLBuffer, MTLResource};
+ 
+ use crate::kernels::elementwise::{ARGMAX_GROUPS, argmax_f32};
+ use crate::kernels::{f32_bytes, u32_bytes};
+-use crate::metal::{ComputePass, Grid, MetalContext, MslVersion};
++use crate::metal::{BlitCopy, ComputePass, Grid, MetalContext, MslVersion};
+ use crate::tensor::{DType, Tensor};
+ 
+ const SOURCE: &str = include_str!("metal/sample.metal");
+@@ -173,6 +174,13 @@
+         self.counts.write_bytes(other.counts.contents())
+     }
+ 
++    /// V16 observer only: the caller has settled all GPU work before reading.
++    /// Never compiled into a normal binary or used by performance runs.
++    #[cfg(test)]
++    pub(crate) fn counts_bytes_for_test(&self) -> &[u8] {
++        self.counts.raw_bytes()
++    }
++
+     pub fn vocab(&self) -> usize {
+         self.adjusted.numel()
+     }
+@@ -211,6 +219,33 @@
+             probs: self.probs.view(i * SAMPLE_K_CAP, &[SAMPLE_K_CAP])?,
+             count: self.counts.view(i, &[1])?,
+         })
++    }
++
++    pub(crate) fn allocated_bytes(&self) -> usize {
++        [&self.ids, &self.probs, &self.counts].into_iter()
++            .map(|t| t.buffer().allocatedSize().max(t.buffer().length())).sum()
++    }
++
++    pub(crate) fn validate_two_slots(&self, sampled: bool) -> Result<()> {
++        ensure!(self.counts.numel() >= 2 && self.ids.numel() >= 2 * SAMPLE_K_CAP
++            && self.probs.numel() >= 2 * SAMPLE_K_CAP, "MTP2 distribution slots unavailable");
++        if sampled {
++            let counts = self.counts.view(0, &[2])?.to_u32()?;
++            ensure!(counts.iter().all(|&n| n > 0 && n as usize <= SAMPLE_K_CAP),
++                "MTP2 distribution count is invalid");
++        }
++        Ok(())
++    }
++
++    pub(crate) fn copy_two_slots_from(&self, ctx: &MetalContext, source: &Self) -> Result<()> {
++        self.validate_two_slots(false)?; source.validate_two_slots(false)?;
++        let src = [source.ids.view(0, &[2 * SAMPLE_K_CAP])?,
++            source.probs.view(0, &[2 * SAMPLE_K_CAP])?, source.counts.view(0, &[2])?];
++        let dst = [self.ids.view(0, &[2 * SAMPLE_K_CAP])?,
++            self.probs.view(0, &[2 * SAMPLE_K_CAP])?, self.counts.view(0, &[2])?];
++        let copies: Vec<_> = src.iter().zip(&dst).map(|(src, dst)| BlitCopy {
++            src, dst, src_offset: 0, dst_offset: 0, len: src.byte_len() }).collect();
++        ctx.blit_copy(&copies)
+     }
+ }
+ 
+diff --git a/src/metal.rs b/src/metal.rs
+--- a/src/metal.rs
++++ b/src/metal.rs
+@@ -1656,6 +1656,9 @@
+ }
+ 
+ impl PendingPass<'_> {
++    /// Cooperative discard is allowed only before submission. Submitted Drop
++    /// waits, but does not prove a safe shared-scratch yield by itself.
++    pub(crate) fn is_deferred(&self) -> bool { !self.submitted }
+     /// Submit a deferred program only after every encoded wait is ready.
+     /// Retain those waits on the queue: they still provide synchronization.
+     pub(crate) fn submit_released(mut self) -> Result<Self> {
+diff --git a/src/qwen4exp/model.rs b/src/qwen4exp/model.rs
+--- a/src/qwen4exp/model.rs
++++ b/src/qwen4exp/model.rs
+@@ -4784,6 +4784,26 @@
+         )
+     }
+ 
++    fn supports_spec_continuation(&self) -> bool {
++        self.max_drafts() >= 2 && self.expert_cache_stats().is_none()
++            && self.kv_format() == KvFormat::Bf16
++    }
++
++    fn finish_speculation_yield<'a>(&self, ctx: &'a MetalContext, state: &mut DecodeState,
++        scratch: &mut Scratch, accepted: usize, next: crate::engine::NextStep<'_>,
++        draft: PendingPass<'a>, continuation: &mut crate::engine::SpecContinuation,
++        header: crate::engine::SpecContinuationHeader) -> Result<()> {
++        Qwen4ExpModel::finish_speculation_yield(self, ctx, state, scratch, accepted,
++            next, draft, continuation, header)
++    }
++
++    fn restore_speculation_continuation(&self, ctx: &MetalContext, state: &DecodeState,
++        scratch: &Scratch, continuation: &mut crate::engine::SpecContinuation,
++        expected: &crate::engine::SpecContinuationHeader) -> Result<Option<Vec<u32>>> {
++        Qwen4ExpModel::restore_speculation_continuation(self, ctx, state, scratch,
++            continuation, expected)
++    }
++
+     fn finish_speculation<'a>(
+         &self,
+         ctx: &'a MetalContext,
+diff --git a/src/qwen4exp/spec.rs b/src/qwen4exp/spec.rs
+--- a/src/qwen4exp/spec.rs
++++ b/src/qwen4exp/spec.rs
+@@ -56,6 +56,42 @@
+ }
+ 
+ impl Qwen4ExpModel {
++    /// Retain the upstream-computed proposals without re-running the head.
++    /// The old None/Some finish paths are kept intact; only this opt-in hook
++    /// discards its explicitly unsubmitted ahead program before the row yields.
++    #[allow(clippy::too_many_arguments)]
++    pub(super) fn finish_speculation_yield<'a>(&self, ctx: &'a MetalContext,
++        state: &mut DecodeState, s: &mut Scratch, accepted: usize,
++        next: crate::engine::NextStep<'_>, draft: PendingPass<'a>,
++        continuation: &mut crate::engine::SpecContinuation,
++        header: crate::engine::SpecContinuationHeader) -> Result<()> {
++        let (proposals, ahead) = self.finish_speculation(ctx, state, s, accepted, Some(next), draft)?;
++        if let Some(ahead) = ahead {
++            if !ahead.is_deferred() {
++                s.sync.release()?;
++                ahead.wait()?;
++                anyhow::bail!("MTP2 yield encountered submitted ahead work");
++            }
++            drop(ahead);
++        }
++        s.sync.release()?;
++        ensure!(state.spec.is_none() && s.sync.armed() == 0,
++            "MTP2 continuation did not reach a settled boundary");
++        let dists = &s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("MTP2 distributions unavailable"))?.dists;
++        continuation.capture(ctx, dists, header, proposals)?;
++        ensure!(state.spec.is_none() && s.sync.armed() == 0,
++            "MTP2 continuation capture changed the settled boundary");
++        Ok(())
++    }
++
++    pub(super) fn restore_speculation_continuation(&self, ctx: &MetalContext,
++        state: &DecodeState, s: &Scratch, continuation: &mut crate::engine::SpecContinuation,
++        expected: &crate::engine::SpecContinuationHeader) -> Result<Option<Vec<u32>>> {
++        ensure!(state.spec.is_none() && s.sync.armed() == 0,
++            "MTP2 continuation restore requires an idle boundary");
++        let dists = &s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("MTP2 distributions unavailable"))?.dists;
++        continuation.restore(ctx, dists, expected)
++    }
+     /// Draft tokens per step, or 0 without the head.
+     pub fn max_drafts(&self) -> usize {
+         if self.weights.mtp.is_some() { MAX_DRAFTS } else { 0 }
+diff --git a/src/serve.rs b/src/serve.rs
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -303,8 +303,8 @@
+         "shared MTP2 requires --mtp-drafts 2");
+     ensure!(options.kv_format == Some(KvFormat::Bf16),
+         "shared MTP2 requires explicit --kv-cache bf16");
+-    ensure!(options.max_batch == Some(1),
+-        "shared MTP2 P1 requires --max-batch 1; peer scheduling is unavailable");
++    ensure!(matches!(options.max_batch, Some(1 | 2)),
++        "shared MTP2 requires explicit --max-batch 1 or 2");
+     ensure!(options.pin_weights == pin::PinMode::Off && options.ngram_preload
+         && !options.ngram_lock, "shared MTP2 requires pin off and unlocked n-gram preload");
+     ensure!(options.thinking
+@@ -902,6 +902,8 @@
+     /// lacks them (the controls are then ignored).
+     thinking_tokens: Option<Arc<ThinkingTokens>>,
+     mtp2_residency: Option<mtp2::WeightResidency>,
++    mtp2_step_id: u64,
++    mtp2_scratch_bytes: usize,
+ }
+ 
+ /// Where a request's text ends up when not streaming.
+@@ -961,7 +963,7 @@
+         // These are the actual loader's live allocations, before any session or
+         // scratch exists. Hash handles privately; never print or persist addresses.
+         let weight_buffers = model.weight_buffers();
+-        let mtp2_residency = match (&weight_loads, load_generation) {
++        let mut mtp2_residency = match (&weight_loads, load_generation) {
+             (Some(loads), Some(generation)) => Some(loads.loaded(generation,
+                 weight_buffers.iter().map(|buffer|
+                     (std::rc::Rc::as_ptr(buffer) as usize, buffer.length())),
+@@ -982,6 +984,10 @@
+         let drafts = options.mtp_drafts.min(model.max_drafts());
+         let requested_batch = options.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
+         let max_batch = requested_batch.clamp(1, model.max_batch_rows().max(1));
++        if options.liliuxflow_mtp2_shared_context {
++            ensure!(max_batch == requested_batch, "shared MTP2 row capacity is unavailable");
++            if let Some(residency) = &mut mtp2_residency { residency.max_batch = max_batch; }
++        }
+         if requested_batch > 1 && max_batch == 1 {
+             eprintln!(
+                 "batching: off, {} cannot batch decode steps in this configuration (the expert cache)",
+@@ -1079,6 +1085,12 @@
+                 "shared MTP2 checkpoint cannot provide the resident context");
+         }
+         let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
++        if options.liliuxflow_mtp2_shared_context && max_batch == 2 {
++            // Allocate the fixed sampler slots before admission. This is shared
++            // scratch, not a second model or an eager full-context state.
++            model.move_sampler_counts(&ctx, &mut scratch,
++                crate::engine::CountsSlot::Engine, crate::engine::CountsSlot::Batch(0))?;
++        }
+         warm_up(&ctx, &model, &mut scratch)?;
+ 
+         let allocated = ctx.current_allocated();
+@@ -1283,6 +1295,8 @@
+         if let Some(residency) = &mtp2_residency {
+             eprintln!("{}", residency.resident_line());
+         }
++        let mtp2_scratch_bytes = mtp2_residency.as_ref().map_or(0, |resident|
++            ctx.current_allocated().saturating_sub(resident.allocation_bytes as usize));
+         Ok(Self {
+             ctx,
+             model,
+@@ -1299,6 +1313,8 @@
+             pin,
+             thinking_tokens,
+             mtp2_residency,
++            mtp2_step_id: 0,
++            mtp2_scratch_bytes,
+         })
+     }
+ 
+diff --git a/src/serve/batch.rs b/src/serve/batch.rs
+--- a/src/serve/batch.rs
++++ b/src/serve/batch.rs
+@@ -50,9 +50,10 @@
+ use super::{Cmd, Engine, EngineQueue, Job, Sink};
+ use crate::engine::{
+     BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel, RowsInFlight,
++    SpecContinuation, SpecContinuationScope, SPEC_CONTINUATION_RESERVED_BYTES,
+ };
+ use crate::generate::{
+-    DecodeCheckpointer, FinishReason, GenerateOptions, Generator, ThinkingHook,
++    ControlledSpec, SpecYield, DecodeCheckpointer, FinishReason, GenerateOptions, Generator, ThinkingHook,
+     emit_acted,
+ };
+ use crate::qwen4exp::VisionInput;
+@@ -344,6 +345,10 @@
+     /// The row's thinking control inserted tokens with its last draw that
+     /// the state has not fed yet ([`feed_inserted_rows`]).
+     inserted: bool,
++    reserved_bytes: usize,
++    step_index: usize,
++    delivered_tokens: Cell<usize>,
++    continuation: Option<SpecContinuation>,
+ }
+ 
+ impl<M: LanguageModel> Row<'_, M> {
+@@ -371,10 +376,13 @@
+             None => Action::Keep,
+         };
+         if action != Action::Keep {
+-            let Row { req: Admitted { parser, out, p, .. }, sink, generated, .. } =
++            let Row { req: Admitted { parser, out, p, .. }, sink, generated, delivered_tokens, .. } =
+                 self;
+             let mut deliver = |t: u32| -> Result<bool> {
+                 let events = parser.push(t)?;
++                if p.mtp2_policy.is_some() && p.stream && super::mtp2::has_transmitted_payload(&events) {
++                    delivered_tokens.set(delivered_tokens.get() + 1);
++                }
+                 out.deliver(events, sink);
+                 Ok(!(sink.cancelled() || parser.stopped || shutdown_cancel))
+             };
+@@ -389,6 +397,9 @@
+             return Ok(());
+         }
+         let events = self.req.parser.push(token)?;
++        if self.req.p.mtp2_policy.is_some() && self.req.p.stream && super::mtp2::has_transmitted_payload(&events) {
++            self.delivered_tokens.set(self.delivered_tokens.get() + 1);
++        }
+         self.req.out.deliver(events, &self.sink);
+         if self.sink.cancelled() || self.req.parser.stopped || shutdown_cancel {
+             self.finish = Some(FinishReason::Callback);
+@@ -502,6 +513,8 @@
+     /// The admitted request's sharing statistics so far (the steps between
+     /// its chunks); its row takes them over.
+     stats: BatchStats,
++    reserved_new_bytes: usize,
++    scratch_bytes: usize,
+ }
+ 
+ impl<M: LanguageModel> PrefillChunks<M> for Interleaved<'_, '_, M> {
+@@ -549,20 +562,23 @@
+             }
+             if fed < tokens.len() {
+                 let between = Instant::now();
+-                let own = session.bytes();
++                let own = session.bytes().max(self.reserved_new_bytes);
+                 // Stretches end where a row finishes (it is answered here),
+                 // and always drained: the next chunk has the GPU and the
+                 // batched scratch to itself. Nothing is admitted meanwhile.
+                 let mut steps = 0;
+                 while steps < DECODE_STEPS_PER_PREFILL_CHUNK && !self.rows.is_empty() {
+-                    let ran = engine.step_rows(
++                    let ran = if engine.mtp2_residency.is_some() {
++                        engine.step_mtp2_rows(self.generator, self.rows, self.slots,
++                            own, super::mtp2::QUANTUM_STEPS, &|| false)
++                    } else { engine.step_rows(
+                         self.generator,
+                         self.rows,
+                         self.slots,
+                         own,
+                         DECODE_STEPS_PER_PREFILL_CHUNK - steps,
+                         &|| false,
+-                    );
++                    ) };
+                     if ran == 0 {
+                         break;
+                     }
+@@ -577,7 +593,7 @@
+ 
+     /// The running rows' sessions.
+     fn in_flight_bytes(&self) -> usize {
+-        Engine::in_flight(self.rows)
++        Engine::in_flight(self.rows) + self.scratch_bytes
+     }
+ 
+     fn batch(&self) -> Option<&BatchStats> {
+@@ -614,12 +630,19 @@
+                     self.start_row(job, seq, &generator, &mut rows, &mut slots);
+                     continue;
+                 }
++                if rows.is_empty() && self.mtp2_residency.is_some() {
++                    job.reject(503, "shared MTP2 session reservation exceeds the configured budget");
++                    continue;
++                }
+                 held = Some(job);
+             }
+             match next_action(rows.len(), held.is_some()) {
+                 Next::Done => break,
+                 Next::Solo { preempt } => {
+-                    self.run_solo(&generator, &mut rows, &mut slots, preempt, queue)
++                    if self.mtp2_residency.is_some() {
++                        self.step_mtp2_rows(&generator, &mut rows, &mut slots, 0,
++                            usize::MAX, &|| preempt && queue.has_waiting());
++                    } else { self.run_solo(&generator, &mut rows, &mut slots, preempt, queue) }
+                 }
+                 Next::Step => {
+                     // A stretch of steps until a row finishes or a waiting
+@@ -628,14 +651,17 @@
+                     // flight only grow), and with every row taken none can.
+                     let can_admit = held.is_none() && rows.len() < self.max_batch;
+                     let admission = || can_admit && queue.has_waiting();
+-                    self.step_rows(
++                    if self.mtp2_residency.is_some() {
++                        self.step_mtp2_rows(&generator, &mut rows, &mut slots, 0,
++                            super::mtp2::QUANTUM_STEPS, &admission);
++                    } else { self.step_rows(
+                         &generator,
+                         &mut rows,
+                         &mut slots,
+                         0,
+                         usize::MAX,
+                         &admission,
+-                    );
++                    ); }
+                 }
+             }
+         }
+@@ -690,7 +716,26 @@
+     /// at most over that growth (one per decode interval, up to the store's
+     /// maximum; none with them off), since the running rows are counted
+     /// with theirs ([`Engine::in_flight`]).
+-    fn fits(&self, job: &Job, rows: &[Row<'_, M>]) -> bool {
++    fn reservation(&self, p: &super::Prepared) -> Result<usize> {
++        let tokens = super::mtp2::endpoint_tokens(p.prompt.len(), p.max_tokens)?;
++        // Include retained prefill+decode snapshots and the temporary new
++        // snapshot before thinning, using the model's MTP-aware rounded helper.
++        let checkpoints = self.sessions.reservation_checkpoints(p.max_tokens);
++        self.model.session_bytes(tokens, checkpoints)
++            .and_then(|n| usize::try_from(n).ok())
++            .and_then(|n| n.checked_add(SPEC_CONTINUATION_RESERVED_BYTES))
++            .ok_or_else(|| anyhow::anyhow!("MTP2 session reservation is unavailable"))
++    }
++
++    fn fits(&mut self, job: &Job, rows: &[Row<'_, M>]) -> bool {
++        if self.mtp2_residency.is_some() {
++            let Ok(incoming) = self.reservation(&job.prepared) else { return false };
++            let active = Self::in_flight(rows);
++            if rows.len() >= self.max_batch || !super::mtp2::reservations_fit(
++                active, incoming, self.mtp2_scratch_bytes, self.sessions.budget_bytes()) { return false; }
++            return self.sessions.reserve_endpoint(&self.ctx,
++                active + incoming + self.mtp2_scratch_bytes);
++        }
+         let growth = job.prepared.max_tokens.min(ADMIT_GROWTH_TOKENS);
+         let tokens = (job.prepared.prompt.len() + growth)
+             .min(job.prepared.context_tokens(self.max_seq));
+@@ -710,7 +755,136 @@
+     /// counts as in flight: their sessions and the decode checkpoints they
+     /// took so far ([`Admitted::bytes`]).
+     fn in_flight(rows: &[Row<'_, M>]) -> usize {
+-        rows.iter().map(|r| r.req.bytes()).sum()
++        super::mtp2::sum_reservations(rows.iter().map(|r|
++            r.req.bytes().saturating_add(r.continuation.as_ref().map_or(0, SpecContinuation::allocated_bytes))
++                .max(r.reserved_bytes)))
++    }
++
++    /// The same settled MTP2 dispatch is used by normal peers and by the
++    /// decode gaps between a newcomer's prefill chunks. Never decode_rows.
++    fn step_mtp2_rows<'g>(
++        &mut self, generator: &'g Generator, rows: &mut Vec<Row<'g, M>>,
++        slots: &mut Slots, extra_in_flight: usize, max_steps: usize,
++        waiting: &dyn Fn() -> bool,
++    ) -> usize {
++        if rows.is_empty() { return 0; }
++        let mut row = rows.remove(0);
++        let result = self.try_mtp2_quantum(generator, &mut row, max_steps, waiting);
++        match result {
++            Ok(steps) => {
++                if row.finish.is_some() {
++                    let others = Self::in_flight(rows) + extra_in_flight + self.mtp2_scratch_bytes;
++                    self.finish_row(row, slots, others);
++                } else { rows.push(row); }
++                steps.max(1)
++            }
++            Err(error) => {
++                // All pass locals dropped before this point. Discard the row's
++                // pending state before any peer takes the shared scratch.
++                let _ = self.model.release_parked(&self.scratch);
++                let fault = self.ctx.fault();
++                self.fail_row(row, slots, fault.as_deref(), &error);
++                1
++            }
++        }
++    }
++
++    fn try_mtp2_quantum(
++        &mut self, generator: &Generator, row: &mut Row<'_, M>,
++        max_steps: usize, waiting: &dyn Fn() -> bool,
++    ) -> Result<usize> {
++        if row.sink.cancelled() || row.req.parser.stopped || self.shutdown.cancel() {
++            if let Some(saved) = &mut row.continuation { saved.invalidate(); }
++            row.finish = Some(FinishReason::Callback); return Ok(0);
++        }
++        ensure!(row.req.session.state.pos() == row.req.facts.n + row.generated.len() - 1,
++            "MTP2 row resumed without its last-unfed draw");
++        self.model.move_sampler_counts(&self.ctx, &mut self.scratch,
++            CountsSlot::Batch(row.slot), CountsSlot::Engine)?;
++        let before = row.generated.len();
++        let scope = SpecContinuationScope::new(&row.sink.metadata.request_id,
++            &self.mtp2_residency.as_ref().expect("candidate").allocation_id, row.slot)?;
++        let mut used_steps = 0;
++        let outcome = {
++            let Engine { ctx, model, scratch, shutdown, mtp2_step_id, mtp2_residency, .. } = self;
++            let Row { req: Admitted { p, parser, out, session, decode_checkpoints, thinking, .. },
++                sink, generated, step_index, drafted, accepted, delivered_tokens, continuation, .. } = row;
++            let options = GenerateOptions { max_tokens: p.max_tokens, sampling: &p.sampling,
++                stop_tokens: &[], drafts: super::mtp2::DRAFTS, thinking: thinking.as_ref() };
++            let mut control = super::mtp2::QuantumControl { request_id: &sink.metadata.request_id,
++                epoch: &mtp2_residency.as_ref().expect("candidate").allocation_id,
++                step_id: mtp2_step_id, step_index, base_drafted: *drafted,
++                base_accepted: *accepted, steps: 0, max_steps, waiting,
++                delivered: delivered_tokens, delivered_checkpoint: delivered_tokens.get() };
++            let outcome = generator.resume_mtp2_controlled(ctx, model, &mut session.state,
++                scratch, generated, &options, Some(decode_checkpoints),
++                &mut |token| {
++                    let events = parser.push(token)?;
++                    if p.stream && super::mtp2::has_transmitted_payload(&events) {
++                        delivered_tokens.set(delivered_tokens.get() + 1);
++                    }
++                    out.deliver(events, sink);
++                    Ok(!sink.cancelled() && !parser.stopped && !shutdown.cancel())
++                }, &mut control, continuation.as_mut().ok_or_else(||
++                    anyhow::anyhow!("MTP2 continuation storage is unavailable"))?, &scope)?;
++            used_steps += control.steps;
++            outcome
++        };
++        match outcome {
++            ControlledSpec::Finished(result) => {
++                row.drafted += result.drafted; row.accepted += result.accepted;
++                row.finish = Some(result.finish);
++            }
++            ControlledSpec::Yield { kind, drafted, accepted } => {
++                row.drafted += drafted; row.accepted += accepted;
++                ensure!(row.req.session.state.pos() == row.req.facts.n + row.generated.len() - 1,
++                    "MTP2 yielded state is not at rest");
++                if kind == SpecYield::PhysicalTail {
++                    let start = row.req.session.state.pos();
++                    ensure!(super::mtp2::RESIDENT_CONTEXT_TOKENS - start < super::mtp2::PHYSICAL_TAIL_RESERVE
++                        && row.req.p.max_tokens - row.generated.len() < super::mtp2::PHYSICAL_TAIL_RESERVE,
++                        "MTP2 tail escaped its physical boundary");
++                    let options = GenerateOptions { max_tokens: row.req.p.max_tokens,
++                        sampling: &row.req.p.sampling, stop_tokens: &[], drafts: 0,
++                        thinking: row.req.thinking.as_ref() };
++                    let old_len = row.generated.len();
++                    let sink = &row.sink;
++                    let parser = &mut row.req.parser;
++                    let out = &mut row.req.out;
++                    let tail = generator.resume(&self.ctx, &self.model, &mut row.req.session.state,
++                        &mut self.scratch, &mut row.generated, &options,
++                        Some(&mut row.req.decode_checkpoints), &mut |token| {
++                            let events = parser.push(token)?;
++                            if row.req.p.stream && super::mtp2::has_transmitted_payload(&events) {
++                                row.delivered_tokens.set(row.delivered_tokens.get() + 1);
++                            }
++                            out.deliver(events, sink);
++                            Ok(!sink.cancelled() && !parser.stopped && !self.shutdown.cancel())
++                        })?;
++                    let expected = row.req.facts.n + row.generated.len() - 1;
++                    ensure!(row.req.session.state.pos() == expected + usize::from(tail.parked_draw.is_some()),
++                        "MTP2 tail state/draw mismatch");
++                    row.finish = Some(tail.finish);
++                    eprintln!("{}", super::mtp2::TailEvidence { tokens: row.generated.len() - old_len,
++                        start_position: start, end_position: row.req.session.state.pos(),
++                        generated_tokens: row.generated.len() }.line(&row.sink.metadata.request_id));
++                } else {
++                    row.stats.preemptions += 1;
++                    eprintln!("[lily-meta] request_id={} phase=mtp2_yield resident_epoch={} generated_tokens={} position={} reason=complete_quantum",
++                        row.sink.metadata.request_id, self.mtp2_residency.as_ref().unwrap().allocation_id,
++                        row.generated.len(), row.req.session.state.pos());
++                }
++            }
++        }
++        row.stats.solo_tokens += row.generated.len() - before;
++        if row.finish.is_none() {
++            self.model.move_sampler_counts(&self.ctx, &mut self.scratch,
++                CountsSlot::Engine, CountsSlot::Batch(row.slot))?;
++        }
++        ensure!(row.req.bytes().checked_add(row.continuation.as_ref()
++            .map_or(0, SpecContinuation::allocated_bytes)).is_some_and(|n| n <= row.reserved_bytes),
++            "MTP2 actual state exceeded its endpoint reservation");
++        Ok(used_steps)
+     }
+ 
+     /// Runs the one row in the single-session loop until it finishes or, with
+@@ -1027,6 +1201,12 @@
+         rows: &mut Vec<Row<'g, M>>,
+         slots: &mut Slots,
+     ) {
++        let reserved_new_bytes = if self.mtp2_residency.is_some() {
++            match self.reservation(&job.prepared) {
++                Ok(bytes) => bytes,
++                Err(_) => { job.reject(503, "shared MTP2 reservation is unavailable"); return; }
++            }
++        } else { 0 };
+         let Opened { p, mut sink, in_flight, queued } = self.open(job);
+         let stream = p.stream;
+         if sink.cancelled() {
+@@ -1034,7 +1214,8 @@
+             return;
+         }
+         let mut interleaved =
+-            Interleaved { generator, rows, slots, stats: BatchStats::default() };
++            Interleaved { generator, rows, slots, stats: BatchStats::default(), reserved_new_bytes,
++                scratch_bytes: self.mtp2_scratch_bytes };
+         let admitted = self.admit(
+             p,
+             &mut sink,
+@@ -1090,6 +1271,7 @@
+                 return;
+             }
+         };
++        let produced_ns = if self.mtp2_residency.is_some() { super::mtp2::monotonic_ns() } else { 0 };
+         let mut row = Row {
+             seq,
+             req,
+@@ -1103,13 +1285,65 @@
+             stats,
+             finish: None,
+             inserted: false,
++            reserved_bytes: reserved_new_bytes,
++            step_index: 0,
++            delivered_tokens: Cell::new(0),
++            continuation: None,
+         };
++        if row.req.p.mtp2_policy.is_some() {
++            let scope = match SpecContinuationScope::new(&row.sink.metadata.request_id,
++                &self.mtp2_residency.as_ref().expect("candidate").allocation_id, row.slot) {
++                Ok(scope) => scope,
++                Err(error) => { self.fail_row(row, slots, None, &error); return; }
++            };
++            let allocated = self.model.require_spec_continuation()
++                .and_then(|()| SpecContinuation::new(&self.ctx, scope));
++            row.continuation = match allocated {
++                Ok(saved) => Some(saved),
++                Err(error) => { self.fail_row(row, slots, None, &error); return; }
++            };
++            // A cache checkout can retain a larger capacity and more old
++            // snapshots than the logical endpoint; preserve that actual state.
++            let tokens = super::mtp2::endpoint_tokens(row.req.p.prompt.len(), row.req.p.max_tokens)
++                .expect("validated reservation").max(row.req.session.state.capacity());
++            let checkpoints = row.req.session.retained_checkpoints()
++                + self.sessions.decode_checkpoints_within(row.req.p.max_tokens);
++            let forecast = match super::mtp2::known_reservation(self.model.session_bytes(tokens, checkpoints))
++                .and_then(|n| n.checked_add(SPEC_CONTINUATION_RESERVED_BYTES)
++                    .ok_or_else(|| anyhow::anyhow!("MTP2 continuation reservation overflow"))) {
++                Ok(bytes) => bytes,
++                Err(error) => { self.fail_row(row, slots, None, &error); return; }
++            };
++            row.reserved_bytes = row.reserved_bytes.max(row.req.bytes()
++                .saturating_add(SPEC_CONTINUATION_RESERVED_BYTES)).max(forecast);
++            if !super::mtp2::reservations_fit(Self::in_flight(rows), row.reserved_bytes,
++                self.mtp2_scratch_bytes, self.sessions.budget_bytes()) {
++                let error = anyhow::anyhow!("shared MTP2 checkout reservation exceeds the configured budget");
++                self.fail_row(row, slots, None, &error); return;
++            }
++        }
+         // The first draw may be where thinking ends (see
+         // `Generator::generate_checkpointed`): what is inserted is fed here.
+         let mut taken =
+             row.take_draw(first, generator, self.shutdown.cancel()).and_then(|()| {
+                 row.feed_inserted(&self.ctx, &self.model, &mut self.scratch)
+             });
++        if let Some(residency) = &self.mtp2_residency {
++            self.mtp2_step_id += 1; row.step_index = 1;
++            let settled_ns = super::mtp2::monotonic_ns();
++            eprintln!("[lily-meta] request_id={} native_request_id={} response_id={} phase=mtp2_step protocol=1 clock={} produced_ns={produced_ns} settled_ns={settled_ns} resident_epoch={} step_id={} step_index=1 step_mode=initial_draw reason=first_trunk_draw draft_count=0 draft_tokens_proposed=0 draft_tokens_accepted=0 generated_token_start=1 generated_token_count=1 generated_tokens={} delivered_token_count={} cumulative_delivered={} cumulative_drafted=0 cumulative_accepted=0 position={}",
++                row.sink.metadata.request_id, row.sink.metadata.request_id, row.req.out.id,
++                super::mtp2::CLOCK,
++                residency.allocation_id, self.mtp2_step_id, row.generated.len(),
++                row.delivered_tokens.get().min(1), row.delivered_tokens.get(), row.req.session.state.pos());
++            eprintln!("[lily-meta] request_id={} phase=mtp2_reservation reservation_bytes={} allocated_session_bytes={} allocated_capacity={} scratch_bytes={}",
++                row.sink.metadata.request_id, row.reserved_bytes, row.req.bytes(),
++                row.req.session.state.capacity(), self.mtp2_scratch_bytes);
++            eprintln!("[lily-meta] request_id={} phase=mtp2_continuation_budget logical_bytes={} allocated_bytes={} reserved_bytes={}",
++                row.sink.metadata.request_id, crate::engine::SPEC_CONTINUATION_LOGICAL_BYTES,
++                row.continuation.as_ref().map_or(0, SpecContinuation::allocated_bytes),
++                SPEC_CONTINUATION_RESERVED_BYTES);
++        }
+         if taken.is_ok() && row.finish.is_none() {
+             taken = self.model.move_sampler_counts(
+                 &self.ctx,
+diff --git a/src/serve/mtp2.rs b/src/serve/mtp2.rs
+--- a/src/serve/mtp2.rs
++++ b/src/serve/mtp2.rs
+@@ -20,6 +20,11 @@
+ pub const RESIDENT_CONTEXT_TOKENS: usize = 262_144;
+ pub const OUTPUT_TOKENS: usize = 65_536;
+ pub const DRAFTS: usize = 2;
++
++/// Shared boot-relative mach_absolute_time clock, converted by Lily's existing
++/// Metal host-clock helper. This is never an Instant elapsed/process origin.
++pub(super) const CLOCK: &str = "mach_absolute_time_ns";
++pub(crate) fn monotonic_ns() -> u64 { (crate::metal::host_secs() * 1_000_000_000.0) as u64 }
+ // Pinned verify: m=(1+k), ahead_rows=2*(1+chain), ensure_room adds MAX_DRAFTS.
+ // The candidate fixes k=chain=2; changing that contract needs a new audit.
+ pub const PHYSICAL_TAIL_RESERVE: usize =
+@@ -189,6 +194,7 @@
+     pub buffer_count: usize,
+     pub allocation_bytes: u64,
+     pub paged_weight_bytes: u64,
++    pub max_batch: usize,
+ }
+ 
+ // `fetch_update` is kept for the crate's Rust 1.92 MSRV.
+@@ -265,6 +271,7 @@
+             buffer_count: seen.len(),
+             allocation_bytes: bytes,
+             paged_weight_bytes,
++            max_batch: 1,
+         })
+     }
+ }
+@@ -272,7 +279,8 @@
+ impl WeightResidency {
+     pub(super) fn resident_line(&self) -> String {
+         format!(
+-            "LILY_MTP2_RESIDENT protocol=1 resident_context_tokens={RESIDENT_CONTEXT_TOKENS} kv_cache=bf16 mtp_drafts={DRAFTS} max_batch=1 weight_load_generation={} weight_load_count={} weight_allocation_id={} weight_buffer_count={} weight_allocation_bytes={} paged_weight_bytes={}",
++            "LILY_MTP2_RESIDENT protocol=1 resident_context_tokens={RESIDENT_CONTEXT_TOKENS} kv_cache=bf16 mtp_drafts={DRAFTS} max_batch={} weight_load_generation={} weight_load_count={} weight_allocation_id={} weight_buffer_count={} weight_allocation_bytes={} paged_weight_bytes={}",
++            self.max_batch,
+             self.generation,
+             self.load_count,
+             self.allocation_id,
+@@ -289,8 +297,9 @@
+         prompt_tokens: usize,
+         output_tokens: usize,
+     ) -> String {
++        let admitted_ns = monotonic_ns();
+         format!(
+-            "[lily-meta] request_id={request_id} phase=mtp2_policy protocol=1 profile_id={} context_tokens={} prompt_tokens={prompt_tokens} output_tokens={output_tokens} resident_context_tokens={RESIDENT_CONTEXT_TOKENS} weight_load_generation={} weight_load_count={} weight_allocation_id={} mtp_drafts={DRAFTS}",
++            "[lily-meta] request_id={request_id} phase=mtp2_policy protocol=1 clock={CLOCK} admitted_ns={admitted_ns} profile_id={} context_tokens={} prompt_tokens={prompt_tokens} output_tokens={output_tokens} resident_context_tokens={RESIDENT_CONTEXT_TOKENS} weight_load_generation={} weight_load_count={} weight_allocation_id={} mtp_drafts={DRAFTS}",
+             policy.profile().id(),
+             policy.context_tokens(),
+             self.generation,
+@@ -298,6 +307,88 @@
+             self.allocation_id
+         )
+     }
++}
++
++pub(super) const QUANTUM_STEPS: usize = 1;
++
++/// Endpoint reservation grows only in accounting. The model still allocates
++/// caches for the actual prompt and grows them lazily in its 8192-token grid.
++pub(super) fn endpoint_tokens(prompt: usize, output: usize) -> Result<usize> {
++    ensure!(prompt > 0 && output > 0 && output <= OUTPUT_TOKENS,
++        "invalid MTP2 reservation token budget");
++    let endpoint = prompt.checked_add(output).context("MTP2 reservation overflow")?;
++    ensure!(endpoint <= RESIDENT_CONTEXT_TOKENS, "MTP2 reservation exceeds resident context");
++    Ok(endpoint.saturating_add(PHYSICAL_TAIL_RESERVE).min(RESIDENT_CONTEXT_TOKENS))
++}
++
++pub(super) fn reservations_fit(active: usize, incoming: usize, scratch: usize, budget: usize) -> bool {
++    active.checked_add(incoming).and_then(|n| n.checked_add(scratch))
++        .is_some_and(|need| need <= budget)
++}
++
++pub(super) fn snapshot_peak(retained_prefill: usize, retained_decode: usize, new_decode: usize) -> usize {
++    retained_prefill + retained_decode + 1 + new_decode
++}
++
++pub(super) fn known_reservation(bytes: Option<u64>) -> Result<usize> {
++    bytes.and_then(|n| usize::try_from(n).ok())
++        .context("shared MTP2 resource reservation is unavailable")
++}
++
++pub(super) fn sum_reservations(bytes: impl IntoIterator<Item = usize>) -> usize {
++    bytes.into_iter().fold(0, usize::saturating_add)
++}
++
++/// One controller lives only while a row owns the scratch. Its log records
++/// actual generation updates after the committed verify/draft settles.
++pub(super) struct QuantumControl<'a> {
++    pub request_id: &'a str,
++    pub epoch: &'a str,
++    pub step_id: &'a mut u64,
++    pub step_index: &'a mut usize,
++    pub base_drafted: usize,
++    pub base_accepted: usize,
++    pub steps: usize,
++    pub max_steps: usize,
++    pub waiting: &'a dyn Fn() -> bool,
++    pub delivered: &'a std::cell::Cell<usize>,
++    pub delivered_checkpoint: usize,
++}
++
++impl crate::generate::SpecStepControl for QuantumControl<'_> {
++    fn wants_yield(&self) -> bool { self.steps + 1 >= self.max_steps || (self.waiting)() }
++
++    fn settled(&mut self, step: crate::generate::SpecStep) -> Result<()> {
++        let settled_ns = monotonic_ns();
++        ensure!(step.produced_ns > 0 && step.produced_ns <= settled_ns,
++            "MTP2 completed step clock is invalid");
++        ensure!(step.draft_count == DRAFTS && step.proposed == DRAFTS,
++            "normal MTP2 quantum did not propose two drafts");
++        ensure!(step.generated_count > 0 && step.generated_start > 0
++            && step.generated_start - 1 + step.generated_count == step.generated_total
++            && step.accepted <= step.proposed,
++            "MTP2 step generation range is invalid");
++        *self.step_id = self.step_id.checked_add(1).context("MTP2 step counter overflow")?;
++        *self.step_index = self.step_index.checked_add(1).context("MTP2 row step counter overflow")?;
++        self.steps += 1;
++        let delivered = self.delivered.get() - self.delivered_checkpoint;
++        self.delivered_checkpoint = self.delivered.get();
++        let mode = if step.thinking_control { "thinking_control" } else { "normal" };
++        eprintln!("[lily-meta] request_id={} phase=mtp2_step protocol=1 clock={CLOCK} produced_ns={} settled_ns={settled_ns} resident_epoch={} step_id={} step_index={} step_mode={mode} draft_count={} draft_tokens_proposed={} draft_tokens_accepted={} generated_token_start={} generated_token_count={} generated_tokens={} delivered_token_count={delivered} cumulative_delivered={} cumulative_drafted={} cumulative_accepted={} position={}",
++            self.request_id, step.produced_ns,
++            self.epoch, self.step_id, self.step_index, step.draft_count,
++            step.proposed, step.accepted, step.generated_start, step.generated_count,
++            step.generated_total, self.delivered.get(), self.base_drafted + step.cumulative_drafted,
++            self.base_accepted + step.cumulative_accepted, step.position);
++        Ok(())
++    }
++}
++
++pub(super) fn has_transmitted_payload(events: &[super::stream::Event]) -> bool {
++    events.iter().any(|event| match event {
++        super::stream::Event::Reasoning(text) | super::stream::Event::Content(text) => !text.is_empty(),
++        super::stream::Event::ToolCall(call) => !call.arguments.is_empty(),
++    })
+ }
+ 
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+diff --git a/src/serve/request.rs b/src/serve/request.rs
+--- a/src/serve/request.rs
++++ b/src/serve/request.rs
+@@ -1271,6 +1271,10 @@
+             let cancelled = sink.cancelled();
+             if let Some(line) = sink.metadata.release(Instant::now(), cancelled) {
+                 eprintln!("{line}");
++                if let Some(resident) = &self.mtp2_residency {
++                    eprintln!("[lily-meta] request_id={} phase=mtp2_released clock={} released_ns={} resident_epoch={} cancelled={cancelled}",
++                        sink.metadata.request_id, super::mtp2::CLOCK, super::mtp2::monotonic_ns(), resident.allocation_id);
++                }
+             }
+         }
+         fault
+diff --git a/src/serve/session.rs b/src/serve/session.rs
+--- a/src/serve/session.rs
++++ b/src/serve/session.rs
+@@ -576,6 +576,8 @@
+         self.state.bytes() + self.checkpoints.iter().map(|c| c.bytes()).sum::<usize>()
+     }
+ 
++    pub(super) fn retained_checkpoints(&self) -> usize { self.checkpoints.len() }
++
+     /// The best position to resume `prompt` from: the live end when the
+     /// session is a strict prefix of the prompt, else the latest checkpoint
+     /// within the shared prefix. Never `>= prompt.len()`.
+@@ -909,6 +911,13 @@
+         )
+     }
+ 
++    pub(super) fn reservation_checkpoints(&self, output: usize) -> usize {
++        // A cached live-end continuation retains the prior decode snapshots
++        // until release, while its new DecodeCheckpoints are held separately.
++        super::mtp2::snapshot_peak(self.max_checkpoints, self.max_decode_checkpoints,
++            self.decode_checkpoints_within(output))
++    }
++
+     /// Counts `bytes` of sessions that other requests hold checked out
+     /// against the budget from now on: the store cannot evict them, so it
+     /// makes room among the resident sessions instead. The batch scheduler
+@@ -916,6 +925,15 @@
+     /// requests in flight; one request at a time leaves it at 0.
+     pub fn set_in_flight_bytes(&mut self, bytes: usize) {
+         self.in_flight_bytes = bytes;
++    }
++
++    /// Candidate reservation is carved out before any newcomer allocates or
++    /// forks a state. Only this store's inactive sessions can be evicted.
++    pub(super) fn reserve_endpoint(&mut self, ctx: &MetalContext, bytes: usize) -> bool {
++        if bytes > self.budget_bytes { return false; }
++        self.in_flight_bytes = bytes;
++        self.trim(ctx, 0);
++        true
+     }
+ 
+     /// Whether the store writes sessions ahead.
+diff --git a/tests/unit/engine.rs b/tests/unit/engine.rs
+--- a/tests/unit/engine.rs
++++ b/tests/unit/engine.rs
+@@ -1,6 +1,42 @@
+ use std::sync::atomic::AtomicBool;
+ 
+ use super::*;
++
++#[test]
++fn continuation_binding_rejects_cross_request_epoch_slot_position_index_token_and_sampling() {
++    let scope = SpecContinuationScope::new("synthetic-own", "synthetic-epoch", 0).unwrap();
++    let params = SamplingParams::greedy();
++    let header = SpecContinuationHeader::new(&scope, 111, 32, 17, &params);
++    header.validate(&header).unwrap();
++    let mut cases = Vec::new();
++    for (request, epoch, slot) in [("synthetic-peer", "synthetic-epoch", 0),
++        ("synthetic-own", "other-epoch", 0), ("synthetic-own", "synthetic-epoch", 1)] {
++        cases.push(SpecContinuationHeader::new(&SpecContinuationScope::new(request, epoch, slot).unwrap(),
++            111, 32, 17, &params));
++    }
++    cases.push(SpecContinuationHeader::new(&scope, 112, 32, 17, &params));
++    cases.push(SpecContinuationHeader::new(&scope, 111, 33, 17, &params));
++    cases.push(SpecContinuationHeader::new(&scope, 111, 32, 19, &params));
++    for changed in [SamplingParams { seed: 7, ..params },
++        SamplingParams { temperature: 1.0, ..params },
++        SamplingParams { top_k: 20, ..params }, SamplingParams { top_p: 0.95, ..params },
++        SamplingParams { min_p: 0.1, ..params }, SamplingParams { presence_penalty: 1.5, ..params },
++        SamplingParams { frequency_penalty: 1.5, ..params },
++        SamplingParams { repetition_penalty: 1.5, ..params }] {
++        cases.push(SpecContinuationHeader::new(&scope, 111, 32, 17, &changed));
++    }
++    for stale in cases { assert!(header.validate(&stale).is_err()); }
++    assert!(SpecContinuationScope::new("", "synthetic-epoch", 0).is_err());
++    assert!(SpecContinuationScope::new("synthetic-own", "", 0).is_err());
++    assert!(SpecContinuationScope::new("synthetic-own", "synthetic-epoch", 2).is_err());
++}
++
++#[test]
++fn continuation_reservation_charges_three_pages_above_logical_two_slot_payload() {
++    assert_eq!(SPEC_CONTINUATION_LOGICAL_BYTES, 16_392);
++    assert_eq!(SPEC_CONTINUATION_RESERVED_BYTES, 196_608);
++    assert!(SPEC_CONTINUATION_RESERVED_BYTES > SPEC_CONTINUATION_LOGICAL_BYTES);
++}
+ 
+ fn written(segments: &[Segment], cancel: Option<&AtomicBool>) -> Result<Vec<u8>> {
+     let mut out = Vec::new();
+diff --git a/tests/unit/qwen4exp/spec.rs b/tests/unit/qwen4exp/spec.rs
+--- a/tests/unit/qwen4exp/spec.rs
++++ b/tests/unit/qwen4exp/spec.rs
+@@ -26,6 +26,443 @@
+         .expect("read prefix");
+     dst.restore(ctx, &snap).expect("restore");
+     dst
++}
++
++/// Explicit V16 observer; never part of a normal serving/performance binary.
++mod v16 {
++    use super::*;
++    use std::collections::BTreeMap;
++    use crate::engine::{CountsSlot, DecodeStateApi, SpecContinuation, SpecContinuationScope};
++    use crate::generate::{ControlledSpec, FinishReason, GenerateOptions, Generator,
++        SpecStep, SpecStepControl, SpecYield};
++    use crate::kernels::attention::KvFormat;
++    use crate::kernels::sample::SamplerScratch;
++
++    type Observation = BTreeMap<String, Vec<u8>>;
++
++    fn digest(bytes: &[u8]) -> String {
++        let mut hash = crate::sha256::Sha256::new();
++        hash.update(bytes);
++        hash.finish().iter().map(|byte| format!("{byte:02x}")).collect()
++    }
++
++    fn prefix_geometry(state: &DecodeState) -> Vec<serde_json::Value> {
++        let mut regions = Vec::new();
++        let mut cursor = 0usize;
++        for (layer, lstate) in state.layers.iter().enumerate()
++            .map(|(i, l)| (format!("trunk_layer_{i}"), l))
++            .chain(state.mtp.iter().map(|m| ("draft_head".to_owned(), &m.layer))) {
++            let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate else { continue };
++            let capacity = k_cache.values.shape()[1];
++            let blocks = blk_keys.shape()[0];
++            assert!(blocks > 0 && capacity.is_multiple_of(blocks));
++            let ratio = capacity / blocks;
++            for (store, tensor) in [("K", &k_cache.values), ("V", &v_cache.values),
++                ("indexer_keys", idx_keys), ("block_keys", blk_keys)] {
++                let shape = tensor.shape();
++                let element_bytes = tensor.dtype().size();
++                assert_eq!(element_bytes, 2, "V16 BF16 prefix geometry");
++                let width = *shape.last().expect("V16 tensor width");
++                let heads = if shape.len() == 3 { shape[0] } else { 1 };
++                let rows = if store == "block_keys" { state.pos.div_ceil(ratio) } else { state.pos };
++                for head in 0..heads {
++                    let bytes = rows * width * element_bytes;
++                    regions.push(serde_json::json!({"label":format!("{layer}.{store}.head{head}"),
++                        "layer":layer,"store":store,"head":head,"tensor_shape":shape,
++                        "state_position":state.pos,"capacity":capacity,"compress_ratio":ratio,
++                        "rows":rows,"row_bytes":width*element_bytes,"element_bytes":element_bytes,
++                        "serialized_start":cursor,"serialized_end":cursor+bytes}));
++                    cursor += bytes;
++                }
++            }
++        }
++        regions
++    }
++
++    fn prefix_location(observation: &Observation, offset: usize) -> Option<serde_json::Value> {
++        let geometry: Vec<serde_json::Value> = serde_json::from_slice(observation.get("prefix_geometry")?).ok()?;
++        let mut region = geometry.into_iter().find(|r| {
++            let start = r["serialized_start"].as_u64().unwrap_or(u64::MAX) as usize;
++            let end = r["serialized_end"].as_u64().unwrap_or(0) as usize;
++            start <= offset && offset < end
++        })?;
++        let local = offset - region["serialized_start"].as_u64()? as usize;
++        let row_bytes = region["row_bytes"].as_u64()? as usize;
++        let element = region["element_bytes"].as_u64()? as usize;
++        if row_bytes == 0 || element == 0 { return None; }
++        region["row"] = (local / row_bytes).into();
++        region["column"] = ((local % row_bytes) / element).into();
++        region["element_byte"] = (local % element).into();
++        region["within_fed_prefix"] = (region["store"] != "block_keys"
++            && local / row_bytes < region["state_position"].as_u64()? as usize).into();
++        Some(region)
++    }
++
++    fn fixture_prompts(dir: &Path) -> [Vec<u32>; 2] {
++        use crate::serve::api::{ChatRequest, Defaults, ImagePolicy,
++            ThinkingDefaults, prepare_chat_with_policy};
++        let path = std::env::var("LILIUXFLOW_V16_FIXTURE_PATH")
++            .expect("V16 explicit frozen G2 synthetic fixture");
++        let bytes = std::fs::read(path).expect("V16 fixture read");
++        let mut hash = crate::sha256::Sha256::new();
++        hash.update(&bytes);
++        let digest: String = hash.finish().iter().map(|byte| format!("{byte:02x}")).collect();
++        assert_eq!(digest, "9a2515517e1c65f92bd71644753d5af3e09f189a2efce367de9bd5beb88bca03",
++            "V16 accepts only the exact proven G2 pair-0 fixture");
++        let payloads: serde_json::Value = serde_json::from_slice(&bytes).expect("V16 fixture JSON");
++        assert_eq!(payloads.as_object().expect("V16 fixture object").len(), 2);
++        let generator = Generator::from_model_dir(dir).expect("V16 CPU tokenizer");
++        let defaults = Defaults { sampling: SamplingParams::greedy(), thinking: true,
++            reasoning_effort: None, thinking_controls: ThinkingDefaults::default() };
++        let mut prompts = Vec::new();
++        for side in ["A", "B"] {
++            let payload = &payloads[side];
++            assert_eq!(payload["liliuxflow_profile"].as_str(), Some("ctx64k-mtp2"));
++            let request: ChatRequest = serde_json::from_value(payload.clone()).expect("V16 ChatRequest");
++            let prepared = prepare_chat_with_policy(request, generator.tokenizer(), &defaults,
++                crate::serve::mtp2::RESIDENT_CONTEXT_TOKENS,
++                &ImagePolicy::unavailable("V16 text-only fixture"),
++                crate::serve::mtp2::PolicyMode::SharedMtp2).expect("V16 native preparation");
++            assert!(prepared.thinking_open, "V16 must retain checkpoint high thinking");
++            assert_eq!(prepared.max_tokens, 2048, "V16 frozen G2 request budget");
++            assert_eq!(prepared.prompt.len(), 80, "V16 exact native template token count");
++            let conversation = serde_json::from_value(payload["messages"].clone())
++                .expect("V16 exact native chat messages");
++            let direct = generator.encode_chat(&conversation, crate::generate::Thinking::Enabled)
++                .expect("V16 pinned Generator chat encoding");
++            assert!(prepared.prompt == direct, "V16 native/Generator template mismatch");
++            prompts.push(prepared.prompt);
++        }
++        [prompts.remove(0), prompts.remove(0)]
++    }
++
++    #[test]
++    #[ignore = "explicit full tokenizer and frozen synthetic G2 fixture; CPU only, no model/Metal"]
++    fn frozen_g2_chat_fixture_has_exact_native_template_counts_cpu() {
++        let dir = std::env::var("LILIUXFLOW_V16_MODEL_DIR").expect("V16 explicit tokenizer metadata");
++        let [own, peer] = fixture_prompts(Path::new(&dir));
++        assert!(own != peer, "V16 fixtures must be distinct requests");
++        eprintln!("V16_FIXTURE native_template_tokens_A={} native_template_tokens_B={} thinking_open=true fixture_sha256=9a2515517e1c65f92bd71644753d5af3e09f189a2efce367de9bd5beb88bca03 GPU=NOT_RUN",
++            own.len(), peer.len());
++    }
++
++    fn at_rest(state: &DecodeState, scratch: &Scratch, base: usize, drawn: usize) {
++        assert!(state.spec.is_none(), "V16: SpecPending survived a boundary");
++        assert_eq!(scratch.sync.armed(), 0, "V16: shared StepSync is armed");
++        assert_eq!(state.pos, base + drawn - 1, "V16: last draw is not unfed");
++    }
++
++    fn observe(state: &DecodeState, counts: &SamplerScratch,
++        drawn: &[u32], params: &SamplingParams) -> Observation {
++        assert!(state.spec.is_none(), "V16 observer needs a settled state");
++        let mut out = Observation::new();
++        // prefix_layout visits every attention layer AND the draft-head layer.
++        // Snapshot-only/recurrent-only comparisons would miss these caches.
++        let mut prefix = Vec::new();
++        state.write_prefix(state.pos, &mut prefix).expect("V16 active prefix");
++        let geometry = prefix_geometry(state);
++        assert_eq!(geometry.last().unwrap()["serialized_end"].as_u64().unwrap() as usize,
++            prefix.len(), "V16 runtime geometry must match the pinned serialized layout");
++        for region in &geometry {
++            let start = region["serialized_start"].as_u64().unwrap() as usize;
++            let end = region["serialized_end"].as_u64().unwrap() as usize;
++            out.insert(format!("prefix_segment_{}", region["label"].as_str().unwrap()),
++                prefix[start..end].to_vec());
++        }
++        out.insert("prefix_geometry".into(), serde_json::to_vec(&geometry).unwrap());
++        out.insert("active_kv_and_draft_kv".into(), prefix);
++        for (i, layer) in state.layers.iter().enumerate() {
++            if let LayerState::Gdn { state, conv_windows } = layer {
++                out.insert(format!("gdn_{i}"), state.raw_bytes().to_vec());
++                for (slot, window) in conv_windows.iter().enumerate() {
++                    out.insert(format!("conv_{i}_slot_{slot}"), window.raw_bytes().to_vec());
++                }
++            }
++        }
++        let ple = state.ple.as_ref().expect("V16 requires PLE coverage");
++        out.insert("ple_history".into(), bytemuck::cast_slice(&ple.hist).to_vec());
++        for (slot, window) in ple.conv_windows.iter().enumerate() {
++            out.insert(format!("ple_conv_slot_{slot}"), window.raw_bytes().to_vec());
++        }
++        out.insert("draft_hidden".into(), state.mtp.as_ref().expect("V16 draft state")
++            .hidden.raw_bytes().to_vec());
++        out.insert("sampler_counts".into(), counts.counts_bytes_for_test().to_vec());
++        out.insert("drawn_tokens_internal_only".into(), bytemuck::cast_slice(drawn).to_vec());
++        out.insert("position_capacity_conv_slot".into(), bytemuck::cast_slice(&[
++            state.pos as u64, state.capacity() as u64, state.conv_slot as u64,
++            state.rope_delta as u64, drawn.len() as u64]).to_vec());
++        // Sampling is counter-based: seed + generated draw index, not a mutable
++        // global RNG object. Compare all sampling inputs as well as counts.
++        out.insert("sampling_seed_and_draw_index".into(),
++            format!("{params:?};draw_index={}", drawn.len()).into_bytes());
++        out
++    }
++
++    fn first_mismatch(a: &Observation, b: &Observation) -> Option<String> {
++        if a.keys().ne(b.keys()) { return Some("component_set".into()); }
++        a.iter().find_map(|(name, bytes)| {
++            let other = &b[name];
++            if bytes.len() != other.len() { return Some(format!("{name}:byte_length")); }
++            bytes.iter().zip(other).position(|(a, b)| a != b)
++                .map(|offset| format!("{name}:byte_offset={offset}"))
++        })
++    }
++
++    fn failure_metadata(a: &Observation, b: &Observation, stage: &str) -> serde_json::Value {
++        let mut mismatches = Vec::new();
++        for (component, left) in a {
++            let Some(right) = b.get(component) else {
++                mismatches.push(serde_json::json!({"component":component,"missing_rhs":true})); continue;
++            };
++            if left == right { continue; }
++            let offset = left.iter().zip(right).position(|(x, y)| x != y)
++                .unwrap_or(left.len().min(right.len()));
++            let mut row = serde_json::json!({"component":component,"first_offset":offset,
++                "lhs_bytes":left.len(),"rhs_bytes":right.len(),
++                "lhs_sha256":digest(left),"rhs_sha256":digest(right)});
++            if component == "active_kv_and_draft_kv" {
++                row["lhs_prefix_location"] = prefix_location(a, offset).unwrap_or(serde_json::Value::Null);
++                row["rhs_prefix_location"] = prefix_location(b, offset).unwrap_or(serde_json::Value::Null);
++            }
++            mismatches.push(row);
++        }
++        let draws = "drawn_tokens_internal_only";
++        serde_json::json!({"stage":stage,
++            "draw_vector_equal":a.get(draws).zip(b.get(draws)).map(|(x, y)| x == y),
++            "lhs_draw_sha256":a.get(draws).map(|v| digest(v)),
++            "rhs_draw_sha256":b.get(draws).map(|v| digest(v)),"mismatches":mismatches})
++    }
++
++    fn same(a: &Observation, b: &Observation, stage: &str) {
++        if let Some(first) = first_mismatch(a, b) {
++            eprintln!("V16_FAILURE {}", failure_metadata(a, b, stage));
++            panic!("V16 {stage}: {first}");
++        }
++    }
++
++    #[derive(Default)]
++    struct OneStep { steps: usize }
++    impl SpecStepControl for OneStep {
++        fn wants_yield(&self) -> bool { true }
++        fn settled(&mut self, step: SpecStep) -> anyhow::Result<()> {
++            anyhow::ensure!(step.draft_count == 2 && step.proposed == 2,
++                "V16 requires two actual drafts");
++            anyhow::ensure!(!step.thinking_control && step.accepted <= 2
++                && (1..=3).contains(&step.generated_count)
++                && step.generated_start > 1
++                && step.generated_start - 1 + step.generated_count == step.generated_total,
++                "V16 completed-step range is invalid");
++            anyhow::ensure!(self.steps == 0, "V16 quantum crossed multiple steps");
++            self.steps += 1;
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn complete_step_probe_rejects_plain_or_malformed_ranges_cpu() {
++        let good = SpecStep { produced_ns: 1, generated_start: 2, generated_count: 3,
++            generated_total: 4, draft_count: 2, proposed: 2, accepted: 2,
++            cumulative_drafted: 2, cumulative_accepted: 2, position: 128,
++            thinking_control: false };
++        let mut control = OneStep::default();
++        assert!(control.wants_yield());
++        assert!(control.settled(SpecStep { proposed: 0, ..good }).is_err());
++        assert!(control.settled(SpecStep { generated_total: 5, ..good }).is_err());
++        assert_eq!(control.steps, 0);
++        control.settled(good).unwrap();
++        assert_eq!(control.steps, 1);
++        assert!(control.settled(good).is_err());
++    }
++
++    #[test]
++    fn first_difference_reports_component_and_offset_without_values_cpu() {
++        let a = Observation::from([("sampler_counts".into(), vec![71, 83])]);
++        let b = Observation::from([("sampler_counts".into(), vec![71, 89])]);
++        assert_eq!(first_mismatch(&a, &a), None);
++        assert_eq!(first_mismatch(&a, &b).as_deref(), Some("sampler_counts:byte_offset=1"));
++        assert_eq!(first_mismatch(&a, &Observation::new()).as_deref(), Some("component_set"));
++    }
++
++    #[test]
++    fn failure_metadata_lists_all_differences_without_raw_values_cpu() {
++        let mut a = Observation::from([("sampler_counts".into(), b"private-count-canary".to_vec()),
++            ("draft_hidden".into(), vec![1, 2]), ("drawn_tokens_internal_only".into(), vec![3, 4])]);
++        let mut b = a.clone();
++        b.get_mut("sampler_counts").unwrap()[0] ^= 1;
++        b.get_mut("draft_hidden").unwrap()[1] ^= 1;
++        let metadata = failure_metadata(&a, &b, "synthetic");
++        assert_eq!(metadata["mismatches"].as_array().unwrap().len(), 2);
++        assert_eq!(metadata["draw_vector_equal"], true);
++        assert!(!metadata.to_string().contains("private-count-canary"));
++        a.get_mut("drawn_tokens_internal_only").unwrap()[0] ^= 1;
++        assert_eq!(failure_metadata(&a, &b, "synthetic")["draw_vector_equal"], false);
++        assert!(failure_metadata(&Observation::new(), &Observation::new(), "synthetic")
++            ["draw_vector_equal"].is_null());
++    }
++
++    #[test]
++    fn serialized_prefix_mapping_uses_runtime_region_geometry_cpu() {
++        let region = serde_json::json!({"label":"draft_head.K.head0","store":"K",
++            "serialized_start":3154944,"serialized_end":3211776,
++            "row_bytes":512,"element_bytes":2,"state_position":111});
++        let observation = Observation::from([("prefix_geometry".into(),
++            serde_json::to_vec(&vec![region]).unwrap())]);
++        let mapped = prefix_location(&observation, 3196944).unwrap();
++        assert_eq!(mapped["row"], 82);
++        assert_eq!(mapped["column"], 8);
++        assert_eq!(mapped["element_byte"], 0);
++        assert_eq!(mapped["within_fed_prefix"], true);
++        assert!(prefix_location(&observation, 3211776).is_none());
++    }
++
++    /// Solo, yield without peer, and yield with a true two-draft peer all
++    /// fork ONE actual prefilled state, including active KV/head state and
++    /// initial sampler counts. No repeated-prompt approximation or raw dump.
++    #[test]
++    #[ignore = "V16: explicit owned GPU window and full Q4 checkpoint required"]
++    fn same_start_mtp2_yield_resume_with_real_peer_preserves_state() {
++        assert_eq!(std::env::var("LILIUXFLOW_V16_GPU_WINDOW").as_deref(), Ok("owned"),
++            "V16 needs the master's owned window; missing input is never a PASS");
++        let dir = std::env::var("LILIUXFLOW_V16_MODEL_DIR").expect("V16 explicit full model");
++        assert_eq!(std::env::var("LILY_QSA_ROUTE").as_deref(), Ok("split"));
++        assert_eq!(std::env::var("LILY_QSA_SCORES").as_deref(), Ok("scalar"));
++        for flag in ["LILY_TRACE_SPEC", "LILY_PROFILE", "LILY_KERNEL_PROFILE",
++            "LILY_PROBE_ARRIVAL", "LILY_EXPERT_SLOTS", "LILY_MEMORY_GB"] {
++            assert!(std::env::var_os(flag).is_none(), "V16 observer flag must be absent: {flag}");
++        }
++        let [prompt, peer_prompt] = fixture_prompts(Path::new(&dir));
++        let started = std::time::Instant::now();
++        crate::instance::acquire().expect("V16 original HOME instance ownership");
++        let ctx = MetalContext::new().expect("V16 context");
++        let model = <Qwen4ExpModel as LanguageModel>::load(&ctx, Path::new(&dir),
++            &LoadOptions { mtp_drafts: 2, kv_format: KvFormat::Bf16,
++                ..LoadOptions::default() }).expect("V16 load");
++        assert!(model.config.layer_types.len() > 4, "V16 requires the full checkpoint");
++        assert_eq!(model.kv_format(), KvFormat::Bf16);
++        assert!(model.max_drafts() >= 2 && model.expert_cache_stats().is_none());
++        assert!(model.max_batch_rows() >= 2, "V16 needs actual sampler slots 0 and 1");
++        let generator = Generator::from_model_dir(Path::new(&dir)).expect("V16 tokenizer");
++        let sampled = SamplingParams { temperature: 1.0, top_k: 20, top_p: 0.95,
++            presence_penalty: 1.5, seed: 7, ..SamplingParams::greedy() };
++        for params in [SamplingParams::greedy(), sampled] {
++            eprintln!("V16_CASE sampled={} with_peer=reference stage=uninterrupted",
++                !params.is_greedy());
++            let mut scratch = model.new_scratch_with_capacity(&ctx, 512).expect("V16 scratch");
++            let mut origin = model.new_state(&ctx, 512).expect("V16 origin");
++            let first = generator.begin(&ctx, &model, &mut origin, &mut scratch,
++                &prompt, &params).expect("V16 begin");
++            let initial_counts = SamplerScratch::new(&ctx, scratch.sampler.vocab()).unwrap();
++            initial_counts.copy_counts_from(&scratch.sampler).unwrap();
++            let initial = vec![first];
++            let mut solo = copy_state(&ctx, &model, &origin, origin.pos, 512);
++            at_rest(&solo, &scratch, origin.pos, initial.len());
++            let start = observe(&solo, &initial_counts, &initial, &params);
++            let options = GenerateOptions { max_tokens: 32, sampling: &params,
++                stop_tokens: &[], drafts: 2, thinking: None };
++            let mut solo_tokens = initial.clone();
++            scratch.sampler.copy_counts_from(&initial_counts).unwrap();
++            let solo_finish = generator.resume(&ctx, &model, &mut solo, &mut scratch,
++                &mut solo_tokens, &options, None, &mut |_| Ok(true)).expect("V16 uninterrupted");
++            at_rest(&solo, &scratch, origin.pos, solo_tokens.len());
++            assert_eq!(solo_finish.finish, FinishReason::Length, "V16 fixture ended early");
++            assert_eq!(solo_tokens.len(), 32);
++            let expected = observe(&solo, &scratch.sampler, &solo_tokens, &params);
++            drop(solo);
++            for with_peer in [false, true] {
++                eprintln!("V16_CASE sampled={} with_peer={with_peer} stage=yield_resume",
++                    !params.is_greedy());
++                let mut own = copy_state(&ctx, &model, &origin, origin.pos, 512);
++                let own_scope = SpecContinuationScope::new("v16-own", "v16-resident", 0).unwrap();
++                let peer_scope = SpecContinuationScope::new("v16-peer", "v16-resident", 1).unwrap();
++                let mut own_continuation = SpecContinuation::new(&ctx, own_scope.clone()).unwrap();
++                let mut peer_continuation = with_peer.then(||
++                    SpecContinuation::new(&ctx, peer_scope.clone()).unwrap());
++                let mut own_tokens = initial.clone();
++                scratch.sampler.copy_counts_from(&initial_counts).unwrap();
++                model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Engine,
++                    CountsSlot::Batch(0)).unwrap();
++                same(&start, &observe(&own, &scratch.sampler, &own_tokens, &params), "initial_clone");
++                let peer_params = SamplingParams { seed: 19, ..params };
++                let peer_options = GenerateOptions { max_tokens: 256, sampling: &peer_params,
++                    stop_tokens: &[], drafts: 2, thinking: None };
++                let mut peer = with_peer.then(|| model.new_state(&ctx, 512).unwrap());
++                let mut peer_tokens = Vec::new();
++                if let Some(peer) = &mut peer {
++                    peer_tokens.push(generator.begin(&ctx, &model, peer, &mut scratch,
++                        &peer_prompt, &peer_params).expect("V16 peer begin"));
++                    model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Engine,
++                        CountsSlot::Batch(1)).unwrap();
++                }
++                model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Batch(0),
++                    CountsSlot::Engine).unwrap();
++                same(&start, &observe(&own, &scratch.sampler, &own_tokens, &params), "peer_prefill");
++                let mut yields = 0;
++                for _ in 0..64 {
++                    assert!(started.elapsed().as_secs() < 240, "V16 bounded deadline");
++                    let before_own_peer = peer.as_ref().map(|peer| {
++                        model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Batch(1),
++                            CountsSlot::Engine).unwrap();
++                        let observed = observe(peer, &scratch.sampler, &peer_tokens, &peer_params);
++                        model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Batch(0),
++                            CountsSlot::Engine).unwrap();
++                        observed
++                    });
++                    let mut control = OneStep::default();
++                    let outcome = generator.resume_mtp2_controlled(&ctx, &model, &mut own,
++                        &mut scratch, &mut own_tokens, &options, None, &mut |_| Ok(true),
++                        &mut control, &mut own_continuation, &own_scope).expect("V16 own quantum");
++                    at_rest(&own, &scratch, origin.pos, own_tokens.len());
++                    assert_eq!(control.steps, 1);
++                    model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Engine,
++                        CountsSlot::Batch(0)).unwrap();
++                    if let (Some(peer), Some(before)) = (&peer, before_own_peer) {
++                        model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Batch(1),
++                            CountsSlot::Engine).unwrap();
++                        same(&before, &observe(peer, &scratch.sampler, &peer_tokens, &peer_params),
++                            "own_did_not_change_peer_state_or_counts");
++                        model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Batch(0),
++                            CountsSlot::Engine).unwrap();
++                    }
++                    match outcome {
++                        ControlledSpec::Finished(done) => {
++                            assert!(!own_continuation.is_ready(), "V16 terminal retained continuation");
++                            assert_eq!(done.finish, FinishReason::Length, "V16 fixture ended early");
++                            break;
++                        }
++                        ControlledSpec::Yield { kind, .. } => {
++                            assert_eq!(kind, SpecYield::Quantum); yields += 1;
++                            assert!(own_continuation.is_ready(), "V16 normal yield lost continuation");
++                        }
++                    }
++                    let before_peer = observe(&own, &scratch.sampler, &own_tokens, &params);
++                    if let Some(peer) = &mut peer {
++                        model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Batch(1),
++                            CountsSlot::Engine).unwrap();
++                        let mut peer_control = OneStep::default();
++                        let peer_outcome = generator.resume_mtp2_controlled(&ctx, &model, peer,
++                            &mut scratch, &mut peer_tokens, &peer_options, None,
++                            &mut |_| Ok(true), &mut peer_control,
++                            peer_continuation.as_mut().unwrap(), &peer_scope).expect("V16 real peer quantum");
++                        at_rest(peer, &scratch, peer_prompt.len(), peer_tokens.len());
++                        assert!(matches!(peer_outcome, ControlledSpec::Yield { kind: SpecYield::Quantum, .. }),
++                            "V16 peer fixture must stay active");
++                        assert_eq!(peer_control.steps, 1);
++                        assert!(peer_continuation.as_ref().unwrap().is_ready());
++                        model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Engine,
++                            CountsSlot::Batch(1)).unwrap();
++                    }
++                    model.move_sampler_counts(&ctx, &mut scratch, CountsSlot::Batch(0),
++                        CountsSlot::Engine).unwrap();
++                    same(&before_peer, &observe(&own, &scratch.sampler, &own_tokens, &params), "peer_isolation");
++                }
++                assert!(yields >= 8, "V16 did not exercise enough full yields");
++                assert_eq!(own_tokens.len(), 32, "V16 did not complete its bounded output");
++                same(&expected, &observe(&own, &scratch.sampler, &own_tokens, &params), "final_parity");
++                eprintln!("V16 state_parity=PASS sampled={} with_peer={with_peer} generated_tokens={} yields={yields} actual_drafts=2 full_state_components={} pending=0 armed=0 observer=correctness_only",
++                    !params.is_greedy(), own_tokens.len(), expected.len());
++            }
++        }
++    }
+ }
+ 
+ /// Runs one verify pass the host-driven way (stage the n-gram rows, encode,
+diff --git a/tests/unit/serve.rs b/tests/unit/serve.rs
+--- a/tests/unit/serve.rs
++++ b/tests/unit/serve.rs
+@@ -20,10 +20,12 @@
+ #[test]
+ fn shared_candidate_fails_closed_without_its_fixed_p1_configuration() {
+     assert!(check_shared_mtp2_options(&shared_candidate_options()).is_ok());
++    let mut two = shared_candidate_options(); two.max_batch = Some(2);
++    assert!(check_shared_mtp2_options(&two).is_ok());
+     let mutations: &[fn(&mut ServeOptions)] = &[
+         |o| o.max_seq = 131_072, |o| o.mtp_drafts = 0,
+         |o| o.kv_format = None, |o| o.kv_format = Some(KvFormat::Q8),
+-        |o| o.max_batch = Some(2), |o| o.max_batch = None,
++        |o| o.max_batch = Some(3), |o| o.max_batch = None,
+         |o| o.pin_weights = pin::PinMode::Auto, |o| o.ngram_preload = false,
+         |o| o.ngram_lock = true, |o| o.thinking = false,
+         |o| o.reasoning_effort = Some("low".into()),
+diff --git a/tests/unit/serve/mtp2.rs b/tests/unit/serve/mtp2.rs
+--- a/tests/unit/serve/mtp2.rs
++++ b/tests/unit/serve/mtp2.rs
+@@ -1,4 +1,103 @@
+ use super::*;
++use crate::generate::SpecStepControl as _;
++
++#[test]
++fn endpoint_reservations_include_physical_lookahead_without_eager_allocations() {
++    assert_eq!(endpoint_tokens(4096, 65536).unwrap(), 69644);
++    assert_eq!(endpoint_tokens(65535, 1).unwrap(), 65548);
++    assert_eq!(endpoint_tokens(RESIDENT_CONTEXT_TOKENS - 2, 2).unwrap(), RESIDENT_CONTEXT_TOKENS);
++    assert!(endpoint_tokens(RESIDENT_CONTEXT_TOKENS, 1).is_err());
++    assert!(endpoint_tokens(10, 0).is_err());
++    assert!(reservations_fit(300, 400, 100, 800));
++    assert!(!reservations_fit(300, 401, 100, 800));
++    assert!(!reservations_fit(usize::MAX, 1, 1, usize::MAX));
++}
++
++#[test]
++fn warm_cached_snapshot_reservation_includes_old_and_new_decode_generations() {
++    assert_eq!(snapshot_peak(3, 4, 4), 12);
++    assert_eq!(snapshot_peak(3, 4, 0), 8);
++    assert_eq!(snapshot_peak(3, 0, 0), 4);
++    assert!(reservations_fit(500, 500, 100, 1100));
++    assert!(!reservations_fit(500, 500, 101, 1100));
++}
++
++#[test]
++fn unavailable_and_overflowing_resource_bills_fail_closed_with_a_peer_present() {
++    assert!(known_reservation(None).is_err());
++    assert_eq!(known_reservation(Some(512)).unwrap(), 512);
++    let peers = sum_reservations([usize::MAX, 512]);
++    assert_eq!(peers, usize::MAX);
++    assert!(!reservations_fit(peers, 1, 0, usize::MAX));
++    assert!(!reservations_fit(512, usize::MAX, 0, usize::MAX));
++}
++
++#[test]
++fn complete_quantum_control_counts_one_full_step_and_no_mid_token_stop() {
++    let delivered = std::cell::Cell::new(0);
++    let (mut global, mut index) = (1, 1);
++    let mut control = QuantumControl { request_id: "req-synthetic-1", epoch: "epoch-synthetic",
++        step_id: &mut global, step_index: &mut index, base_drafted: 4, base_accepted: 2,
++        steps: 0, max_steps: 1, waiting: &|| false, delivered: &delivered, delivered_checkpoint: 0 };
++    assert!(control.wants_yield());
++    assert_eq!(control.steps, 0, "decision does not fabricate a completed step");
++    delivered.set(2);
++    control.settled(crate::generate::SpecStep { produced_ns: monotonic_ns(), generated_start: 2, generated_count: 3,
++        generated_total: 4, draft_count: 2, proposed: 2, accepted: 2,
++        cumulative_drafted: 2, cumulative_accepted: 2, position: 73, thinking_control: false }).unwrap();
++    assert_eq!((control.steps, control.delivered_checkpoint), (1, 2));
++    assert_eq!((*control.step_id, *control.step_index), (2, 2));
++    assert!(control.settled(crate::generate::SpecStep { produced_ns: monotonic_ns(), generated_start: 5, generated_count: 1,
++        generated_total: 5, draft_count: 0, proposed: 0, accepted: 0,
++        cumulative_drafted: 2, cumulative_accepted: 2, position: 74, thinking_control: false }).is_err());
++}
++
++#[test]
++fn native_monotonic_clock_contract_is_shared_boot_relative_and_non_decreasing() {
++    assert_eq!(CLOCK, "mach_absolute_time_ns");
++    let first = monotonic_ns();
++    assert!(first > 0);
++    let mut previous = first;
++    for _ in 0..32 { let now = monotonic_ns(); assert!(now >= previous); previous = now; }
++    println!("LILY_CLOCK_PROBE clock={CLOCK} monotonic_ns={previous}");
++}
++
++#[test]
++fn transmitted_token_counter_is_a_single_conservative_callback_boolean() {
++    use crate::serve::stream::Event;
++    assert!(!has_transmitted_payload(&[]));
++    assert!(!has_transmitted_payload(&[Event::Content(String::new()), Event::Reasoning(String::new())]));
++    assert!(has_transmitted_payload(&[Event::Content("x".into()), Event::Reasoning("y".into())]));
++    // Two payload events still count just one on_token callback.
++    assert_eq!(usize::from(has_transmitted_payload(&[Event::Content("x".into()), Event::Reasoning("y".into())])), 1);
++    let residency = fake_loads();
++    let mut weights = residency.loaded(residency.begin().unwrap(), [(1, 40)], 100).unwrap();
++    weights.max_batch = 2;
++    assert!(weights.resident_line().contains("max_batch=2"));
++}
++
++#[test]
++#[ignore = "requires explicit small operator config metadata; no model/Metal"]
++fn native_full_config_session_helper_matches_independent_source_arithmetic() {
++    let path = std::env::var("LILIUXFLOW_CPU_MODEL_CONFIG").expect("explicit config metadata fixture");
++    let bytes = std::fs::read(path).unwrap();
++    let cfg = crate::qwen4exp::config::Qwen4ExpConfig::from_json(&bytes).unwrap();
++    let expected = [(65536, 2135519232u64), (131072, 4152979456), (262144, 8187899904)];
++    for (capacity, live) in expected {
++        let actual = crate::qwen4exp::model::session_bytes(&cfg, true,
++            crate::kernels::attention::KvFormat::Bf16, capacity, 0).unwrap();
++        assert_eq!(actual, live);
++        let snapshot = crate::qwen4exp::model::session_bytes(&cfg, true,
++            crate::kernels::attention::KvFormat::Bf16, capacity, 1).unwrap() - actual;
++        assert_eq!(snapshot, 115662848);
++        assert_eq!(crate::qwen4exp::model::session_bytes(&cfg, true,
++            crate::kernels::attention::KvFormat::Bf16, capacity, 12).unwrap(), live + 12 * snapshot);
++    }
++    let rounded = crate::qwen4exp::model::session_bytes(&cfg, true,
++        crate::kernels::attention::KvFormat::Bf16, endpoint_tokens(65535, 1).unwrap(), 8).unwrap();
++    assert_eq!(rounded, crate::qwen4exp::model::session_bytes(&cfg, true,
++        crate::kernels::attention::KvFormat::Bf16, 73728, 8).unwrap());
++}
+ 
+ #[test]
+ fn shared_profile_policy_is_finite_required_and_candidate_only() {
+diff --git a/tests/unit/serve/session.rs b/tests/unit/serve/session.rs
+--- a/tests/unit/serve/session.rs
++++ b/tests/unit/serve/session.rs
+@@ -474,6 +474,13 @@
+ 
+     struct Model;
+ 
++    #[test]
++    fn mock_model_defaults_reject_mtp2_continuation_without_a_gpu_context() {
++        assert!(!Model.supports_spec_continuation());
++        assert_eq!(Model.require_spec_continuation().unwrap_err().to_string(),
++            "model does not support settled MTP2 continuations");
++    }
++
+     impl LanguageModel for Model {
+         type State = State;
+         type Scratch = Scratch;

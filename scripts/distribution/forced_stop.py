@@ -9,6 +9,56 @@ import hashlib,os,re,signal,stat,subprocess,time
 from common import DistributionError
 
 IDENTITY_FIELDS=('pid','ppid','pgid','uid','started','command_sha256')
+
+def shared_model_record(trusted,record):
+    """Classify one finite shared record with owned immutable source/binary proof.
+
+    This does not signal or infer native request release. It verifies exact
+    process commands/identity; the caller must separately verify its captured
+    agent descendants and retain the existing non-DB filtering.
+    """
+    import shlex
+    from mtp2_shared_runtime import SharedInstallation,shared_argv,runtime_identity_fields
+    if (type(record) is not dict or type(record.get('schema_version')) is not int or record['schema_version']!=1
+        or record.get('installation_id')!=trusted['config']['installation_id']
+        or record.get('profile_id')!='mtp2-shared' or record.get('context_tokens')!=262144
+        or type(record.get('context_tokens')) is not int):
+        raise DistributionError('shared model record installation/profile differs')
+    generation=record.get('validation_bundle_id')
+    if generation is not None:
+        from mtp2_shared_upgrade import _verify_bundle
+        m,source,engine,binary=_verify_bundle(trusted,generation,record.get('validation_bundle_manifest_sha256'))
+        installation=SharedInstallation(engine,binary,Path(trusted['config']['model_dir']),trusted['data_root'],(),
+            tuple(trusted['config']['ports'].values()),generation)
+    else:
+        from mtp2_shared_runner import RELEASE_EXPECTATION
+        from mtp2_shared_runtime import validate_shared_extension, normal_shared_view
+        if RELEASE_EXPECTATION is None:raise DistributionError('shared production stop recipe is unavailable')
+        selected=normal_shared_view(trusted)
+        installation=validate_shared_extension(selected,RELEASE_EXPECTATION);source=selected['source_root']
+        if installation is None:raise DistributionError('shared model executable is not installed')
+    if record.get('binary_sha256')!=installation.engine.binary_sha256 or any(record.get(k)!=v for k,v in runtime_identity_fields(installation.engine).items()):
+        raise DistributionError('shared model record binary/source identity differs')
+    runner=identity(record.get('runner'));child=identity(record.get('child'))
+    if runner['uid']!=trusted['config']['owner_uid'] or child['uid']!=runner['uid'] or child['ppid']!=runner['pid']:
+        raise DistributionError('shared model process owner/parent differs')
+    port=record.get('backend_port')
+    argv=shared_argv(installation,port)
+    if exact(child):
+        actual=shlex.split(command(child))
+        if (actual[:-3]!=argv or actual[-3:-1]!=['--liliuxflow-mtp2-control','--liliuxflow-mtp2-control-key-fd']
+            or not actual[-1].isascii() or not actual[-1].isdigit() or int(actual[-1])<3):
+            raise DistributionError('shared native command differs from its finite recipe')
+    if exact(runner):
+        actual=shlex.split(command(runner));expected=[str(trusted['binaries']['compat_python']),
+            str(source/'scripts/distribution/mtp2_shared_runner.py'),'--data-root',str(trusted['data_root']),
+            '--port',str(port)]
+        if generation is not None:expected+=['--candidate-validation']
+        # Manager command places the finite flag before --port; direct CLI may
+        # place it last. Both lists carry exactly the same fixed operands.
+        alternate=expected[:-3]+['--candidate-validation','--port',str(port)] if generation is not None else expected
+        if actual not in (expected,alternate):raise DistributionError('shared runner command/source differs')
+    return runner,child
 def identity(value):
     if (not isinstance(value,dict) or set(value)!=set(IDENTITY_FIELDS)
             or any(type(value[k]) is not int or value[k]<0 for k in ('pid','ppid','pgid','uid'))

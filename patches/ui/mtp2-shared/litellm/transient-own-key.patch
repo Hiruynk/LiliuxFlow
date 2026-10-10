@@ -1,0 +1,99 @@
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatUI.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatUI.tsx
+@@ -1,4 +1,6 @@
+ "use client";
++import {uiText} from "@/liliuxflow/runtime";
++import {SharedOwnKeyInput,useSharedOwnKey,isMtp2Model} from "@/liliuxflow/SharedOwnKey";
+ import {SourceChartDisplay} from "@/liliuxflow/SourceChartDisplay";
+ 
+ import { noticeMessage } from "@/liliuxflow/NoticeMessage";
+@@ -56,6 +58,7 @@
+ import { MessageType } from "@/components/chat_ui/types";
+ import { useCodeInterpreter } from "../../hooks/useCodeInterpreter";
+ import { useChatHistory } from "../../hooks/useChatHistory";
++import { getProxyBaseUrl } from "@/components/networking";
+ import { getSecureItem, setSecureItem } from "@/utils/secureStorage";
+ import { MultiSelect, type MultiSelectOption } from "@/components/shared/MultiSelect";
+ import { SearchSelect } from "@/components/shared/SearchSelect";
+@@ -145,6 +148,8 @@
+     const [selectedModel, setSelectedModel] = useState<string | null | undefined>(simplified ? fixedModel : null);
+     const [showCustomModelInput, setShowCustomModelInput] = useState<boolean>(false);
+     const [modelInfo, setModelInfo] = useState<ModelGroup[]>([]);
++    const sharedOwnKey = useSharedOwnKey(fetchAvailableModels,getProxyBaseUrl);
++    const visibleModelInfo = [...modelInfo.filter(model=>!isMtp2Model(model.model_group)),...sharedOwnKey.models];
+     const [isLoadingModels, setIsLoadingModels] = useState(false);
+     const [modelLoadError, setModelLoadError] = useState(false);
+     const [agentInfo, setAgentInfo] = useState<Agent[]>([]);
+@@ -379,7 +384,7 @@
+                     return;
+                 }
+                 setModelInfo(uniqueModels);
+-                setSelectedModel((currentModel) => uniqueModels.some((model) => model.model_group === currentModel) ? currentModel : undefined);
++                setSelectedModel((currentModel) => isMtp2Model(currentModel) ? currentModel : uniqueModels.some((model) => model.model_group === currentModel) ? currentModel : undefined);
+             }
+             catch (error) {
+                 if (cancelled) {
+@@ -714,7 +719,9 @@
+         if (!token || !userRole || !userID) {
+             return;
+         }
+-        const effectiveApiKey = simplified ? accessToken : apiKeySource === "session" ? accessToken : apiKey;
++        const originalApiKey = simplified ? accessToken : apiKeySource === "session" ? accessToken : apiKey;
++        const effectiveApiKey = sharedOwnKey.keyFor(selectedModel,originalApiKey);
++        if(isMtp2Model(selectedModel)&&endpointType!==EndpointType.CHAT){toast.fromError(uiText("shared.context.unavailable"));return;}
+         if (!effectiveApiKey) {
+             toast.fromError("Please provide a Virtual Key or select Current UI Session");
+             return;
+@@ -796,7 +803,7 @@
+                         })),
+                         newUserMessage,
+                     ];
+-                    const requestProxyBaseUrl = simplified && proxySettings
++                    const requestProxyBaseUrl = isMtp2Model(selectedModel) ? sharedOwnKey.proxyBase() : simplified && proxySettings
+                         ? proxySettings.LITELLM_UI_API_DOC_BASE_URL ?? proxySettings.PROXY_BASE_URL ?? undefined
+                         : customProxyBaseUrl || undefined;
+                     await makeOpenAIChatCompletionRequest(apiChatHistory, (chunk, model) => updateTextUI("assistant", chunk, model), selectedModel, effectiveApiKey, selectedTags, signal, updateReasoningContent, updateTimingData, updateUsageData, traceId, selectedVectorStores.length > 0 ? selectedVectorStores : undefined, selectedGuardrails.length > 0 ? selectedGuardrails : undefined, selectedPolicies.length > 0 ? selectedPolicies : undefined, selectedMCPServers, updateChatImageUI, updateSearchResults, useAdvancedParams ? temperature : undefined, useAdvancedParams ? maxTokens : undefined, updateTotalLatency, requestProxyBaseUrl, mcpServers, mcpServerToolRestrictions, handleMCPEvent, mockTestFallbacks, mcpToolsets, streamingEnabled);
+@@ -932,7 +939,7 @@
+     const onModelChange = (value: string | null) => {
+         setSelectedModel(value);
+         setShowCustomModelInput(value === "custom");
+-        const model = modelInfo.find((option) => option.model_group === value);
++        const model = visibleModelInfo.find((option) => option.model_group === value);
+         if (model?.mode && !isModelCompatibleWithEndpoint(model, endpointType as EndpointType)) {
+             setEndpointType(getEndpointType(model.mode));
+         }
+@@ -942,7 +949,7 @@
+         if (!selectedModel || selectedModel === "custom") {
+             return false;
+         }
+-        const model = modelInfo.find((m) => m.model_group === selectedModel);
++        const model = visibleModelInfo.find((m) => m.model_group === selectedModel);
+         if (!model) {
+             return false;
+         }
+@@ -952,7 +959,7 @@
+     const supportsStreamingToggle = endpointType === EndpointType.CHAT ||
+         endpointType === EndpointType.RESPONSES ||
+         endpointType === EndpointType.ANTHROPIC_MESSAGES;
+-    const modelsForEndpoint = useMemo(() => filterModelsForEndpoint(modelInfo, endpointType as EndpointType), [modelInfo, endpointType]);
++    const modelsForEndpoint = useMemo(() => filterModelsForEndpoint(visibleModelInfo, endpointType as EndpointType), [modelInfo, sharedOwnKey.models, endpointType]);
+     let modelEmptyText = "No models available for this key";
+     if (modelLoadError) {
+         modelEmptyText = "Unable to load models for this key";
+@@ -960,7 +967,7 @@
+     else if (apiKeySource === "custom" && !apiKey.trim()) {
+         modelEmptyText = "Enter a Virtual Key to load models";
+     }
+-    else if (modelInfo.length > 0 && modelsForEndpoint.length === 0) {
++    else if (visibleModelInfo.length > 0 && modelsForEndpoint.length === 0) {
+         modelEmptyText = "No models available for this endpoint";
+     }
+     const inputPlaceholder = endpointType === EndpointType.CHAT ||
+@@ -1010,6 +1017,7 @@
+                     </div>)}
+                 </div>
+ 
++                <SharedOwnKeyInput state={sharedOwnKey}/>
+                 <div>
+                   <div className="mb-2 flex items-center justify-between">
+                     <label className="flex items-center text-sm font-medium text-foreground"><LocalizedRichText id="ui.admin.rich.5c4234ea21ae" components={{ "value0": <Settings className="mr-2 size-4" aria-hidden="true"/> }}/></label>

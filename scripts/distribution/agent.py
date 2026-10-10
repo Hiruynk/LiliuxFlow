@@ -105,7 +105,9 @@ def preflight_ports(ports):
                 raise DistributionError('configured loopback port is occupied; listener owner left untouched')
 
 
-def safe_environment(trusted):
+def safe_environment(trusted, *, shared_context=False):
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be explicit')
     data=trusted['data_root'];config=trusted['config'];secret=trusted['secrets']
     node_bin=data/'runtime/toolchains/node/bin'
     if not node_bin.is_dir():raise DistributionError('installation-owned Node toolchain is unavailable')
@@ -114,6 +116,14 @@ def safe_environment(trusted):
             'LILIUXFLOW_DATA_ROOT':str(data),'LILIUXFLOW_PRIVATE_LOG':str(data/'logs/database-steps.jsonl'),'PYTHONPATH':str(trusted['source_root']/'services/compat/src')}
     if trusted.get('controlplane_only'):
         common['LILIUXFLOW_CONTROLPLANE_ONLY']='1'
+    if shared_context:
+        from mtp2_shared_gateway import require_shared_installation, FEATURE_ENV
+        require_shared_installation(trusted)
+        common[FEATURE_ENV]='1'
+        if '_mtp2_validation_binding' in trusted:
+            common['LILIUXFLOW_MTP2_SHARED_VALIDATION']='1'
+            common['PYTHONDONTWRITEBYTECODE']='1'
+        common['PYTHONPATH']+=os.pathsep+str(trusted['source_root']/'scripts/distribution')
     litellm={**common,'PATH':str(data/'runtime/litellm/bin')+':'+common['PATH'],**{k:secret[k] for k in ('LITELLM_MASTER_KEY','LITELLM_SALT_KEY','UI_USERNAME','UI_PASSWORD')},
              'DATABASE_URL':'postgresql://litellm_app:'+quote(secret['DB_PASSWORD'],safe='')+'@127.0.0.1:'+str(config['ports']['postgresql'])+'/litellm',
              'MANAGER_BACKEND_TOKEN':secret['MANAGER_BACKEND_TOKEN'],'STORE_MODEL_IN_DB':'True','LITELLM_LOG':'ERROR',
@@ -127,6 +137,8 @@ def safe_environment(trusted):
         private_file(policy)
         litellm['LILIUXFLOW_PROFILE_POLICY_PATH']=str(policy)
         litellm['LILIUXFLOW_PROFILE_POLICY_SHA256']=sha256(policy)
+    if shared_context:
+        litellm['STORE_MODEL_IN_DB']='False'
     return common,litellm
 
 
@@ -153,7 +165,21 @@ def validation_routes(trusted, profile_ids=()):
     return tuple(selected),keys
 
 
-def configs(trusted, *, validation_profile_ids=()):
+def configuration_documents(trusted, *, validation_profile_ids=(), shared_context=False):
+    """Derive the normal config bytes from verified source/installation values.
+
+    This pure plan writes no config or receipt. Shared factories derive their
+    expected LP hash here, independently of the current config file's digest.
+    """
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be explicit')
+    if shared_context:
+        if '_mtp2_config_binding' in trusted:
+            from mtp2_shared_upgrade import configuration_binding
+            configuration_binding(trusted)
+        else:
+            from mtp2_shared_gateway import require_shared_installation
+            require_shared_installation(trusted)
     data=trusted['data_root'];cfg=trusted['config'];secret=trusted['secrets'];source=trusted['source_root'];ports=cfg['ports']
     registry=trusted['registry'];validation,validation_keys=validation_routes(trusted,validation_profile_ids)
     configured = trusted.get('model_configured') is not False
@@ -185,10 +211,42 @@ def configs(trusted, *, validation_profile_ids=()):
            'callbacks':['litellm.proxy._liliuxflow_context_profiles.context_profile_policy']},
         'router_settings':{'num_retries':0,'max_fallbacks':0,'fallbacks':[],'context_window_fallbacks':[],'content_policy_fallbacks':[],
                            'timeout':max((p.total_deadline_seconds for p in profiles),default=30)+30}}
+    if shared_context:
+        from mtp2_shared_config import shared_manager_config, PHYSICAL_MODEL_ID
+        manager=shared_manager_config(manager,registry,runner_python=trusted['binaries']['compat_python'],source_root=source,data_root=data,
+            candidate_validation='_mtp2_validation_binding' in trusted or '_mtp2_config_binding' in trusted)
+        manager['models'][PHYSICAL_MODEL_ID]['concurrencyLimit']=2
+        # fcefa7 ProcessCommand starts its autonomous TTL worker only when
+        # UnloadAfter > 0. The guard owns shared group idle1800 and cleanup.
+        manager['models'][PHYSICAL_MODEL_ID]['ttl']=0
+        lp['litellm_settings']['callbacks'].append('mtp2_shared_gateway.shared_callback')
+        lp['general_settings']['store_model_in_db']=False
+        lp['general_settings']['supported_db_objects']=[]
+    policy={'schema_version':1,
+        'enabled_models':[p.public_alias for p in profiles if p.production_enabled],'validation_keys':validation_keys}
+    return manager,lp,policy
+
+
+def normal_shared_configuration_sha256(trusted):
+    """Expected config derived from installed trust, not a config self-hash."""
+    if '_mtp2_validation_binding' in trusted or '_mtp2_config_binding' in trusted:
+        raise DistributionError('normal shared config cannot use a validation binding')
+    _manager,lp,_policy=configuration_documents(trusted,shared_context=True)
+    import hashlib
+    return hashlib.sha256((json.dumps(lp,indent=2)+'\n').encode()).hexdigest()
+
+
+def configs(trusted, *, validation_profile_ids=(), shared_context=False, return_validation_seal=False):
+    if type(return_validation_seal) is not bool:
+        raise DistributionError('shared generated config seal mode must be explicit')
+    manager,lp,policy=configuration_documents(trusted,validation_profile_ids=validation_profile_ids,shared_context=shared_context)
+    data=trusted['data_root']
     atomic_private_json(data/'run/llama-swap.json',manager)
     atomic_private_json(data/'run/litellm.json',lp)
-    atomic_private_json(data/'run/context-profile-policy.json',{'schema_version':1,
-        'enabled_models':[p.public_alias for p in profiles if p.production_enabled],'validation_keys':validation_keys})
+    atomic_private_json(data/'run/context-profile-policy.json',policy)
+    if return_validation_seal:
+        from mtp2_shared_upgrade import generated_configuration
+        return data/'run/llama-swap.json',data/'run/litellm.json',generated_configuration(trusted,lp)
     return data/'run/llama-swap.json',data/'run/litellm.json'
 
 
@@ -543,13 +601,18 @@ def drain(trusted):
         if not success:http_json(guard+'/__recovery/maintenance/unlock',method='POST',payload={},control=secret['GUARD_CONTROL_TOKEN'])
 
 
-def run(data,*,controlplane_only=False):
+def run(data,*,controlplane_only=False,shared_context=False):
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be explicit')
+    if shared_context and controlplane_only:
+        raise DistributionError('shared MTP2 requires the configured full model installation')
     print('LILIUXFLOW_AGENT_STAGE validate',flush=True)
     def trust_trace(event):
         file=no_symlinks(data/'logs/trust-stage.jsonl')
         descriptor=os.open(file,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
         with os.fdopen(descriptor,'a') as output:output.write(json.dumps(event)+'\n')
-    trusted=validate(data,require_checkpoint='controlplane' if controlplane_only else 'available',trace=trust_trace);trusted['controlplane_only']=controlplane_only or not trusted['model_configured'];cfg=trusted['config'];ports=cfg['ports'];source=trusted['source_root'];children={};postgres=None;requested_stop=False
+    selection={'shared_context':True} if shared_context else {}
+    trusted=validate(data,require_checkpoint='controlplane' if controlplane_only else 'available',trace=trust_trace,**selection);trusted['controlplane_only']=controlplane_only or not trusted['model_configured'];cfg=trusted['config'];ports=cfg['ports'];source=trusted['source_root'];children={};postgres=None;requested_stop=False
     def stop_signal(_signal,_frame):
         nonlocal requested_stop
         requested_stop=True
@@ -561,11 +624,12 @@ def run(data,*,controlplane_only=False):
     preflight_ports(ports)
     with mutation(data):
         print('LILIUXFLOW_AGENT_STAGE configs',flush=True)
-        manager,lp=configs(trusted)
+        manager,lp=configs(trusted,shared_context=shared_context)
         print('LILIUXFLOW_AGENT_STAGE environment',flush=True)
-        common,lp_env=safe_environment(trusted)
+        common,lp_env=safe_environment(trusted,shared_context=shared_context)
         print('LILIUXFLOW_AGENT_STAGE registry',flush=True)
         me=capture(os.getpid());record={'schema_version':1,'installation_id':cfg['installation_id'],'agent':me,'children':{},'postgres':None,'ready':False,'controlplane_only':trusted['controlplane_only'],'model_configured':trusted['model_configured']}
+        if shared_context:record['shared_context']=True
         write_json_new(state,record)
         try:
             postgres=pg_start(trusted);record['postgres']=postgres;atomic_private_json(state,record)
@@ -574,6 +638,8 @@ def run(data,*,controlplane_only=False):
                       'manager':[trusted['binaries']['llama_swap'],'-config',manager,'-listen','127.0.0.1:'+str(ports['manager'])],
                       'guard':[cp,'-m','uvicorn','compat_api.portable:create_guard_app','--factory','--host','127.0.0.1','--port',str(ports['guard']),'--no-access-log','--log-level','warning','--timeout-graceful-shutdown','10'],
                       'compat':[cp,'-m','uvicorn','compat_api.portable:create_compat_app','--factory','--host','127.0.0.1','--port',str(ports['compat']),'--no-access-log','--log-level','warning','--timeout-graceful-shutdown','5']}
+            if shared_context:
+                commands['litellm']=[lp_python,'-m','uvicorn','mtp2_shared_gateway:create_litellm_app','--factory','--host','127.0.0.1','--port',str(ports['litellm']),'--no-access-log','--log-level','warning','--timeout-graceful-shutdown','10']
             urls={'litellm':'/health/readiness','manager':'/health','guard':'/health','compat':'/api/capabilities'}
             for name in ('litellm','manager','guard','compat'):
                 log=data/'logs'/(name+'.log');descriptor=os.open(log,os.O_WRONLY|os.O_APPEND|os.O_CREAT,0o600)
@@ -606,6 +672,16 @@ def run(data,*,controlplane_only=False):
                     if child['pid'] not in {x['pid'] for x in lineage} or runner['pid'] not in {x['pid'] for x in lineage}:
                         raise DistributionError('model lineage differs; cleanup refused')
                     if not terminate(runner,grace=30):raise DistributionError('owned model runner did not stop')
+            shared_model=data/'run/mtp2-shared-model.json'
+            if shared_model.exists():
+                import forced_stop as fs
+                runner,child=fs.shared_model_record(trusted,read_object(private_file(shared_model)))
+                live=[value for value in (runner,child) if fs.exact(value)]
+                lineage={value['pid']:value for value in fs.descendants(me['pid'])}
+                if any(lineage.get(value['pid'])!=value for value in live):
+                    raise DistributionError('shared model lineage differs; cleanup refused')
+                if fs.exact(runner) and not terminate(runner,grace=30):
+                    raise DistributionError('owned shared runner did not stop')
             for name in ('compat','guard','manager','litellm'):
                 if name in children and not terminate(children[name][1],grace=20):raise DistributionError('owned child did not exit; ownership registry retained')
             if postgres:pg_stop(trusted,postgres)
@@ -630,17 +706,70 @@ def user_launchd_log(trusted,*,prepare=False):
     return log
 
 
-def launchd_plist(trusted):
+def launchd_plist(trusted, *, shared_context=False):
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be explicit')
+    if shared_context:
+        from mtp2_shared_gateway import require_shared_installation
+        require_shared_installation(trusted)
     data=trusted['data_root'];source=trusted['source_root'];cfg=trusted['config']
-    return {'Label':cfg['launchd_label'],'ProgramArguments':[str(trusted['binaries']['compat_python']),str(source/'scripts/distribution/agent.py'),'--data-root',str(data)]+(['--controlplane-only'] if trusted.get('controlplane_only') else []),
+    return {'Label':cfg['launchd_label'],'ProgramArguments':[str(trusted['binaries']['compat_python']),str(source/'scripts/distribution/agent.py'),'--data-root',str(data)]+(['--controlplane-only'] if trusted.get('controlplane_only') else [])+(['--mtp2-shared-context'] if shared_context else []),
             'WorkingDirectory':str(source),'RunAtLoad':True,'KeepAlive':{'SuccessfulExit':False},'ThrottleInterval':10,
             'ExitTimeOut':90,'AbandonProcessGroup':False,'Umask':63,'ProcessType':'Interactive',
             'StandardOutPath':str(user_launchd_log(trusted)),'StandardErrorPath':str(user_launchd_log(trusted))}
 
 
-def start(data,*,dry_run=False,controlplane_only=False,readiness_seconds=180):
+def select_stopped_plist(trusted,path,expected):
+    """Regenerate one normal owned stopped plist; never adopt a live label/PID."""
+    raw=private_file(path).read_bytes()
+    if len(raw)>64*1024:raise DistributionError('installation plist exceeds its bound')
+    decoded=plistlib.loads(raw)
+    if decoded==expected:return
+    data=trusted['data_root'];cfg=trusted['config']
+    if cfg['launchd_label']!='com.diurnoctra.liliuxflow.'+str(uuid.UUID(cfg['installation_id'])):
+        raise DistributionError('stopped plist installation label differs')
+    prefix=[str(trusted['binaries']['compat_python']),str(trusted['source_root']/'scripts/distribution/agent.py'),'--data-root',str(data)]
+    arguments=decoded.get('ProgramArguments')
+    if not isinstance(arguments,list) or arguments[:4]!=prefix or arguments[4:] not in ([],['--controlplane-only'],['--mtp2-shared-context']):
+        raise DistributionError('stopped plist source/arguments differ')
+    prior=dict(trusted);prior['controlplane_only']=arguments[4:]==['--controlplane-only']
+    old_shared=arguments[4:]==['--mtp2-shared-context']
+    if old_shared:
+        from mtp2_shared_runtime import normal_shared_view
+        prior=normal_shared_view(prior)
+    if decoded!=launchd_plist(prior,shared_context=old_shared):
+        raise DistributionError('stopped plist fields differ from the normal generator')
+    with mutation(data):
+        if private_file(path).read_bytes()!=raw:
+            raise DistributionError('stopped plist preimage changed')
+        if any((data/value).exists() for value in ('run/agent.json','run/model.json','run/mtp2-shared-model.json','run/services.json')):
+            raise DistributionError('stopped plist selection needs complete owned cleanup')
+        target='gui/'+str(os.getuid())+'/'+cfg['launchd_label']
+        state=subprocess.run(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=5)
+        diagnostic=(state.stderr or '').lower()
+        if state.returncode==0 or not ('could not find service' in diagnostic or 'no such process' in diagnostic):
+            raise DistributionError('stopped plist label is live or removal is unverified')
+        preflight_ports(cfg['ports'])
+        temporary=path.with_name(path.name+'.'+uuid.uuid4().hex+'.selection')
+        try:
+            write_new(temporary,plistlib.dumps(expected))
+            if private_file(path).read_bytes()!=raw:
+                raise DistributionError('stopped plist preimage changed')
+            os.replace(temporary,path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        if plistlib.loads(private_file(path).read_bytes())!=expected:
+            raise DistributionError('stopped plist selection verification failed')
+
+
+def start(data,*,dry_run=False,controlplane_only=False,readiness_seconds=180,shared_context=False):
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be an exact boolean')
+    if shared_context and controlplane_only:
+        raise DistributionError('shared MTP2 requires the configured full model installation')
     if type(readiness_seconds) is not int or not 1<=readiness_seconds<=180:raise DistributionError('startup readiness bound is invalid')
-    trusted=validate(data,require_checkpoint='controlplane' if controlplane_only else 'available')
+    selection={'shared_context':True} if shared_context else {}
+    trusted=validate(data,require_checkpoint='controlplane' if controlplane_only else 'available',**selection)
     trusted['controlplane_only']=controlplane_only or not trusted['model_configured']
     if not trusted['config']['database_initialized']:raise DistributionError('database initialization is required')
     if dry_run:return {'state':'validated_start_plan','launchd_label':trusted['config']['launchd_label'],'loopback_ports':trusted['config']['ports'],'model_load':'lazy' if trusted['model_configured'] else 'not_configured','inference_ready':False,'credentials_printed':False}
@@ -648,8 +777,10 @@ def start(data,*,dry_run=False,controlplane_only=False,readiness_seconds=180):
     log=user_launchd_log(trusted,prepare=True)
     # Stop/uninstall retain user logs; database/credential backups do not export them.
     plist=data/'run/stack.plist'
-    if plist.exists():private_file(plist)
-    else:write_new(plist,plistlib.dumps(launchd_plist(trusted)))
+    expected_plist=launchd_plist(trusted,shared_context=shared_context)
+    if plist.exists():
+        select_stopped_plist(trusted,plist,expected_plist)
+    else:write_new(plist,plistlib.dumps(expected_plist))
     result=subprocess.run(['/bin/launchctl','bootstrap','gui/'+str(os.getuid()),str(plist)],capture_output=True)
     if result.returncode:raise DistributionError('own user LaunchAgent bootstrap failed')
     kick=subprocess.run(['/bin/launchctl','kickstart','gui/'+str(os.getuid())+'/'+trusted['config']['launchd_label']],capture_output=True)
@@ -710,7 +841,7 @@ def _force_stop(trusted,*,dry_run=False):
     if (type(record.get('schema_version')) is not int or record['schema_version']!=1 or record.get('installation_id')!=cfg['installation_id']
             or not isinstance(record.get('children'),dict)
             or decoded.get('Label')!=label or decoded.get('WorkingDirectory')!=str(source)
-            or not isinstance(arguments,list) or arguments[:4]!=prefix or arguments[4:] not in ([],['--controlplane-only'])):
+            or not isinstance(arguments,list) or arguments[:4]!=prefix or arguments[4:] not in ([],['--controlplane-only'],['--mtp2-shared-context'])):
         raise DistributionError('force stop owned registry/plist installation differs')
     owner=fs.identity(record.get('agent'))
     if not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):raise DistributionError('force stop agent identity/command differs')
@@ -743,6 +874,11 @@ def _force_stop(trusted,*,dry_run=False):
             for key in ('runner','child'):
                 value=fs.identity(model_record.get(key))
                 if fs.exact(value) and bypid.get(value['pid'])!=value:raise DistributionError('owned model lies outside verified agent tree')
+        shared=data/'run/mtp2-shared-model.json'
+        if shared.exists():
+            for value in fs.shared_model_record(trusted,read_object(private_file(shared))):
+                if fs.exact(value) and bypid.get(value['pid'])!=value:
+                    raise DistributionError('owned shared model lies outside verified agent tree')
         bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         fs.terminate_all(captured,resume=True)
         if pg is not None:
@@ -805,7 +941,7 @@ def stop(data,*,dry_run=False,controlplane_only=False,force=False):
         decoded=plistlib.loads(private_file(plist).read_bytes())
         arguments=decoded.get('ProgramArguments',[])
         expected_prefix=[str(trusted['binaries']['compat_python']),str(trusted['source_root']/'scripts/distribution/agent.py'),'--data-root',str(data)]
-        if decoded.get('Label')!=trusted['config']['launchd_label'] or arguments[:4]!=expected_prefix or arguments[4:] not in ([],['--controlplane-only']):
+        if decoded.get('Label')!=trusted['config']['launchd_label'] or arguments[:4]!=expected_prefix or arguments[4:] not in ([],['--controlplane-only'],['--mtp2-shared-context']):
             raise DistributionError('pre-start agent plist identity differs; no job signaled')
         label='gui/'+str(os.getuid())+'/'+trusted['config']['launchd_label']
         status=subprocess.run(['/bin/launchctl','print',label],capture_output=True,text=True)
@@ -849,8 +985,8 @@ def stop(data,*,dry_run=False,controlplane_only=False,force=False):
     return {**result,'force':False,'normal_idle_drain':True,'native_exit_proven':True}
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--data-root',type=Path,required=True);parser.add_argument('--controlplane-only',action='store_true');args=parser.parse_args();os.umask(0o077)
-    try:raise SystemExit(run(args.data_root,controlplane_only=args.controlplane_only))
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--data-root',type=Path,required=True);parser.add_argument('--controlplane-only',action='store_true');parser.add_argument('--mtp2-shared-context',action='store_true');args=parser.parse_args();os.umask(0o077)
+    try:raise SystemExit(run(args.data_root,controlplane_only=args.controlplane_only,shared_context=args.mtp2_shared_context))
     except (DistributionError,OSError,ValueError,KeyError) as error:
         reason=str(error) if isinstance(error,DistributionError) else type(error).__name__
         print('LILIUXFLOW_AGENT_STOPPED reason='+reason,flush=True)

@@ -1143,6 +1143,7 @@ def create_app(
     resource_probe: Callable | None = None,
     context_admission: Callable | None = None,
     validation_aliases: tuple[str, ...] = (),
+    shared_guard_factory: Callable | None = None,
 ) -> FastAPI:
     manager_url = manager_url or os.environ.get("RECOVERY_MANAGER_UPSTREAM", "")
     control_token = control_token if control_token is not None else os.environ.get("RECOVERY_GUARD_CONTROL_TOKEN", "")
@@ -1151,6 +1152,11 @@ def create_app(
     guard = (_LifecycleGuard(**options) if registry is None else
              _ContextLifecycleGuard(**options, registry=registry, resource_probe=resource_probe,
                                     context_admission=context_admission, validation_aliases=validation_aliases))
+    if shared_guard_factory is not None:
+        if registry is None or not callable(shared_guard_factory):
+            raise ValueError('shared MTP2 requires trusted context guard construction')
+        guard = shared_guard_factory(**options, registry=registry, resource_probe=resource_probe,
+                                     context_admission=context_admission, validation_aliases=validation_aliases)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):

@@ -9,11 +9,14 @@ original licenses and attribution. See THIRD_PARTY_NOTICES.md and the original
 license documents under docs/productization/licenses/.
 
 LiliuxFlow carries service integration changes for fixed upstream versions of
-Lily, LiteLLM and llama-swap. The five Lily patch files under
+Lily, LiteLLM and llama-swap. The Lily patch files under
 scripts/distribution/patches/lily/ identify changes to prompt-divergence logging,
 queue and prefill cancellation, prefill progress metadata, effective QSA route
 metadata and cancelled-session cache disposal. llama-swap source and UI patch
 recipes and LiteLLM UI patch recipes also identify the changed upstream files.
+Additional optional/shared MTP2 patches under scripts/distribution/patches/
+lily-opt64/ and lily-mtp2-shared/ identify changes to privacy, cancellation,
+context policy, scheduling, authenticated control, tenant caching and CPU copies.
 Original upstream copyright and license notices are retained. These changes do
 not assert authorship of the upstream engines, model weights or algorithms.
 

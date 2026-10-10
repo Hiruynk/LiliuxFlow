@@ -1,0 +1,326 @@
+diff --git a/src/serve.rs b/src/serve.rs
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -651,6 +651,26 @@
+ }
+ 
+ /// What the engine sends the responder thread for one request.
++mod output_queue;
++
++const CONTROLLED_OUTPUT_MESSAGES: usize = 1024;
++const CONTROLLED_OUTPUT_FRAME_BYTES: usize = 128 << 20;
++const CONTROLLED_OUTPUT_RETAINED_BYTES: usize = 256 << 20;
++
++enum ResponseTx { Legacy(Sender<Out>), Controlled(output_queue::Sender<Out>) }
++enum ResponseRx { Legacy(Receiver<Out>), Controlled(output_queue::Reader<Out>) }
++impl ResponseTx {
++    fn send(&self, message: Out) {
++        match self {
++            Self::Legacy(tx) => { let _ = tx.send(message); }
++            Self::Controlled(tx) => {
++                let bytes = match &message { Out::Body(body) => body.capacity(), _ => 0 };
++                let _ = tx.try_send(message, bytes);
++            }
++        }
++    }
++}
++
+ enum Out {
+     Start { status: u16, content_type: &'static str },
+     Body(Vec<u8>),
+@@ -659,7 +679,7 @@
+ 
+ /// The engine's handle on a request's response.
+ struct Sink {
+-    tx: Sender<Out>,
++    tx: ResponseTx,
+     cancelled: Arc<AtomicBool>,
+     started: bool,
+     metadata: RequestMeta,
+@@ -772,7 +792,32 @@
+         let _ = self.tx.send(Out::Body(body));
+     }
+ 
++    // Returns false only for the legacy path, which retains its original
++    // serializer. A controlled serialization fault cancels this row and is
++    // delivered by the relay; it is never a successful/truncated body.
++    fn send_controlled_json(&self, value: &Value) -> bool {
++        let ResponseTx::Controlled(tx) = &self.tx else { return false; };
++        let mut frame = output_queue::Frame::new(CONTROLLED_OUTPUT_FRAME_BYTES);
++        match serde_json::to_writer(&mut frame, value) {
++            Ok(()) => self.send(frame.into_bytes()),
++            Err(_) => tx.abort(output_queue::Fault::OversizedFrame),
++        }
++        true
++    }
++
+     fn sse(&self, value: &Value) {
++        if let ResponseTx::Controlled(tx) = &self.tx {
++            use std::io::Write;
++            let mut frame = output_queue::Frame::new(CONTROLLED_OUTPUT_FRAME_BYTES);
++            let encoded = frame.write_all(b"data: ")
++                .and_then(|_| serde_json::to_writer(&mut frame, value).map_err(std::io::Error::other))
++                .and_then(|_| frame.write_all(b"\n\n"));
++            match encoded {
++                Ok(()) => self.send(frame.into_bytes()),
++                Err(_) => tx.abort(output_queue::Fault::OversizedFrame),
++            }
++            return;
++        }
+         let mut line = b"data: ".to_vec();
+         line.extend_from_slice(
+             serde_json::to_string(value).unwrap_or_default().as_bytes(),
+@@ -888,7 +933,64 @@
+ /// the response has started: a failed write, a reset or a confirmed EOF
+ /// flags cancellation for the engine, which stops at the next prefill chunk
+ /// or decoded token.
+-fn relay(
++fn relay(stream: TcpStream, http11: bool, rx: ResponseRx, cancelled: Arc<AtomicBool>) {
++    match rx {
++        ResponseRx::Legacy(rx) => relay_legacy(stream, http11, rx, cancelled),
++        ResponseRx::Controlled(rx) => relay_controlled(stream, http11, rx, cancelled),
++    }
++}
++
++// Controlled transport only: each blocking write has a finite timeout. Queue
++// producers always try_send; a slow reader cannot block the shared GPU worker.
++fn controlled_output_error_sse() -> &'static [u8] { b"data: {\"error\":{\"type\":\"server_error\",\"code\":\"output_backpressure\",\"message\":\"controlled_output_queue_overflow\"}}\n\ndata: [DONE]\n\n" }
++
++fn relay_controlled(stream: TcpStream, http11: bool, rx: output_queue::Reader<Out>, cancelled: Arc<AtomicBool>) {
++    use output_queue::Read;
++    if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
++        cancelled.store(true, Ordering::Relaxed); return;
++    }
++    let watched = http::Watched::new(stream, http11, cancelled.clone());
++    let first = match rx.recv() {
++        Read::Message(value) => value,
++        Read::Fault(_) => {
++            let _ = watched.respond(503, "application/json", &error_json("server_error", "controlled_output_queue_overflow"));
++            return;
++        }
++        Read::Closed => return,
++    };
++    let (status, content_type) = match &first.value {
++        Out::Start { status, content_type } => (*status, *content_type),
++        _ => { cancelled.store(true, Ordering::Relaxed); return; }
++    };
++    drop(first);
++    let mut response = match http::ChunkedResponse::start(watched, status, content_type) {
++        Ok(value) => value, Err(_) => { cancelled.store(true, Ordering::Relaxed); return; }
++    };
++    loop {
++        match rx.recv() {
++            Read::Message(value) => match &value.value {
++                Out::Body(bytes) => { if response.write_chunk(bytes).is_err() { cancelled.store(true, Ordering::Relaxed); return; } }
++                Out::End => break,
++                Out::Start { .. } => { cancelled.store(true, Ordering::Relaxed); return; }
++            },
++            Read::Fault(_) => {
++                // Best-effort typed error within the socket timeout. Never a
++                // normal length/stop terminal; cancellation stays true even if
++                // the peer receives the error and the protocol end marker.
++                if content_type == "text/event-stream" {
++                    let _ = response.write_chunk(controlled_output_error_sse());
++                } else {
++                    let _ = response.write_chunk(&error_json("server_error", "controlled_output_queue_overflow"));
++                }
++                let _ = response.finish(); return;
++            }
++            Read::Closed => return,
++        }
++    }
++    if !cancelled.load(Ordering::Relaxed) { let _ = response.finish(); }
++}
++
++fn relay_legacy(
+     stream: TcpStream,
+     http11: bool,
+     rx: Receiver<Out>,
+@@ -2790,8 +2892,15 @@
+                 }
+                 State::Ready | State::Idle | State::Reloading | State::Recovering => {}
+             }
+-            let (tx, rx) = mpsc::channel();
+             let cancelled = control_admission.as_ref().map_or_else(||Arc::new(AtomicBool::new(false)),|g|g.cancelled.clone());
++            let (tx, rx) = if control_admission.is_some() {
++                let (tx, rx) = output_queue::bounded(CONTROLLED_OUTPUT_MESSAGES,
++                    CONTROLLED_OUTPUT_RETAINED_BYTES, CONTROLLED_OUTPUT_FRAME_BYTES, cancelled.clone());
++                (ResponseTx::Controlled(tx), ResponseRx::Controlled(rx))
++            } else {
++                let (tx, rx) = mpsc::channel();
++                (ResponseTx::Legacy(tx), ResponseRx::Legacy(rx))
++            };
+             if let Some(guard)=control_admission.as_mut() {
+                 if guard.publish().is_err() {drop(prepared);drop(control_admission.take());
+                     refuse(stream,"mtp2 queue",503,"server_error","mtp2_control_queue_rejected");return;}
+diff --git a/src/serve/output_queue.rs b/src/serve/output_queue.rs
+new file mode 100644
+--- /dev/null
++++ b/src/serve/output_queue.rs
+@@ -0,0 +1,140 @@
++//! CPU-only prototype: nonblocking message+byte bounded controlled response.
++//! A received envelope keeps its byte reservation until the socket writer
++//! finishes/discards it. Faults cancel only this row; no GPU fence/kernel call.
++use std::sync::{Arc, atomic::{AtomicBool,AtomicU8,AtomicUsize,Ordering},mpsc::{self,SyncSender,Receiver,TrySendError}};
++use std::io::{self,Write};
++
++/// Only used by controlled serialization. Checks before reserving/appending;
++/// legacy serde/to_string stays unchanged. Capacity is also kept <= limit.
++pub struct Frame {bytes:Vec<u8>,limit:usize}
++impl Frame {
++    pub fn new(limit:usize)->Self{Self{bytes:Vec::new(),limit}}
++    pub fn into_bytes(self)->Vec<u8>{self.bytes}
++}
++impl Write for Frame {
++    fn write(&mut self,bytes:&[u8])->io::Result<usize>{
++        let required=self.bytes.len().checked_add(bytes.len()).filter(|n|*n<=self.limit)
++            .ok_or_else(||io::Error::other("controlled_output_frame_oversize"))?;
++        if required>self.bytes.capacity(){
++            let target=required.max(self.bytes.capacity().saturating_mul(2)).max(256).min(self.limit);
++            self.bytes.try_reserve_exact(target-self.bytes.len()).map_err(|_|io::Error::other("controlled_output_frame_allocation"))?;
++        }
++        self.bytes.extend_from_slice(bytes);Ok(bytes.len())
++    }
++    fn flush(&mut self)->io::Result<()>{Ok(())}
++}
++
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++#[repr(u8)]
++pub enum Fault { MessageFull=1, ByteFull=2, OversizedFrame=3, Disconnected=4 }
++impl Fault {fn from(value:u8)->Option<Self>{match value {1=>Some(Self::MessageFull),2=>Some(Self::ByteFull),3=>Some(Self::OversizedFrame),4=>Some(Self::Disconnected),_=>None}}}
++struct State {bytes:AtomicUsize,messages:AtomicUsize,fault:AtomicU8,cancelled:Arc<AtomicBool>,max_messages:usize,max_bytes:usize,max_frame:usize}
++pub struct Envelope<T>{pub value:T,size:usize,state:Arc<State>}
++impl<T> Drop for Envelope<T>{fn drop(&mut self){self.state.bytes.fetch_sub(self.size,Ordering::AcqRel);self.state.messages.fetch_sub(1,Ordering::AcqRel);}}
++// A fault wake carries no body/reservation. If try_send finds a full channel,
++// the waiting reader already has a message available and sees the sticky fault.
++enum Entry<T>{Message(Envelope<T>),FaultWake}
++pub struct Sender<T>{tx:SyncSender<Entry<T>>,state:Arc<State>}
++pub struct Reader<T>{rx:Receiver<Entry<T>>,state:Arc<State>}
++pub enum Read<T>{Message(Envelope<T>),Fault(Fault),Closed}
++
++pub fn bounded<T>(messages:usize,bytes:usize,max_frame:usize,cancelled:Arc<AtomicBool>)->(Sender<T>,Reader<T>){
++    assert!(messages>0&&bytes>0&&max_frame>0&&max_frame<=bytes);
++    let(tx,rx)=mpsc::sync_channel(messages);
++    let state=Arc::new(State{bytes:AtomicUsize::new(0),messages:AtomicUsize::new(0),fault:AtomicU8::new(0),cancelled,max_messages:messages,max_bytes:bytes,max_frame});
++    (Sender{tx,state:state.clone()},Reader{rx,state})
++}
++impl<T> Sender<T>{
++    fn fail(&self,fault:Fault){
++        let first=self.state.fault.compare_exchange(0,fault as u8,Ordering::AcqRel,Ordering::Acquire).is_ok();
++        self.state.cancelled.store(true,Ordering::Release);
++        if first {let _=self.tx.try_send(Entry::FaultWake);}
++    }
++    pub fn abort(&self,fault:Fault){self.fail(fault);}
++    pub fn try_send(&self,value:T,size:usize)->Result<(),Fault>{
++        if let Some(fault)=Fault::from(self.state.fault.load(Ordering::Acquire)){return Err(fault)}
++        if size>self.state.max_frame{self.fail(Fault::OversizedFrame);return Err(Fault::OversizedFrame)}
++        if self.state.messages.fetch_update(Ordering::AcqRel,Ordering::Acquire,|used|
++            used.checked_add(1).filter(|total|*total<=self.state.max_messages)).is_err(){
++            self.fail(Fault::MessageFull);return Err(Fault::MessageFull)
++        }
++        if self.state.bytes.fetch_update(Ordering::AcqRel,Ordering::Acquire,|used|
++            used.checked_add(size).filter(|total|*total<=self.state.max_bytes)).is_err(){
++            self.state.messages.fetch_sub(1,Ordering::AcqRel);
++            self.fail(Fault::ByteFull);return Err(Fault::ByteFull)
++        }
++        let envelope=Envelope{value,size,state:self.state.clone()};
++        match self.tx.try_send(Entry::Message(envelope)){
++            Ok(())=>Ok(()),
++            Err(TrySendError::Full(message))=>{drop(message);self.fail(Fault::MessageFull);Err(Fault::MessageFull)},
++            Err(TrySendError::Disconnected(message))=>{drop(message);self.fail(Fault::Disconnected);Err(Fault::Disconnected)},
++        }
++    }
++    pub fn retained_bytes(&self)->usize{self.state.bytes.load(Ordering::Acquire)}
++    pub fn retained_messages(&self)->usize{self.state.messages.load(Ordering::Acquire)}
++}
++impl<T> Reader<T>{
++    pub fn recv(&self)->Read<T>{
++        if let Some(fault)=Fault::from(self.state.fault.load(Ordering::Acquire)){return Read::Fault(fault)}
++        match self.rx.recv(){
++            Ok(Entry::Message(message))=>{
++                if let Some(fault)=Fault::from(self.state.fault.load(Ordering::Acquire)){drop(message);Read::Fault(fault)}
++                else{Read::Message(message)}
++            },Ok(Entry::FaultWake)|Err(_)=>match Fault::from(self.state.fault.load(Ordering::Acquire)){Some(f)=>Read::Fault(f),None=>Read::Closed}
++        }
++    }
++}
++
++#[cfg(test)]mod tests{
++    use super::*;
++    #[test]fn exactbyte_boundary_and_inflight_writer_counted(){
++        let(tx,rx)=bounded(4,8,8,Arc::new(AtomicBool::new(false)));
++        tx.try_send(vec![0;8],8).unwrap();let held=match rx.recv(){Read::Message(v)=>v,_=>panic!()};
++        assert_eq!(tx.retained_bytes(),8);drop(held);assert_eq!(tx.retained_bytes(),0);
++    }
++    #[test]fn fullbyte_fails_no_wrap_and_cancels_only_owned_row(){
++        let a=Arc::new(AtomicBool::new(false));let b=Arc::new(AtomicBool::new(false));
++        let(tx,_rx)=bounded(4,8,8,a.clone());tx.try_send(1,8).unwrap();
++        assert_eq!(tx.try_send(2,1),Err(Fault::ByteFull));assert!(a.load(Ordering::Acquire));assert!(!b.load(Ordering::Acquire));
++    }
++    #[test]fn message_count_full_is_nonblocking_and_reservation_rolled_back(){
++        let(tx,_rx)=bounded(1,16,8,Arc::new(AtomicBool::new(false)));tx.try_send(1,8).unwrap();
++        assert_eq!(tx.try_send(2,8),Err(Fault::MessageFull));assert_eq!(tx.retained_bytes(),8);
++    }
++    #[test]fn oversized_rejected_before_queue_or_byte_growth(){
++        let(tx,_)=bounded(4,16,8,Arc::new(AtomicBool::new(false)));
++        assert_eq!(tx.try_send(1,9),Err(Fault::OversizedFrame));assert_eq!(tx.retained_bytes(),0);
++    }
++    #[test]fn disconnected_releases_reserved_bytes(){
++        let(tx,rx)=bounded(4,16,8,Arc::new(AtomicBool::new(false)));drop(rx);
++        assert_eq!(tx.try_send(1,8),Err(Fault::Disconnected));assert_eq!(tx.retained_bytes(),0);
++    }
++    #[test]fn fault_is_typed_and_never_normal_end(){
++        let(tx,rx)=bounded(1,16,8,Arc::new(AtomicBool::new(false)));tx.try_send(1,8).unwrap();
++        tx.try_send(2,8).unwrap_err();assert!(matches!(rx.recv(),Read::Fault(Fault::MessageFull)));
++    }
++    #[test]fn two_rows_independent_peer_progress_when_other_backlogged(){
++        let(a,_rx)=bounded(1,16,8,Arc::new(AtomicBool::new(false)));let(b,rx)=bounded(4,16,8,Arc::new(AtomicBool::new(false)));
++        a.try_send(1,8).unwrap();a.try_send(2,8).unwrap_err();
++        b.try_send(3,8).unwrap();assert!(matches!(rx.recv(),Read::Message(_)));assert_eq!(b.retained_bytes(),0);
++    }
++    #[test]fn bounded_frame_rejects_before_vec_growth(){
++        let mut frame=Frame::new(8);frame.write_all(b"12345678").unwrap();
++        assert!(frame.write_all(b"9").is_err());let bytes=frame.into_bytes();assert_eq!(bytes.len(),8);assert!(bytes.capacity()<=8);
++    }
++    #[test]fn retained_message_limit_includes_inflight_writer(){
++        let(tx,rx)=bounded(1,16,8,Arc::new(AtomicBool::new(false)));tx.try_send(1,8).unwrap();
++        let held=match rx.recv(){Read::Message(v)=>v,_=>panic!()};
++        assert_eq!(tx.retained_messages(),1);assert_eq!(tx.try_send(2,8),Err(Fault::MessageFull));
++        assert_eq!(tx.retained_bytes(),8);drop(held);assert_eq!(tx.retained_messages(),0);
++    }
++    #[test]fn empty_waiting_reader_wakes_on_serialization_fault_without_sender_drop(){
++        let(tx,rx)=bounded::<u8>(1,16,8,Arc::new(AtomicBool::new(false)));
++        let(done_tx,done_rx)=mpsc::channel();
++        let handle=std::thread::spawn(move||{done_tx.send(matches!(rx.recv(),Read::Fault(Fault::OversizedFrame))).unwrap();});
++        tx.abort(Fault::OversizedFrame);
++        let result=done_rx.recv_timeout(std::time::Duration::from_secs(2));
++        // Always drop the sender and join, even if the assertion fails.
++        drop(tx);handle.join().unwrap();assert_eq!(result.unwrap(),true);
++    }
++}
+diff --git a/src/serve/request.rs b/src/serve/request.rs
+--- a/src/serve/request.rs
++++ b/src/serve/request.rs
+@@ -1491,7 +1491,9 @@
+         } else {
+             let body = response_body(closing, out.collected);
+             sink.start(200, "application/json");
+-            sink.send(serde_json::to_vec(&body)?);
++            if !sink.send_controlled_json(&body) {
++                sink.send(serde_json::to_vec(&body)?);
++            }
+         }
+         Ok(())
+     }
+diff --git a/tests/unit/serve/request.rs b/tests/unit/serve/request.rs
+--- a/tests/unit/serve/request.rs
++++ b/tests/unit/serve/request.rs
+@@ -764,7 +764,7 @@
+ fn sink() -> (Sink, std::sync::mpsc::Receiver<crate::serve::Out>) {
+     let (tx, rx) = std::sync::mpsc::channel();
+     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+-    (Sink { tx, cancelled, started: false, metadata: RequestMeta::new("req-100-1".into()), control_admission: None }, rx)
++    (Sink { tx: crate::serve::ResponseTx::Legacy(tx), cancelled, started: false, metadata: RequestMeta::new("req-100-1".into()), control_admission: None }, rx)
+ }
+ 
+ /// What the responder thread would get, one line per message.
