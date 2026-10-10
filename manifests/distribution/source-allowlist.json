@@ -245,6 +245,7 @@
     "scripts/distribution/patches/lily-opt64/01-prefix-privacy.patch",
     "scripts/distribution/patches/lily-opt64/02-cancel-drop-queue-terminal.patch",
     "scripts/distribution/patches/lily-opt64/03-effective-native-metadata.patch",
+    "scripts/distribution/test_mtp2_shared_compiler_binding.py",
     "scripts/distribution/test_mtp2_shared_config.py",
     "scripts/distribution/test_mtp2_shared_coordinator.py",
     "scripts/distribution/test_mtp2_shared_gateway.py",

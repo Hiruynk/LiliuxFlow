@@ -443,6 +443,8 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
     env['PATH']=str(data/'runtime/toolchains/node/bin')+':'+str(go.parent)+':'+env['PATH']
     env['PRISMA_USE_GLOBAL_NODE']='true'
     env['PRISMA_USE_NODEJS_BIN']='false'
+    if shared_selected:
+        cargo,env,shared_base_toolchain=_shared_rust_toolchain(cargo,env)
     cargo=Path(cargo or shutil.which('cargo') or Path.home()/'.cargo/bin/cargo')
     rust=subprocess.run([str(cargo),'--version'],capture_output=True,text=True,env=env)
     gv=subprocess.run([str(go),'version'],capture_output=True,text=True)
@@ -506,6 +508,8 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
             steps.append(command([node,npm_cli,'run','build'],cwd=target,env=env,log=logs/(name+'-ui.txt')))
     steps.append(command([cargo,'build','--release','--locked','--bin','lily','--target-dir',work/'cargo-target'],cwd=lily,env=env,log=logs/'lily-build.txt'))
     shutil.copyfile(work/'cargo-target/release/lily',native/'lily');(native/'lily').chmod(0o700)
+    if shared_selected and _shared_rust_toolchain(cargo,env)[2]!=shared_base_toolchain:
+        raise DistributionError('shared base compiler or SDK changed during compilation')
     if opt_pin:
         steps.append(command([cargo,'build','--release','--locked','--bin','lily','--target-dir',work/'cargo-opt64-target'],cwd=opt_source,env=env,log=logs/'lily-opt64-build.txt'))
         shutil.copyfile(work/'cargo-opt64-target/release/lily',native/'lily-opt64');(native/'lily-opt64').chmod(0o700)
@@ -554,6 +558,8 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
            'binaries':{name:{'path':str(path.relative_to(data)),'sha256':sha256(path)} for name,path in binaries.items()},'build_tools':runtime_node,
            'postgresql_bin':str(pg_bin),'postgresql_sha256':sha256(pg_bin/'postgres'),'postgresql_tools':{name:sha256(pg_bin/name) for name in ('postgres','initdb','pg_ctl','psql','pg_dump','pg_restore')},'ui_recipe_sha256':ui_recipe,'ui_locale_acceptance':False,
            'build_steps':steps,'fetches':fetch_receipts,'toolchains':{'rust':rust.stdout.strip(),'go':gv.stdout.strip(),'node':nv.stdout.strip(),'postgresql':pv.stdout.strip()}}
+    if shared_selected:
+        trust['toolchains']['shared_base_rust']=shared_base_toolchain
     if opt_pin:
         from optin_engine import generated_record
         trust['optin_engines']={OPT64_ENGINE:generated_record(opt_recipe,sha256(native/'lily-opt64'))}

@@ -34,7 +34,15 @@ def shared_model_record(trusted,record):
         from mtp2_shared_runner import RELEASE_EXPECTATION
         from mtp2_shared_runtime import validate_shared_extension, normal_shared_view
         if RELEASE_EXPECTATION is None:raise DistributionError('shared production stop recipe is unavailable')
-        selected=normal_shared_view(trusted)
+        # Public stop validates the base without a checkpoint. Reuse the
+        # existing verified receipt/stat/metadata gate for normal shared stop;
+        # this does not rehash safetensors, load a model or authorize inference.
+        from trust import validate
+        verified=validate(trusted['data_root'],require_checkpoint=True)
+        if (verified['config']!=trusted['config'] or verified['trust']!=trusted['trust']
+                or verified['source_root']!=trusted['source_root'] or verified['data_root']!=trusted['data_root']):
+            raise DistributionError('shared shutdown installation changed during revalidation')
+        selected=normal_shared_view(verified)
         installation=validate_shared_extension(selected,RELEASE_EXPECTATION);source=selected['source_root']
         if installation is None:raise DistributionError('shared model executable is not installed')
     if record.get('binary_sha256')!=installation.engine.binary_sha256 or any(record.get(k)!=v for k,v in runtime_identity_fields(installation.engine).items()):

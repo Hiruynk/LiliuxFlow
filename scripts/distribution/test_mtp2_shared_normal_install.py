@@ -14,7 +14,7 @@ from unittest.mock import Mock,patch
 ROOT=Path(__file__).resolve().parents[2]
 sys.dont_write_bytecode=True
 sys.path.insert(0,str(ROOT/'scripts/distribution'))
-import agent,build_native as build,liliuxflow as cli,profile_registry,trust,ui_recipe
+import agent,build_native as build,forced_stop as fs,liliuxflow as cli,profile_registry,trust,ui_recipe
 import mtp2_shared_runtime as shared,mtp2_shared_runner as runner
 from mtp2_shared_recipe import serving_inputs
 from common import DistributionError
@@ -205,6 +205,80 @@ class InstalledTrustTests(unittest.TestCase):
         self.save();trust.verify_checkpoint(f.data)
         self.release=patch.object(runner,'RELEASE_EXPECTATION',expected);self.release.start();self.addCleanup(self.release.stop)
     def save(self):trust.atomic_private_json(self.f.data/'runtime/release-trust.json',self.f.record)
+    def stop_inputs(self):
+        import shlex
+        base=trust.validate(self.f.data,require_checkpoint=False)
+        self.assertIsNone(base['checkpoint'])
+        selected=trust.validate(self.f.data,shared_context=True)
+        installation=shared.validate_shared_extension(selected,runner.RELEASE_EXPECTATION)
+        self.assertIsNotNone(installation)
+        port=19000
+        def ident(pid,ppid):
+            return {'pid':pid,'ppid':ppid,'pgid':pid,'uid':os.getuid(),
+                    'started':'CPU_ONLY_BIRTH','command_sha256':'f'*64}
+        record={'schema_version':1,'installation_id':base['config']['installation_id'],
+            'profile_id':'mtp2-shared','context_tokens':262144,
+            'binary_sha256':installation.engine.binary_sha256,'backend_port':port,
+            'runner':ident(98201,98200),'child':ident(98202,98201),
+            **shared.runtime_identity_fields(installation.engine)}
+        commands={record['runner']['pid']:shlex.join([
+            str(base['binaries']['compat_python']),
+            str(selected['source_root']/'scripts/distribution/mtp2_shared_runner.py'),
+            '--data-root',str(selected['data_root']),'--port',str(port)]),
+            record['child']['pid']:shlex.join(shared.shared_argv(installation,port)+[
+                '--liliuxflow-mtp2-control','--liliuxflow-mtp2-control-key-fd','3'])}
+        return base,record,commands
+    def test_normal_shared_stop_revalidates_tiny_checkpoint_receipt_without_payload_hash(self):
+        base,record,commands=self.stop_inputs();hashed=[];real_hash=trust.sha256
+        def bounded_hash(path):
+            self.assertNotEqual(Path(path).suffix,'.safetensors','Stop must not hash full weights')
+            hashed.append(Path(path).name);return real_hash(path)
+        with patch.object(fs,'exact',return_value=True), \
+             patch.object(fs,'command',side_effect=lambda ident:commands[ident['pid']]), \
+             patch.object(fs.os,'kill',side_effect=AssertionError('classifier must not signal')), \
+             patch.object(trust,'sha256',side_effect=bounded_hash), \
+             patch.object(trust,'verify_checkpoint',side_effect=AssertionError('stop must not reverify weight payload')) as verify, \
+             patch.object(trust,'validate',wraps=trust.validate) as validated:
+            self.assertEqual(fs.shared_model_record(base,record),(record['runner'],record['child']))
+            validated.assert_called_once_with(base['data_root'],require_checkpoint=True)
+            verify.assert_not_called()
+        self.assertIsNone(base['checkpoint']);self.assertTrue(hashed)
+    def test_normal_shared_stop_refuses_wrong_identity_binding_and_unverified_receipt_before_signal(self):
+        base,record,commands=self.stop_inputs()
+        for fault in ('uid','binary','argv'):
+            wrong=copy.deepcopy(record);actual_commands=dict(commands)
+            if fault=='uid':wrong['child']['uid']+=1
+            elif fault=='binary':wrong['binary_sha256']='0'*64
+            else:actual_commands[wrong['child']['pid']]+=' --unauthorized'
+            with self.subTest(fault=fault), \
+                 patch.object(fs,'exact',return_value=True) as exact, \
+                 patch.object(fs,'command',side_effect=lambda ident:actual_commands[ident['pid']]), \
+                 patch.object(fs.os,'kill',side_effect=AssertionError('classifier must not signal')), \
+                 self.assertRaises(DistributionError):
+                fs.shared_model_record(base,wrong)
+            if fault in ('uid','binary'):exact.assert_not_called()
+        original_validate=trust.validate
+        def changed_binding(*args,**kwargs):
+            value=original_validate(*args,**kwargs);changed=copy.copy(value)
+            changed['config']=dict(value['config'],owner_uid=value['config']['owner_uid']+1)
+            return changed
+        with patch.object(trust,'validate',side_effect=changed_binding), \
+             patch.object(fs,'exact',side_effect=AssertionError('changed binding must reject before process access')), \
+             patch.object(fs,'command',side_effect=AssertionError('changed binding must reject before command inspection')), \
+             patch.object(fs.os,'kill',side_effect=AssertionError('classifier must not signal')), \
+             self.assertRaisesRegex(DistributionError,'installation changed during revalidation'):
+            fs.shared_model_record(base,record)
+        receipt=self.f.data/'runtime/checkpoint-verified.json';original=receipt.read_bytes()
+        try:
+            value=json.loads(original);value['validation']='metadata_only';value['payload_verified']=False
+            receipt.write_text(json.dumps(value));receipt.chmod(0o600)
+            with patch.object(fs,'exact',side_effect=AssertionError('unverified receipt must reject before process access')), \
+                 patch.object(fs,'command',side_effect=AssertionError('unverified receipt must reject before command inspection')), \
+                 patch.object(fs.os,'kill',side_effect=AssertionError('classifier must not signal')), \
+                 self.assertRaises(DistributionError):
+                fs.shared_model_record(base,record)
+        finally:
+            receipt.write_bytes(original);receipt.chmod(0o600)
     def test_actual_installed_shared_extension_and_source_view_with_tiny_checkpoint(self):
         plain=trust.validate(self.f.data);selected=trust.validate(self.f.data,shared_context=True)
         self.assertEqual(len(selected['registry'].enabled_profiles),6);self.assertEqual(len(plain['registry'].enabled_profiles),3)
