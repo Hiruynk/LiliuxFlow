@@ -849,6 +849,7 @@ def _force_stop(trusted,*,dry_run=False):
         if plistlib.loads(plist_raw)!=decoded:raise DistributionError('shared stop initial plist changed')
     owner=fs.identity(record.get('agent'))
     if not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):raise DistributionError('force stop agent identity/command differs')
+    if shared_shutdown:host_lease=_shared_stop_host_lease_snapshot(data,owner,fs)
     target='gui/'+str(os.getuid())+'/'+label
     printed=subprocess.run(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=5)
     import re
@@ -911,6 +912,14 @@ def _force_stop(trusted,*,dry_run=False):
         _wait_launchd_removed(target,lambda:all(observe(x) for x in captured+[owner]+([pg] if pg is not None else [])),runner=subprocess.run)
         if shared_record is None:_force_clear_model_records(trusted,captured,fs)
         else:_force_clear_model_records(trusted,captured,fs,shared_record=shared_record)
+        if shared_shutdown:
+            if state.exists() and read_object(private_file(state))!=record:
+                raise DistributionError('shared stop agent registry changed before host lease retirement')
+            info=private_file(plist).stat()
+            if (info.st_dev,info.st_ino)!=plist_stamp or private_file(plist).read_bytes()!=plist_raw:
+                raise DistributionError('shared stop plist changed before host lease retirement')
+            _shared_stop_retire_host_lease(data,owner,fs,host_lease,
+                lambda:all(observe(x) for x in captured+[owner]+([pg] if pg is not None else [])),target)
         if state.exists():
             if read_object(private_file(state))!=record:raise DistributionError('force stop agent registry changed; retained for review')
             state.unlink()
@@ -920,6 +929,59 @@ def _force_stop(trusted,*,dry_run=False):
         for value in reversed(frozen):
             try:fs.send(value,signal.SIGCONT)
             except (DistributionError,OSError):pass
+
+def _shared_stop_host_lease_snapshot(data,owner,fs):
+    """Finite agent lease only; never adopt a different holder or create a path."""
+    lock=no_symlinks(data/'run/host-mutation.lease')
+    if not lock.exists():return None
+    info=lock.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+        raise DistributionError('shared stop host lease directory owner/mode differs')
+    if {path.name for path in lock.iterdir()}!={'lease.json'}:
+        raise DistributionError('shared stop host lease contents differ')
+    path=private_file(lock/'lease.json');file_info=path.stat()
+    if file_info.st_size>4096:raise DistributionError('shared stop host lease exceeds finite holder size')
+    raw=path.read_bytes()
+    try:holder=json.loads(raw)
+    except (ValueError,UnicodeError):raise DistributionError('shared stop host lease holder is malformed') from None
+    if fs.identity(holder)!=owner:raise DistributionError('shared stop host lease holder differs from captured agent')
+    stamp=(info.st_dev,info.st_ino);file_stamp=(file_info.st_dev,file_info.st_ino)
+    now=lock.stat();file_now=private_file(path).stat()
+    if ((now.st_dev,now.st_ino)!=stamp or now.st_uid!=os.getuid() or now.st_mode&0o077
+            or (file_now.st_dev,file_now.st_ino)!=file_stamp
+            or path.read_bytes()!=raw or {path.name for path in lock.iterdir()}!={'lease.json'}):
+        raise DistributionError('shared stop host lease changed during capture')
+    return stamp,file_stamp,raw
+
+def _shared_stop_retire_host_lease(data,owner,fs,captured,released,target):
+    """Quarantine only this operation's captured ended agent lease after shutdown."""
+    lock=no_symlinks(data/'run/host-mutation.lease')
+    current=_shared_stop_host_lease_snapshot(data,owner,fs)
+    if current is None:return
+    if captured is None or current!=captured:
+        raise DistributionError('shared stop host lease was replaced or not captured')
+    _wait_launchd_removed(target,released,runner=subprocess.run)
+    if released() is not True:raise DistributionError('shared stop host lease owner/resources remain')
+    if _shared_stop_host_lease_snapshot(data,owner,fs)!=captured:
+        raise DistributionError('shared stop host lease changed before quarantine')
+    quarantine=lock.with_name(lock.name+'.portable-stopped-'+uuid.uuid4().hex)
+    os.rename(lock,quarantine)
+    try:
+        # Preserve the exact directory/file inodes and bytes for private review.
+        info=quarantine.stat();path=private_file(quarantine/'lease.json');file_info=path.stat()
+        if ((info.st_dev,info.st_ino)!=captured[0] or info.st_uid!=os.getuid() or info.st_mode&0o077
+                or (file_info.st_dev,file_info.st_ino)!=captured[1]
+                or path.read_bytes()!=captured[2] or fs.identity(read_object(path))!=owner
+                or {path.name for path in quarantine.iterdir()}!={'lease.json'}):
+            raise DistributionError('shared stop host lease quarantine identity differs')
+        _wait_launchd_removed(target,released,runner=subprocess.run)
+        if released() is not True or no_symlinks(lock).exists():
+            raise DistributionError('shared stop host lease ownership changed during quarantine')
+    except BaseException:
+        if not lock.exists() and quarantine.exists():
+            info=quarantine.stat()
+            if (info.st_dev,info.st_ino)==captured[0]:os.rename(quarantine,lock)
+        raise
 
 def _shared_launchd_job_fields(lines):
     """Read only job-level fields/argv; nested launchd metadata is opaque."""
