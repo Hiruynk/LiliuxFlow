@@ -22,5 +22,5 @@ export function sharedModelRecords(response){
  const seen=new Set();
  /** @type {Record<string,number>} */
  const contexts={'64k':65536,'128k':131072,'262k':262144};
- return response.data.filter((/** @type {any} */ row)=>typeof row?.id==='string'&&isSharedAlias(row.id)&&!seen.has(row.id)&&seen.add(row.id)).map((/** @type {any} */ row)=>({id:row.id,name:row.id,state:'unknown',description:'',unlisted:false,peerID:'',context_length:contexts[row.id.split('-').at(-1)],modalities:{in:['text','image'],out:['text']}}));
+ return response.data.filter((/** @type {any} */ row)=>typeof row?.id==='string'&&isSharedAlias(row.id)&&!seen.has(row.id)&&seen.add(row.id)).map((/** @type {any} */ row)=>({id:row.id,name:row.id,state:'unknown',playgroundType:'model',description:'',unlisted:false,peerID:'',context_length:contexts[row.id.split('-').at(-1)],modalities:{in:['text','image'],out:['text']}}));
 }
