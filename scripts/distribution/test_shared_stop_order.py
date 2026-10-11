@@ -77,6 +77,10 @@ class SharedStopOrderTests(unittest.TestCase):
             return types.SimpleNamespace(wait=lambda timeout: events.append('wait'), returncode=0)
 
         stack = self.patches()
+        def live_owner_proof(*args):
+            if not self.exact(self.owner):
+                raise DistributionError('shared stop frozen agent identity/command differs')
+        stack.enter_context(patch.object(agent, '_shared_stop_bootout_proof', side_effect=live_owner_proof))
         stack.enter_context(patch.object(forced_stop, 'shared_exit_observer', side_effect=lambda identities,diagnostic: forced_stop.exited))
         stack.enter_context(patch.object(forced_stop, 'descendants', side_effect=lambda pid: [] if pg and pid == 12002 else [self.child]))
         stack.enter_context(patch.object(forced_stop, 'terminate_all', side_effect=terminate))

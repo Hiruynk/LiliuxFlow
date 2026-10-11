@@ -844,6 +844,9 @@ def _force_stop(trusted,*,dry_run=False):
             or not isinstance(arguments,list) or arguments[:4]!=prefix or arguments[4:] not in ([],['--controlplane-only'],['--mtp2-shared-context'])):
         raise DistributionError('force stop owned registry/plist installation differs')
     shared_shutdown=record.get('shared_context') is True and arguments[4:]==['--mtp2-shared-context']
+    if shared_shutdown:
+        info=private_file(plist).stat();plist_stamp=(info.st_dev,info.st_ino);plist_raw=private_file(plist).read_bytes()
+        if plistlib.loads(plist_raw)!=decoded:raise DistributionError('shared stop initial plist changed')
     owner=fs.identity(record.get('agent'))
     if not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):raise DistributionError('force stop agent identity/command differs')
     target='gui/'+str(os.getuid())+'/'+label
@@ -899,8 +902,7 @@ def _force_stop(trusted,*,dry_run=False):
                 private_run([postgres_tools(trusted)/'pg_ctl','-D',data/'postgres/data','-m','fast','-w','-t','30','stop'],env=pg_environment(trusted),timeout=40)
             if not observe(pg):raise DistributionError('owned PostgreSQL remains after normal fast stop')
         if shared_shutdown:
-            if not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):
-                raise DistributionError('shared stop frozen agent identity/command differs')
+            _shared_stop_bootout_proof(trusted,state,record,plist,decoded,plist_raw,plist_stamp,owner,arguments,observe,fs,target)
             bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if shared_shutdown:fs.terminate_all([owner],grace=5,resume=True,observer=observe)
         else:fs.terminate_all([owner],grace=5,resume=True)
@@ -918,6 +920,83 @@ def _force_stop(trusted,*,dry_run=False):
         for value in reversed(frozen):
             try:fs.send(value,signal.SIGCONT)
             except (DistributionError,OSError):pass
+
+def _shared_launchd_job_fields(lines):
+    """Read only job-level fields/argv; nested launchd metadata is opaque."""
+    import re
+    def indent(line):return line[:len(line)-len(line.lstrip(' \t'))]
+    stack=[(indent(lines[0]),None)];top_indent=None;fields={};arguments=None
+    for line in lines[1:]:
+        text=line.strip();prefix=indent(line)
+        if not text:continue
+        if not stack:raise DistributionError('shared stop launchd trailing job data')
+        if text=='}':
+            if prefix!=stack[-1][0]:raise DistributionError('shared stop launchd block indentation differs')
+            stack.pop();continue
+        if not prefix.startswith(stack[-1][0]) or len(prefix)<=len(stack[-1][0]):
+            raise DistributionError('shared stop launchd field indentation differs')
+        if len(stack)==2 and stack[-1][1]=='arguments':
+            arguments.append(text);continue
+        match=re.fullmatch(r'(.+?)\s*=\s*(.*)',text)
+        if len(stack)==1:
+            if top_indent is None:top_indent=prefix
+            if prefix!=top_indent or match is None:raise DistributionError('shared stop launchd top-level field shape differs')
+            key,value=match.groups()
+            if key in fields:raise DistributionError('shared stop launchd duplicate top-level field')
+            fields[key]=value
+            if key=='arguments':
+                if value!='{':raise DistributionError('shared stop launchd arguments are unknown')
+                arguments=[]
+        if match is not None and match[2]=='{':stack.append((prefix,match[1]))
+    if stack:raise DistributionError('shared stop launchd job blocks are incomplete')
+    return fields,arguments
+
+def _shared_stop_bootout_proof(trusted,state,record,plist,decoded,raw,stamp,owner,arguments,observe,fs,target):
+    """Same-operation captured owner only; no replacement PID or signal adoption."""
+    import hashlib,re
+    current=fs.inspect(owner['pid']);actual_command=None
+    if current==owner:actual_command=fs.command(owner)
+    live=current==owner and actual_command==' '.join(arguments)
+    if not live:
+        write_json_new(private_directory(trusted['data_root']/'run')/('shared-stop-agent-check-'+uuid.uuid4().hex+'.json'),{
+            'schema_version':1,'enum':'SHARED_STOP_CAPTURED_AGENT_CHECK','pid':owner['pid'],
+            'owner_absent_at_check':current is None,
+            'changed_fields':[key for key in fs.IDENTITY_FIELDS if current is None or current[key]!=owner[key]],
+            'observed':None if current is None else {key:current[key] for key in ('pid','ppid','pgid','uid')},
+            'observed_command_sha256':None if actual_command is None else hashlib.sha256(actual_command.encode()).hexdigest(),
+            'observed_identity_command_sha256':None if current is None else current['command_sha256'],
+            'expected_command_sha256':hashlib.sha256(' '.join(arguments).encode()).hexdigest(),
+            'command_matches_plist':None if actual_command is None else actual_command==' '.join(arguments),
+            'phase':'after_captured_tree_and_pg_before_bootout','signal_authorized':False,'cause':'UNKNOWN'})
+        if current is not None and any(current[key]!=owner[key] for key in ('pid','pgid','uid','started')):
+            raise DistributionError('shared stop captured agent birth/group/owner changed')
+        if not observe(owner):raise DistributionError('shared stop frozen agent identity/command differs')
+    for _ in range(2):
+        info=private_file(plist).stat()
+        if (info.st_dev,info.st_ino)!=stamp or private_file(plist).read_bytes()!=raw:
+            raise DistributionError('shared stop plist changed before bootout')
+        if state.exists() and read_object(private_file(state))!=record:
+            raise DistributionError('shared stop agent registry changed before bootout')
+        result=subprocess.run(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=3)
+        lines=result.stdout.splitlines()
+        if result.returncode or result.stderr.strip() or len(result.stdout.encode())>65536 or not lines or lines[0].strip()!=target+' = {':
+            raise DistributionError('shared stop launchd job is unknown before bootout')
+        fields,printed_arguments=_shared_launchd_job_fields(lines)
+        if (printed_arguments!=arguments or fields.get('path')!=str(plist) or fields.get('program')!=arguments[0]
+                or fields.get('working directory')!=decoded['WorkingDirectory']):
+            raise DistributionError('shared stop launchd job/plist identity differs')
+        pids=[fields['pid']] if 'pid' in fields else []
+        if live:
+            if pids!=[str(owner['pid'])] or not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):
+                raise DistributionError('shared stop live agent/job identity changed')
+        else:
+            if pids not in ([],[str(owner['pid'])]):raise DistributionError('shared stop launchd replacement PID refused')
+            if pids:
+                if fs.inspect(owner['pid']) is not None or fs.inspect(owner['pid']) is not None:
+                    raise DistributionError('shared stop cached launchd PID absence is unproven')
+            elif fields.get('state') not in ('spawn scheduled','not running'):
+                raise DistributionError('shared stop no-PID launchd state is unknown')
+            if not observe(owner):raise DistributionError('shared stop captured agent exit changed')
 
 def _force_clear_shared_model_records(trusted,captured,fs,lease,record):
     # The record was authenticated while the frozen child was still captured.
