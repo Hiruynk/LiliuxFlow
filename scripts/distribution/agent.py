@@ -882,25 +882,31 @@ def _force_stop(trusted,*,dry_run=False):
             for value in fs.shared_model_record(trusted,shared_record):
                 if fs.exact(value) and bypid.get(value['pid'])!=value:
                     raise DistributionError('owned shared model lies outside verified agent tree')
+        observe=fs.exited
+        if shared_shutdown:
+            observe=fs.shared_exit_observer(captured+[owner]+([pg] if pg is not None else []),
+                lambda value:write_json_new(private_directory(data/'run')/('shared-stop-first-identity-'+uuid.uuid4().hex+'.json'),value))
         # Shared descendants retain their captured parent while they exit.
         # Remove the launchd job before allowing the frozen owner to exit,
         # so KeepAlive cannot restart it between teardown and job removal.
         if not shared_shutdown:
             bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        fs.terminate_all(captured,resume=True)
+        if shared_shutdown:fs.terminate_all(captured,resume=True,observer=observe)
+        else:fs.terminate_all(captured,resume=True)
         if pg is not None:
             if fs.exact(pg):
                 if private_file(data/'postgres/data/postmaster.pid').read_bytes()!=pgcontent:raise DistributionError('owned PGDATA PID file changed before fast stop')
                 private_run([postgres_tools(trusted)/'pg_ctl','-D',data/'postgres/data','-m','fast','-w','-t','30','stop'],env=pg_environment(trusted),timeout=40)
-            if not fs.exited(pg):raise DistributionError('owned PostgreSQL remains after normal fast stop')
+            if not observe(pg):raise DistributionError('owned PostgreSQL remains after normal fast stop')
         if shared_shutdown:
             if not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):
                 raise DistributionError('shared stop frozen agent identity/command differs')
             bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        fs.terminate_all([owner],grace=5,resume=True)
+        if shared_shutdown:fs.terminate_all([owner],grace=5,resume=True,observer=observe)
+        else:fs.terminate_all([owner],grace=5,resume=True)
         bootout.wait(timeout=15)
-        if bootout.returncode or any(not fs.exited(x) for x in captured+[owner]):raise DistributionError('owned force shutdown incomplete; registry retained')
-        _wait_launchd_removed(target,lambda:all(fs.exited(x) for x in captured+[owner]+([pg] if pg is not None else [])),runner=subprocess.run)
+        if bootout.returncode or any(not observe(x) for x in captured+[owner]):raise DistributionError('owned force shutdown incomplete; registry retained')
+        _wait_launchd_removed(target,lambda:all(observe(x) for x in captured+[owner]+([pg] if pg is not None else [])),runner=subprocess.run)
         if shared_record is None:_force_clear_model_records(trusted,captured,fs)
         else:_force_clear_model_records(trusted,captured,fs,shared_record=shared_record)
         if state.exists():
