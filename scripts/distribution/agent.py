@@ -888,6 +888,7 @@ def _force_stop(trusted,*,dry_run=False):
                     raise DistributionError('owned shared model lies outside verified agent tree')
         observe=fs.exited
         if shared_shutdown:
+            ended_records=_shared_stop_ended_record_snapshot(trusted,state,record,shared_record)
             observe=fs.shared_exit_observer(captured+[owner]+([pg] if pg is not None else []),
                 lambda value:write_json_new(private_directory(data/'run')/('shared-stop-first-identity-'+uuid.uuid4().hex+'.json'),value))
         # Shared descendants retain their captured parent while they exit.
@@ -895,7 +896,15 @@ def _force_stop(trusted,*,dry_run=False):
         # so KeepAlive cannot restart it between teardown and job removal.
         if not shared_shutdown:
             bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        if shared_shutdown:fs.terminate_all(captured,resume=True,observer=observe)
+        if shared_shutdown:
+            try:fs.terminate_all(captured,resume=True,observer=observe)
+            except DistributionError as error:
+                if str(error) not in ('live owned process identity changed','shared exit observation deadline expired'):
+                    raise
+                try:
+                    _shared_stop_recheck_ended_descendants(trusted,state,record,plist,decoded,plist_raw,plist_stamp,
+                        owner,arguments,captured,frozen,ended_records,host_lease,pgfamily,fs,target)
+                except DistributionError:raise error
         else:fs.terminate_all(captured,resume=True)
         if pg is not None:
             if fs.exact(pg):
@@ -929,6 +938,88 @@ def _force_stop(trusted,*,dry_run=False):
         for value in reversed(frozen):
             try:fs.send(value,signal.SIGCONT)
             except (DistributionError,OSError):pass
+
+def _shared_stop_ended_record_snapshot(trusted,state,record,shared_record):
+    """Same-operation private preimages only; no persistent capture or adoption."""
+    lease=no_symlinks(Path.home()/'Library/Application Support/LiliuxFlow-runtime-leases/gpu.lease')
+    paths=((state,False,record),(trusted['data_root']/'run/mtp2-shared-model.json',False,shared_record),
+           (lease,True,shared_record));captured=[]
+    for path,directory,expected in paths:
+        path=no_symlinks(path)
+        if not path.exists():captured.append((path,directory,None));continue
+        # An unrelated lease never becomes fallback cleanup authority. Keep
+        # the original successful shutdown path's treatment of foreign leases.
+        if expected is None:captured.append((path,directory,False));continue
+        if directory:private_directory(path)
+        content=private_file(path/'lease.json' if directory else path);info=path.stat();file_info=content.stat();raw=content.read_bytes()
+        if json.loads(raw)!=expected or directory and {x.name for x in path.iterdir()}!={'lease.json'}:
+            captured.append((path,directory,False));continue
+        captured.append((path,directory,((info.st_dev,info.st_ino),(file_info.st_dev,file_info.st_ino),raw)))
+    return captured
+
+def _shared_stop_recheck_ended_descendants(trusted,state,record,plist,decoded,raw,stamp,owner,arguments,captured,frozen,records,host_lease,pgfamily,fs,target):
+    """Reprove ended descendants while retaining this operation's frozen owner.
+
+    The owner must remain exact and kernel-stopped with its same launchd PID,
+    or be absent twice with a no-PID job. No signal or stale tree is adopted.
+    """
+    values=[*captured,owner];known={fs.identity(value)['pid'] for value in values}
+    if len(known)!=len(values) or any(value['uid']!=os.getuid() or value['pid'] in (os.getpid(),os.getppid()) for value in values):
+        raise DistributionError('shared ended completion capture differs')
+    if owner not in frozen:raise DistributionError('shared ended completion owner was not frozen')
+    deadline=time.monotonic()+5;owner_live=None
+    def timeout(cap):
+        remaining=deadline-time.monotonic()
+        if remaining<=0:raise DistributionError('shared ended completion deadline expired')
+        return min(cap,remaining)
+    for attempt in range(2):
+        for value in captured:
+            if fs._probe(value['pid'],timeout=timeout(.1)) is not None:
+                raise DistributionError('shared ended completion captured PID is not absent')
+        packet=fs._probe(owner['pid'],timeout=timeout(.1));live=packet is not None
+        if live and (packet[0]!=owner or packet[1]!=' '.join(arguments)):
+            raise DistributionError('shared ended completion frozen owner identity changed')
+        if owner_live is not None and live!=owner_live:
+            raise DistributionError('shared ended completion owner changed between samples')
+        owner_live=live
+        rows=fs._descendant_rows(timeout=timeout(.1))
+        kernel=next((row for row in rows if row['pid']==owner['pid']),None)
+        if live and (kernel is None or kernel['uid']!=owner['uid'] or kernel['ruid']!=os.getuid()
+                or kernel['started']!=owner['started'] or kernel['ppid']!=owner['ppid'] or not kernel['stat'].startswith('T')):
+            raise DistributionError('shared ended completion frozen owner kernel proof differs')
+        if any((row['pid'] in known and not (live and row['pid']==owner['pid'])
+                or row['ppid'] in known) and row['pid'] not in pgfamily for row in rows):
+            raise DistributionError('shared ended completion captured subtree is not absent')
+        info=private_file(plist).stat()
+        if (info.st_dev,info.st_ino)!=stamp or private_file(plist).read_bytes()!=raw:
+            raise DistributionError('shared ended completion plist changed')
+        for path,directory,preimage in records:
+            if preimage is False:raise DistributionError('shared ended completion lifecycle record was not bound')
+            path=no_symlinks(path)
+            if not path.exists():continue
+            if preimage is None:raise DistributionError('shared ended completion lifecycle record appeared')
+            if directory:private_directory(path)
+            content=private_file(path/'lease.json' if directory else path);info=path.stat();file_info=content.stat()
+            if ((info.st_dev,info.st_ino)!=preimage[0] or (file_info.st_dev,file_info.st_ino)!=preimage[1]
+                    or content.read_bytes()!=preimage[2] or directory and {x.name for x in path.iterdir()}!={'lease.json'}):
+                raise DistributionError('shared ended completion lifecycle preimage changed')
+        current=_shared_stop_host_lease_snapshot(trusted['data_root'],owner,fs)
+        if current is not None and current!=host_lease:raise DistributionError('shared ended completion host lease changed')
+        result=subprocess.run(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=timeout(1))
+        lines=result.stdout.splitlines()
+        if result.returncode or result.stderr.strip() or len(result.stdout.encode())>65536 or not lines or lines[0].strip()!=target+' = {':
+            raise DistributionError('shared ended completion launchd job is unknown')
+        fields,printed_arguments=_shared_launchd_job_fields(lines)
+        job_pid=fields.get('pid')
+        if (live and job_pid!=str(owner['pid']) or not live and ('pid' in fields or fields.get('state') not in ('spawn scheduled','not running'))
+                or printed_arguments!=arguments or fields.get('path')!=str(plist) or fields.get('program')!=arguments[0]
+                or fields.get('working directory')!=decoded['WorkingDirectory']):
+            raise DistributionError('shared ended completion requires exact captured job PID or no-PID')
+        if attempt==0:time.sleep(min(.02,timeout(.02)))
+    write_json_new(private_directory(trusted['data_root']/'run')/('shared-stop-ended-completion-'+uuid.uuid4().hex+'.json'),{
+        'schema_version':1,'enum':'SHARED_STOP_CAPTURED_DESCENDANTS_ENDED_COMPLETION','captured_pid_count':len(values),
+        'descendant_absence_samples':2,'owner_absent':not owner_live,'job_samples':2,
+        'signal_authorized':False,'cause':'UNKNOWN'})
 
 def _shared_stop_host_lease_snapshot(data,owner,fs):
     """Finite agent lease only; never adopt a different holder or create a path."""

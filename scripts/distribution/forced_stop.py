@@ -281,7 +281,7 @@ def shared_exit_observer(identities, diagnostic):
         nonlocal emitted
         ident=identity(value)
         if owned.get(ident['pid'])!=ident:raise DistributionError('shared exit observer identity was not captured')
-        deadline=time.monotonic()+.5;first=None;outcome='REFUSED';current=row=None;absences=0;drift=False
+        started=time.monotonic();deadline=started+3;first=None;outcome='REFUSED';current=row=None;absences=0;drift=False;samples=0
         def timeout():
             remaining=deadline-time.monotonic()
             if remaining<=0:raise DistributionError('shared exit observation deadline expired')
@@ -321,12 +321,12 @@ def shared_exit_observer(identities, diagnostic):
                 raise DistributionError('exited zombie identity or subtree changed')
             return 'ZOMBIE'
         try:
-            # Spend the existing half-second settle budget. Four fast samples
-            # could exhaust the loop before an owned exit transition settles.
-            # E/INEXIT or command drift is never itself an exit/signal proof.
-            for attempt in range(52):
+            # A shared exit transition may take longer than half a second.
+            # Observe for at most three seconds; E/INEXIT or command drift
+            # is never itself an exit or signal proof.
+            for attempt in range(302):
                 if attempt and time.monotonic()>=deadline:break
-                state=sample()
+                samples+=1;state=sample()
                 if (absences or ended.get(ident['pid'])=='ABSENT') and state!='ABSENT':raise DistributionError('shared exit PID reappeared after absence')
                 if ended.get(ident['pid'])=='ZOMBIE' and state in ('LIVE','DRIFT'):
                     raise DistributionError('shared exited zombie changed to a live identity')
@@ -349,7 +349,9 @@ def shared_exit_observer(identities, diagnostic):
             raise
         finally:
             if first is not None and not emitted:
-                emitted=True;first['reobservation_outcome']=outcome;diagnostic(first)
+                emitted=True;first.update(reobservation_outcome=outcome,
+                    observation_bound_ms=3000,observation_elapsed_ms=round(max(0,time.monotonic()-started)*1000),
+                    observation_samples=samples);diagnostic(first)
     return observe
 
 

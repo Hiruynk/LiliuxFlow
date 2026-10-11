@@ -70,7 +70,7 @@ class SharedExitTests(unittest.TestCase):
         with patch.object(fs,'_probe',side_effect=DistributionError('owned process probe is unknown')),self.assertRaises(DistributionError):self.observe(self.owner)
         self.assertEqual(self.diagnostics[0]['reobservation_outcome'],'REFUSED')
     def test_deadline_is_short_and_every_PS_probe_receives_remaining_bound(self):
-        with patch.object(fs.time,'monotonic',side_effect=[0,1]),patch.object(fs,'_probe') as probe,self.assertRaisesRegex(DistributionError,'deadline'):
+        with patch.object(fs.time,'monotonic',side_effect=[0,4,4]),patch.object(fs,'_probe') as probe,self.assertRaisesRegex(DistributionError,'deadline'):
             self.observe(self.owner)
         probe.assert_not_called()
         with patch.object(fs,'_probe',return_value=None) as probe:self.assertTrue(self.observe(self.owner))
@@ -113,12 +113,12 @@ class SharedExitTests(unittest.TestCase):
         ending={**self.kernel,'stat':'?E'}
         with self.probe([self.drift],[[ending]]),self.assertRaisesRegex(DistributionError,'live owned process identity changed'):
             self.observe(self.owner)
-        self.assertGreaterEqual(self.elapsed,.5)
+        self.assertGreaterEqual(self.elapsed,3)
         self.assertEqual(self.diagnostics[0]['reobservation_outcome'],'REFUSED')
 
     def test_exit_after_declared_deadline_is_not_adopted(self):
         ending={**self.kernel,'stat':'?E'}
-        with self.probe([self.drift]*60+[None,None],[[ending]]*60),self.assertRaises(DistributionError):self.observe(self.owner)
+        with self.probe([self.drift]*400+[None,None],[[ending]]*400),self.assertRaises(DistributionError):self.observe(self.owner)
         self.assertEqual(self.diagnostics[0]['reobservation_outcome'],'REFUSED')
 
     def test_delayed_ending_then_new_birth_never_recovers(self):
@@ -126,4 +126,25 @@ class SharedExitTests(unittest.TestCase):
         with self.probe([self.drift]*10+[reused,None,None],[[ending]]*10),self.assertRaisesRegex(DistributionError,'birth'):
             self.observe(self.owner)
 
-if __name__=='__main__':unittest.main(verbosity=2)
+    def test_question_E_longer_than_half_second_requires_actual_absence(self):
+        ending={**self.kernel,'stat':'?E'}
+        with self.probe([self.drift]*200+[None,None],[[ending]]*200):self.assertTrue(self.observe(self.owner))
+        self.assertGreater(self.elapsed,1.9);self.assertLess(self.elapsed,3)
+        first=self.diagnostics[0]
+        self.assertEqual(first['reobservation_outcome'],'ABSENT_TWICE')
+        self.assertEqual(first['observation_bound_ms'],3000)
+        self.assertGreaterEqual(first['observation_elapsed_ms'],1900)
+        self.assertEqual(first['observation_samples'],202)
+        self.assertFalse(first['signal_authorized'])
+
+    def test_persistent_drift_retains_numeric_duration_and_sample_count(self):
+        ending={**self.kernel,'stat':'?E'}
+        with self.probe([self.drift],[[ending]]),self.assertRaises(DistributionError):self.observe(self.owner)
+        first=self.diagnostics[0]
+        self.assertGreaterEqual(first['observation_elapsed_ms'],3000)
+        self.assertLessEqual(first['observation_samples'],302)
+        self.assertGreater(first['observation_samples'],200)
+        self.assertEqual(first['reobservation_outcome'],'REFUSED')
+        self.assertNotIn('CPU_SECRET_COMMAND',json.dumps(first))
+
+if __name__=='__main__' :unittest.main(verbosity=2)
