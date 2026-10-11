@@ -62,3 +62,23 @@ jobs:
         run: |
           uv run --locked --no-dev --project services/model-installer python -m unittest discover -s scripts/distribution -p test_optional_model_sdk.py -v
           uv run --locked --no-dev --project services/model-installer python -m unittest discover -s scripts/distribution -p test_public_ci.py -v
+  macos-sdk-transport:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Check out the reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # official v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          lfs: false
+          submodules: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
+        with:
+          enable-cache: false
+      - name: Run the Apple SDK-backed transport CPU test
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/liliuxflow-litellm-cpu
+        run: >-
+          uv run --locked --no-dev --project services/litellm python -m unittest
+          discover -s scripts/distribution -p test_mtp2_shared_transport.py -v

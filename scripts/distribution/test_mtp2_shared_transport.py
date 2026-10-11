@@ -573,6 +573,10 @@ class TransportTests(unittest.TestCase):
             self.assertNotIn("SECRET_UNTRUSTED_BODY", str(error))
             self.assertNotIn(SECRET.decode(), str(error))
 
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "NOT_AVAILABLE: Apple CommonCrypto CCHmac requires macOS; exercised by the macos-15 CPU job.",
+    )
     def test_sdk_CCHmac_matches_frozen_request_and_response_frames(self):
         library = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
         fn = library.CCHmac
