@@ -107,7 +107,9 @@
     "manifests/distribution/lily-mtp2-shared-bounded-output-source-baseline.json",
     "scripts/distribution/patches/lily-mtp2-shared/08-controlled-output-queue.patch",
     "scripts/distribution/mtp2_shared_usage_accounting.py",
-    "scripts/distribution/test_mtp2_shared_usage_accounting.py"
+    "scripts/distribution/test_mtp2_shared_usage_accounting.py",
+    "scripts/distribution/test_mtp2_shared_preheader.py",
+    "scripts/distribution/test_mtp2_shared_preheader_slot.py"
   ],
   "prefixes": [
     "scripts/distribution/",

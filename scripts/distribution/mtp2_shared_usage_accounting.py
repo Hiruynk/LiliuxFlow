@@ -16,6 +16,14 @@ class UsageTicket:
     alias: str
     profile: str
     owner: object = field(repr=False, compare=False)
+    claim_sha256: str | None = field(default=None,repr=False)
+    logging_obj: object = field(default=None,repr=False,compare=False)
+    auth_obj: object = field(default=None,repr=False,compare=False)
+    settlement: list = field(default_factory=list,repr=False,compare=False)
+    rate_stash: object = field(default=None,repr=False,compare=False)
+    slot_acquisition: object = field(default=None,repr=False,compare=False)
+    slot_snapshot: tuple | None = field(default=None,repr=False)
+    rate_limiter: object = field(default=None,repr=False,compare=False)
 
 
 def native_response_id(response):
@@ -111,3 +119,73 @@ async def bill_native_partial(ticket, owner, request_data, response, *, resolve,
     finally:
         if previous is absent:del logging.dispatch_success_handlers
         else:logging.dispatch_success_handlers=previous
+
+
+async def bill_native_preheader(ticket, owner, request_data, auth, exception, *, resolve, official_bill, proxy_logging=None):
+    """Owned preheader cancellation only; return None for exact stock delegation.
+
+    A handled cancellation never runs the stock failure spend/refund afterward.
+    Unknown usage never becomes a spend-zero/refund. The pinned disconnect
+    method can release only the captured logical LP slot; native ownership and
+    admission remain the guard's separate domain, with no GPU-free claim.
+    """
+    from fastapi import HTTPException
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_request_processing import _CLIENT_DISCONNECT_DETAIL
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    if (type(ticket) is not UsageTicket or ticket.owner is not owner
+        or type(exception) is not HTTPException or exception.status_code!=499 or exception.detail!=_CLIENT_DISCONNECT_DETAIL
+        or type(request_data) is not dict or type(auth) is not UserAPIKeyAuth or ticket.auth_obj is not auth or auth.via_virtual_key is not True
+        or type(ticket.logging_obj) is not Logging or request_data.get('litellm_logging_obj') is not ticket.logging_obj
+        or request_data.get('_litellm_client_requested_model',request_data.get('model'))!=ticket.alias
+        or type(ticket.claim_sha256) is not str or len(ticket.claim_sha256)!=64
+        or any(c not in '0123456789abcdef' for c in ticket.claim_sha256)):
+        return None
+    if not ticket.settlement:ticket.settlement.append(asyncio.Lock())
+    async with ticket.settlement[0]:
+        if len(ticket.settlement)>1:return ticket.settlement[1]
+        logging=ticket.logging_obj
+        handled=False
+        try:
+            value=await asyncio.wait_for(resolve(ticket,None,None),timeout=65)
+            value=exact_usage(ticket,value,epoch=value.get('epoch') if type(value) is dict else None,response_id=None)
+            # Internal usage carrier only, no streamed chunk/response fabricated.
+            from types import SimpleNamespace
+            carrier=SimpleNamespace(model=logging.model,chunks=[],_response_headers={EPOCH_HEADER:value['epoch']})
+            async def terminal(*_):return value
+            request_data.pop('standard_logging_object',None)
+            handled=await bill_native_partial(ticket,owner,request_data,carrier,resolve=terminal,official_bill=official_bill)
+        except (Exception,asyncio.CancelledError):pass
+        status='VERIFIED_NATIVE_PREHEADER_USAGE' if handled else 'UNVERIFIED_NATIVE_PREHEADER_USAGE'
+        # Once the official success dispatcher starts, its callbacks alone own
+        # the release: a cancelled callback may have changed an integer mirror
+        # before clearing the stash. Never decrement that mirror a second time.
+        dispatched=logging.model_call_details.get('has_dispatched_final_stream_success') is True
+        slot_status='SUCCESS_DISPATCH_OWNS_SLOT' if handled or dispatched else await release_preheader_slot_only(ticket,request_data,auth,proxy_logging)
+        if dispatched and not handled:slot_status='OFFICIAL_DISPATCH_RELEASE_UNVERIFIED'
+        logging.model_call_details.setdefault('litellm_params',{}).setdefault('metadata',{})['liliuxflow_mtp2_native_usage']={
+            'status':status,'logical_slot':slot_status,'TPM_reservation_refunded':False,'native_release_claim':False,
+            'logical_cleanup_unverified':slot_status not in ('SUCCESS_DISPATCH_OWNS_SLOT','RELEASED_LOGICAL_SLOT_ONLY','NOT_ACQUIRED_OR_ALREADY_RELEASED')}
+        ticket.settlement.append(handled)
+        return handled
+
+
+async def release_preheader_slot_only(ticket, data, auth, proxy_logging):
+    """Pinned request-context slot cleanup, never token refund/native release."""
+    from litellm.proxy.utils import ProxyLogging
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash,RequestRateLimiterStash,_PROXY_MaxParallelRequestsHandler_v3
+    stash=get_request_stash()
+    if (type(proxy_logging) is not ProxyLogging or type(ticket.rate_stash) is not RequestRateLimiterStash
+        or stash is not ticket.rate_stash or stash.owner_litellm_call_id!=data.get('litellm_call_id')):
+        return 'UNVERIFIED_LOGICAL_SLOT_OWNER'
+    if stash.parallel_slot is None:return 'NOT_ACQUIRED_OR_ALREADY_RELEASED'
+    limiter=proxy_logging.get_proxy_hook('parallel_request_limiter')
+    if type(limiter) is not _PROXY_MaxParallelRequestsHandler_v3 or limiter is not ticket.rate_limiter:
+        return 'UNVERIFIED_LOGICAL_SLOT_HANDLER'
+    current=stash.parallel_slot
+    if (current is not ticket.slot_acquisition or type(current) is not dict
+        or (current.get('slot_id'),tuple(current.get('counter_keys',())))!=ticket.slot_snapshot):
+        return 'UNVERIFIED_LOGICAL_SLOT_ACQUISITION'
+    try:await ProxyLogging._arelease_max_parallel_requests_on_disconnect(proxy_logging,auth)
+    except (Exception,asyncio.CancelledError):return 'LOGICAL_SLOT_RELEASE_FAILED'
+    return 'RELEASED_LOGICAL_SLOT_ONLY' if stash.parallel_slot is None else 'LOGICAL_SLOT_RELEASE_UNPROVEN'

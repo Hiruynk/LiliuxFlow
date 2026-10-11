@@ -20,7 +20,7 @@ from types import MethodType
 from common import DistributionError
 from mtp2_shared_config import PUBLIC_ALIASES, PHYSICAL_MODEL_ID
 from mtp2_shared_ingress import CAPABILITY_HEADER, issue_capability, validate_raw_ingress, verify_capability
-from mtp2_shared_usage_accounting import UsageTicket, EPOCH_HEADER, USAGE_PATH, _FIELDS, bill_native_partial
+from mtp2_shared_usage_accounting import UsageTicket, EPOCH_HEADER, USAGE_PATH, _FIELDS, bill_native_partial, bill_native_preheader
 
 FEATURE_ENV = "LILIUXFLOW_MTP2_SHARED_GATEWAY"
 VALIDATION_ENV = "LILIUXFLOW_MTP2_SHARED_VALIDATION"
@@ -202,11 +202,13 @@ class _PrivateRouteBoundary:
             raise DistributionError('private candidate pinned partial hook changed')
         async def resolve_usage(ticket, epoch, response_id):
             import httpx
+            query={'nonce':ticket.nonce,'tenant':ticket.tenant,'alias':ticket.alias,'profile':ticket.profile,
+                   'epoch':epoch,'response_id':response_id}
+            if epoch is None:query['claim_sha256']=ticket.claim_sha256
             async with httpx.AsyncClient(timeout=65, trust_env=False) as client:
                 async with client.stream('POST', 'http://127.0.0.1:'+str(boundary.guard_port)+USAGE_PATH,
                     headers={'Authorization':'Bearer '+_callback_config[1].decode('utf-8')},
-                    json={'nonce':ticket.nonce,'tenant':ticket.tenant,'alias':ticket.alias,'profile':ticket.profile,
-                          'epoch':epoch,'response_id':response_id}) as reply:
+                    json=query) as reply:
                     if reply.status_code!=200:raise DistributionError('shared_usage_unavailable')
                     raw=bytearray()
                     async for part in reply.aiter_bytes():
@@ -222,6 +224,31 @@ class _PrivateRouteBoundary:
         native_partial._liliuxflow_original_partial=original_partial
         stream_cleanup._bill_partial_streamed_spend_on_disconnect=native_partial
         self._partial_module,self._partial_hook=stream_cleanup,native_partial
+        original_failure=logging.post_call_failure_hook
+        if (getattr(original_failure,'__func__',None) is not ProxyLogging.post_call_failure_hook
+            or hashlib.sha256(inspect.getsource(ProxyLogging.post_call_failure_hook).encode()).hexdigest()
+                !='122e07b1c875d84be5f0b39de01eecc20ab23e314e0b4e6934dd46ae452552b2'):
+            raise DistributionError('private candidate failure boundary is unavailable')
+        async def preheader_failure(_self,request_data,original_exception,user_api_key_dict,error_type=None,route=None,traceback_str=None):
+            capture=_raw_context.get()
+            ticket=capture.accounting[0] if type(capture) is _RawCapture and capture.owner is _callback_config[2] and len(capture.accounting)==1 else None
+            if ticket is not None:
+                if _self is not logging or boundary.server.proxy_logging_obj is not logging:
+                    raise DistributionError('private candidate failure instance changed')
+                boundary.assert_live_routes()
+                boundary.assert_no_late_mutators()
+            settled=await bill_native_preheader(ticket,_callback_config[2],request_data,user_api_key_dict,original_exception,
+                resolve=resolve_usage,official_bill=original_partial,proxy_logging=logging)
+            if settled is None:
+                return await original_failure(request_data=request_data,original_exception=original_exception,user_api_key_dict=user_api_key_dict,
+                    error_type=error_type,route=route,traceback_str=traceback_str)
+            # Native success dispatch owns verified billing/slot settlement.
+            # Unknown releases only its original logical slot via pinned SDK
+            # cleanup; native admission remains independently fail closed.
+            return None
+        logging.post_call_failure_hook=MethodType(preheader_failure,logging)
+        self._preheader_failure=logging.post_call_failure_hook
+        self._preheader_failure_function=preheader_failure
 
     def assert_no_late_mutators(self):
         """Pre-call processing finishes before issuance; later hooks must be inert.
@@ -256,6 +283,10 @@ class _PrivateRouteBoundary:
             from litellm.proxy.utils import ProxyLogging
             if self._partial_module._bill_partial_streamed_spend_on_disconnect is not self._partial_hook:
                 raise DistributionError('private candidate accounting hook changed')
+            if (self._logging.post_call_failure_hook is not self._preheader_failure
+                or getattr(self._preheader_failure,'__self__',None) is not self._logging
+                or getattr(self._preheader_failure,'__func__',None) is not self._preheader_failure_function):
+                raise DistributionError('private candidate preheader accounting hook changed')
             if type(litellm.callbacks) is not list:
                 raise DistributionError("private candidate callback registry changed")
             callbacks = ProxyLogging._callback_capabilities().resolved_callbacks
@@ -473,7 +504,13 @@ def create_callback():
             admitted=verify_capability(capability,json.loads(capture.body),registry,backend_secret=backend_secret)
             if capture.accounting:
                 raise HTTPException(503,'MTP2 accounting ticket already issued')
-            capture.accounting.append(UsageTicket(admitted.request_id,admitted.tenant,admitted.alias,admitted.profile_id,_owner))
+            from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash
+            stash=get_request_stash();slot=stash.parallel_slot if stash is not None else None
+            capture.accounting.append(UsageTicket(admitted.request_id,admitted.tenant,admitted.alias,admitted.profile_id,_owner,
+                hashlib.sha256(capability.encode()).hexdigest(),data.get('litellm_logging_obj'),user_api_key_dict,
+                rate_stash=stash,slot_acquisition=slot,
+                slot_snapshot=(slot['slot_id'],tuple(slot['counter_keys'])) if slot is not None else None,
+                rate_limiter=_private_boundary._logging.get_proxy_hook('parallel_request_limiter') if _private_boundary is not None else None))
             data["extra_headers"] = {**headers, CAPABILITY_HEADER: capability}
             return data
 
@@ -852,7 +889,7 @@ def _make_shared_guard(*, owner_probe, **kwargs):
                             self.terminal_usage={k:v for k,v in self.terminal_usage.items() if v[0]>now}
                             if len(self.terminal_usage)>=128:
                                 self.terminal_usage.pop(next(iter(self.terminal_usage)))
-                            self.terminal_usage[row.handle.nonce]=(now+60,usage)
+                            self.terminal_usage[row.handle.nonce]=(now+60,usage,getattr(row,'claim_sha256',None))
                             self.native_actor.forget_terminal(row.handle, record)
                             row.native_done = True
                             row.stage = "cleanup"
@@ -917,7 +954,7 @@ def _make_shared_guard(*, owner_probe, **kwargs):
                 capability = request.headers.get(CAPABILITY_HEADER, "")
                 admitted = self.native_actor.consume_verified_ingress(capability, body, self.registry, deadline=deadline,
                                                                        completion=request.url.path == "/v1/completions")
-                row = SimpleNamespace(admitted=admitted, profile=profile, handle=None,
+                row = SimpleNamespace(admitted=admitted, profile=profile, handle=None,claim_sha256=hashlib.sha256(capability.encode()).hexdigest(),
                                       settled=asyncio.get_running_loop().create_future(), caller_cancelled=False, generation_failed=False,
                                       stage="queued", native_done=False, reader_done=False)
                 async with self._lock:
@@ -1054,18 +1091,31 @@ def _make_shared_guard(*, owner_probe, **kwargs):
             try:
                 value=json.loads(body)
                 fields={'nonce','tenant','alias','profile','epoch','response_id'}
-                if type(value) is not dict or set(value)!=fields:raise ValueError()
+                if type(value) is not dict:raise ValueError()
+                preheader=set(value)==fields|{'claim_sha256'}
+                if not preheader and set(value)!=fields:raise ValueError()
+                if preheader and (value['epoch'] is not None or value['response_id'] is not None
+                    or type(value['claim_sha256']) is not str or len(value['claim_sha256'])!=64
+                    or any(c not in '0123456789abcdef' for c in value['claim_sha256'])):raise ValueError()
                 nonce=value['nonce']
                 if type(nonce) is not str or len(nonce)!=32 or any(c not in '0123456789abcdef' for c in nonce):raise ValueError()
                 row=self.shared_rows.get(nonce)
+                epoch=value['epoch']
                 if row is not None:
                     handle=row.handle
-                    if handle is None or any(getattr(handle,k)!=value[k] for k in ('epoch','nonce','tenant','alias','profile')):raise ValueError()
-                    await asyncio.wait_for(asyncio.shield(row.settled),timeout=60)
+                    if handle is None or any(getattr(handle,k)!=value[k] for k in ('nonce','tenant','alias','profile')):raise ValueError()
+                    if preheader:
+                        if not hmac.compare_digest(getattr(row,'claim_sha256','') or '',value['claim_sha256']):raise ValueError()
+                        epoch=handle.epoch # Original forwarded handle only; never current resident epoch.
+                    elif handle.epoch!=epoch:raise ValueError()
+                    if await asyncio.wait_for(asyncio.shield(row.settled),timeout=60) is not True:raise ValueError()
                 entry=self.terminal_usage.get(nonce)
                 if entry is None or entry[0]<=asyncio.get_running_loop().time() or entry[1] is None:raise ValueError()
                 usage=entry[1]
-                if any(getattr(usage,k)!=value[k] for k in ('epoch','nonce','tenant','alias','profile')):raise ValueError()
+                if preheader:
+                    if len(entry)!=3 or not hmac.compare_digest(entry[2] or '',value['claim_sha256']):raise ValueError()
+                    if epoch is None:epoch=usage.epoch # Cache belongs to that same original claimed request.
+                if usage.epoch!=epoch or any(getattr(usage,k)!=value[k] for k in ('nonce','tenant','alias','profile')):raise ValueError()
                 if value['response_id'] is not None and value['response_id']!=usage.response_id:raise ValueError()
                 return JSONResponse({k:getattr(usage,k) for k in _FIELDS},headers={'Cache-Control':'no-store'})
             except (ValueError,KeyError,TypeError,asyncio.TimeoutError,DistributionError,_GuardError):
