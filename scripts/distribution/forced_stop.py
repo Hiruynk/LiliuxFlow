@@ -321,7 +321,11 @@ def shared_exit_observer(identities, diagnostic):
                 raise DistributionError('exited zombie identity or subtree changed')
             return 'ZOMBIE'
         try:
-            for attempt in range(4):
+            # Spend the existing half-second settle budget. Four fast samples
+            # could exhaust the loop before an owned exit transition settles.
+            # E/INEXIT or command drift is never itself an exit/signal proof.
+            for attempt in range(52):
+                if attempt and time.monotonic()>=deadline:break
                 state=sample()
                 if (absences or ended.get(ident['pid'])=='ABSENT') and state!='ABSENT':raise DistributionError('shared exit PID reappeared after absence')
                 if ended.get(ident['pid'])=='ZOMBIE' and state in ('LIVE','DRIFT'):
@@ -336,7 +340,9 @@ def shared_exit_observer(identities, diagnostic):
                     if state=='DRIFT':
                         drift=True
                         if first is None:first=evidence('live owned process identity changed')
-                time.sleep(min(.01,timeout()))
+                remaining=deadline-time.monotonic()
+                if remaining<=0:break
+                time.sleep(min(.01,remaining))
             raise DistributionError('live owned process identity changed' if drift else 'shared exit absence is unproven')
         except DistributionError as error:
             if first is None:first=evidence(str(error))

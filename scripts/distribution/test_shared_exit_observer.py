@@ -12,12 +12,17 @@ class SharedExitTests(unittest.TestCase):
     def setUp(self):
         self.kernel=self.row(101,100);self.owner=self.ident(self.kernel);self.drift={**self.owner,'command_sha256':'b'*64}
         self.diagnostics=[];self.observe=fs.shared_exit_observer([self.owner],self.diagnostics.append)
+        self.elapsed=0
     def probe(self,values,rows=None):
         from contextlib import ExitStack
         stack=ExitStack()
         def packet(value):return None if value is None else (value,'CPU_SECRET_COMMAND_MUST_NOT_BE_RECORDED')
-        stack.enter_context(patch.object(fs,'_probe',side_effect=[packet(x) for x in values]))
-        stack.enter_context(patch.object(fs,'_descendant_rows',side_effect=rows or [[self.kernel]]))
+        packets=iter([packet(x) for x in values]);last=packet(values[-1])
+        kernel_rows=rows or [[self.kernel]];snapshots=iter(kernel_rows)
+        stack.enter_context(patch.object(fs,'_probe',side_effect=lambda *a,**k:next(packets,last)))
+        stack.enter_context(patch.object(fs,'_descendant_rows',side_effect=lambda **k:next(snapshots,kernel_rows[-1])))
+        stack.enter_context(patch.object(fs.time,'monotonic',side_effect=lambda:self.elapsed))
+        stack.enter_context(patch.object(fs.time,'sleep',side_effect=lambda seconds:setattr(self,'elapsed',self.elapsed+seconds)))
         stack.enter_context(patch.object(fs.os,'kill',side_effect=AssertionError('real signals forbidden')))
         return stack
     def test_cross_snapshot_live_drift_then_absence_twice_recovers_without_signals(self):
@@ -95,5 +100,30 @@ class SharedExitTests(unittest.TestCase):
     def test_send_still_rejects_full_live_identity_even_with_exit_observer_available(self):
         with patch.object(fs,'inspect',return_value=self.drift),patch.object(fs.os,'kill') as kill,self.assertRaises(DistributionError):fs.send(self.owner,signal.SIGTERM)
         kill.assert_not_called()
+
+    def test_actual_observed_question_E_transition_can_settle_after_four_samples(self):
+        ending={**self.kernel,'stat':'?E'}
+        with self.probe([self.drift]*10+[None,None],[[ending]]*10):self.assertTrue(self.observe(self.owner))
+        self.assertGreaterEqual(self.elapsed,.1)
+        self.assertLess(self.elapsed,.5)
+        self.assertEqual(self.diagnostics[0]['kernel']['stat_ascii'],[63,69])
+        self.assertEqual(self.diagnostics[0]['reobservation_outcome'],'ABSENT_TWICE')
+
+    def test_question_E_never_is_exit_proof_and_persistent_live_still_refuses(self):
+        ending={**self.kernel,'stat':'?E'}
+        with self.probe([self.drift],[[ending]]),self.assertRaisesRegex(DistributionError,'live owned process identity changed'):
+            self.observe(self.owner)
+        self.assertGreaterEqual(self.elapsed,.5)
+        self.assertEqual(self.diagnostics[0]['reobservation_outcome'],'REFUSED')
+
+    def test_exit_after_declared_deadline_is_not_adopted(self):
+        ending={**self.kernel,'stat':'?E'}
+        with self.probe([self.drift]*60+[None,None],[[ending]]*60),self.assertRaises(DistributionError):self.observe(self.owner)
+        self.assertEqual(self.diagnostics[0]['reobservation_outcome'],'REFUSED')
+
+    def test_delayed_ending_then_new_birth_never_recovers(self):
+        ending={**self.kernel,'stat':'?E'};reused={**self.owner,'started':'new birth'}
+        with self.probe([self.drift]*10+[reused,None,None],[[ending]]*10),self.assertRaisesRegex(DistributionError,'birth'):
+            self.observe(self.owner)
 
 if __name__=='__main__':unittest.main(verbosity=2)
