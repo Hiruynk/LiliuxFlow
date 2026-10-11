@@ -875,8 +875,10 @@ def _force_stop(trusted,*,dry_run=False):
                 value=fs.identity(model_record.get(key))
                 if fs.exact(value) and bypid.get(value['pid'])!=value:raise DistributionError('owned model lies outside verified agent tree')
         shared=data/'run/mtp2-shared-model.json'
+        shared_record=None
         if shared.exists():
-            for value in fs.shared_model_record(trusted,read_object(private_file(shared))):
+            shared_record=read_object(private_file(shared))
+            for value in fs.shared_model_record(trusted,shared_record):
                 if fs.exact(value) and bypid.get(value['pid'])!=value:
                     raise DistributionError('owned shared model lies outside verified agent tree')
         bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -890,7 +892,8 @@ def _force_stop(trusted,*,dry_run=False):
         bootout.wait(timeout=15)
         if bootout.returncode or any(not fs.exited(x) for x in captured+[owner]):raise DistributionError('owned force shutdown incomplete; registry retained')
         _wait_launchd_removed(target,lambda:all(fs.exited(x) for x in captured+[owner]+([pg] if pg is not None else [])),runner=subprocess.run)
-        _force_clear_model_records(trusted,captured,fs)
+        if shared_record is None:_force_clear_model_records(trusted,captured,fs)
+        else:_force_clear_model_records(trusted,captured,fs,shared_record=shared_record)
         if state.exists():
             if read_object(private_file(state))!=record:raise DistributionError('force stop agent registry changed; retained for review')
             state.unlink()
@@ -901,10 +904,60 @@ def _force_stop(trusted,*,dry_run=False):
             try:fs.send(value,signal.SIGCONT)
             except (DistributionError,OSError):pass
 
-def _force_clear_model_records(trusted,captured,fs):
+def _force_clear_shared_model_records(trusted,captured,fs,lease,record):
+    # The record was authenticated while the frozen child was still captured.
+    # Revalidate installed source/binary trust, then require that same complete
+    # record and both exact exited identities. No lane/release event is inferred.
+    runner,child=fs.shared_model_record(trusted,record);bypid={x['pid']:x for x in captured}
+    def ended():
+        if any(bypid.get(value['pid'])!=value or not fs.exited(value) for value in (runner,child)):
+            raise DistributionError('shared stop owner is not an exact exited captured child')
+    ended()
+    model=no_symlinks(trusted['data_root']/'run/mtp2-shared-model.json');targets=[]
+    for path,directory in ((lease,True),(model,False)):
+        if not path.exists():continue
+        if directory:private_directory(path)
+        else:private_file(path)
+        before=path.stat();record_path=path/'lease.json' if directory else path
+        if (read_object(private_file(record_path))!=record
+                or directory and {x.name for x in path.iterdir()}!={'lease.json'}):
+            raise DistributionError('shared stop lease/model record changed; retained for review')
+        targets.append((path,directory,(before.st_dev,before.st_ino)))
+    moved=[]
+    try:
+        for path,directory,stamp in targets:
+            ended();current=path.stat();record_path=path/'lease.json' if directory else path
+            if ((current.st_dev,current.st_ino)!=stamp or read_object(private_file(record_path))!=record
+                    or directory and {x.name for x in path.iterdir()}!={'lease.json'}):
+                raise DistributionError('shared stop lease/model identity changed before quarantine')
+            quarantine=path.with_name(path.name+'.portable-stopped-'+uuid.uuid4().hex)
+            os.rename(path,quarantine);moved.append((path,quarantine,directory,stamp))
+            current=quarantine.stat();record_path=quarantine/'lease.json' if directory else quarantine
+            if ((current.st_dev,current.st_ino)!=stamp or read_object(private_file(record_path))!=record
+                    or directory and {x.name for x in quarantine.iterdir()}!={'lease.json'}):
+                raise DistributionError('shared stop quarantine identity changed; retained for review')
+        ended()
+        for path,quarantine,directory,stamp in moved:
+            current=quarantine.stat();record_path=quarantine/'lease.json' if directory else quarantine
+            if (path.exists() or (current.st_dev,current.st_ino)!=stamp
+                    or read_object(private_file(record_path))!=record
+                    or directory and {x.name for x in quarantine.iterdir()}!={'lease.json'}):
+                raise DistributionError('shared stop ownership changed during quarantine')
+        for _,quarantine,directory,_ in moved:
+            if directory:(quarantine/'lease.json').unlink();quarantine.rmdir()
+            else:quarantine.unlink()
+    except BaseException:
+        for path,quarantine,_,stamp in reversed(moved):
+            if quarantine.exists() and not path.exists():
+                current=quarantine.stat()
+                if (current.st_dev,current.st_ino)==stamp:os.rename(quarantine,path)
+        raise
+
+def _force_clear_model_records(trusted,captured,fs,*,shared_record=None):
     # No event counters or identity fields are rewritten. Only exact exited
     # installation-owned stale records may be removed after physical teardown.
     data=trusted['data_root'];bypid={x['pid']:x for x in captured};lease=no_symlinks(Path.home()/'Library/Application Support/LiliuxFlow-runtime-leases/gpu.lease')
+    if shared_record is not None:_force_clear_shared_model_records(trusted,captured,fs,lease,shared_record)
     path=lease/'lease.json'
     if path.exists():
         record=read_object(private_file(path))

@@ -6,7 +6,7 @@ is required. The existing runtime fixture has a two-byte synthetic config file;
 its inert binaries/credentials are test data and never authorize a real install.
 """
 from __future__ import annotations
-import argparse,ast,copy,hashlib,json,os,shutil,sys,tempfile,unittest
+import argparse,ast,contextlib,copy,hashlib,json,os,plistlib,shutil,signal,subprocess,sys,tempfile,unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock,patch
@@ -352,5 +352,195 @@ class InstalledTrustTests(unittest.TestCase):
         for bad in (0,1,'1',None):
             with self.subTest(bad=bad),patch.object(trust,'installation',side_effect=AssertionError('must reject before reads')),self.assertRaises(DistributionError):
                 trust.validate(self.f.data,shared_context=bad)
+
+class SharedStopCleanupTests(unittest.TestCase):
+    """Normal stop's real trust/classifier/cleanup on inert CPU lifecycle files."""
+    def setUp(self):
+        self.fixture=InstalledTrustTests('test_actual_installed_shared_extension_and_source_view_with_tiny_checkpoint')
+        self.fixture.setUp();self.addCleanup(self.fixture.doCleanups)
+        f=self.fixture.f
+        f.config['launchd_label']='com.diurnoctra.liliuxflow.'+f.config['installation_id']
+        f.config['database_initialized']=False
+        trust.atomic_private_json(f.data/'install.json',f.config)
+        self.base,self.record,self.commands=self.fixture.stop_inputs()
+        for key in ('runner','child'):
+            value=self.record[key];value['command_sha256']=hashlib.sha256(self.commands[value['pid']].encode()).hexdigest()
+        import shlex
+        argv_hash=hashlib.sha256(json.dumps(shlex.split(self.commands[self.record['child']['pid']]),separators=(',',':')).encode()).hexdigest()
+        self.record.update(public_alias='liliuxflow-internal-mtp2-shared',startup_id='1'*32,argv_sha256=argv_hash)
+        self.captured=[copy.deepcopy(self.record[key]) for key in ('runner','child')]
+        self.home=f.data/'CPU-only-home';self.home.mkdir(mode=0o700)
+        self.lease=self.home/'Library/Application Support/LiliuxFlow-runtime-leases/gpu.lease'
+        self.model=f.data/'run/mtp2-shared-model.json';self.live={};self.signals=[]
+        self.write(self.record)
+    def write(self,record):
+        agent.private_directory(self.lease)
+        trust.atomic_private_json(self.lease/'lease.json',record);trust.atomic_private_json(self.model,record)
+    def patches(self):
+        stack=contextlib.ExitStack()
+        stack.enter_context(patch.object(Path,'home',return_value=self.home))
+        stack.enter_context(patch.object(fs,'inspect',side_effect=lambda pid:self.live.get(pid)))
+        stack.enter_context(patch.object(fs,'command',side_effect=lambda value:self.commands[value['pid']]))
+        stack.enter_context(patch.object(fs,'_descendant_rows',side_effect=lambda:[
+            {**value,'ruid':os.getuid(),'stat':'S','ucomm':'CPU-fixture'} for value in self.live.values()]))
+        stack.enter_context(patch.object(fs.os,'kill',side_effect=AssertionError('CPU fixture must not signal')))
+        return stack
+    def cleanup(self,snapshot=None,captured=None):
+        return agent._force_clear_model_records(self.base,self.captured if captured is None else captured,fs,
+                                               shared_record=self.record if snapshot is None else snapshot)
+    def retained(self,before):
+        self.assertEqual((self.lease/'lease.json').read_bytes(),before[0])
+        self.assertEqual(self.model.read_bytes(),before[1])
+        self.assertFalse(list(self.lease.parent.glob('gpu.lease.portable-stopped-*')))
+        self.assertFalse(list(self.model.parent.glob('mtp2-shared-model.json.portable-stopped-*')))
+    def before(self):return (self.lease/'lease.json').read_bytes(),self.model.read_bytes()
+    def test_shared_cleanup_uses_additive_binary_and_removes_exact_ended_pair(self):
+        self.assertNotEqual(self.record['binary_sha256'],self.base['trust']['binaries']['lily']['sha256'])
+        keep=obj(self.base['data_root'],'run/CPU-unrelated.json',{'preserved':True});before=keep.read_bytes()
+        with self.patches(),patch.object(fs,'shared_model_record',wraps=fs.shared_model_record) as classify:
+            self.cleanup();classify.assert_called_once_with(self.base,self.record)
+        self.assertFalse(self.lease.exists());self.assertFalse(self.model.exists());self.assertEqual(keep.read_bytes(),before)
+    def test_shared_cleanup_accepts_already_removed_exact_record_without_touching_other_data(self):
+        for missing in ('lease','model','both'):
+            with self.subTest(missing=missing):
+                self.write(self.record)
+                if missing in ('lease','both'):(self.lease/'lease.json').unlink();self.lease.rmdir()
+                if missing in ('model','both'):self.model.unlink()
+                with self.patches():self.cleanup()
+                self.assertFalse(self.lease.exists());self.assertFalse(self.model.exists())
+    def test_wrong_captured_source_binary_owner_installation_or_profile_retains_pair(self):
+        for field,value in (('installation_id','foreign'),('binary_sha256','0'*64),('engine_source_commit','0'*40),
+                            ('engine_source_inventory_sha256','0'*64),('profile_id','ctx64k'),('context_tokens',65536),
+                            ('child.uid',os.getuid()+1),('child.ppid',99999)):
+            with self.subTest(field=field):
+                wrong=copy.deepcopy(self.record)
+                if '.' in field:a,b=field.split('.');wrong[a][b]=value
+                else:wrong[field]=value
+                self.write(wrong);before=self.before()
+                with self.patches(),self.assertRaises(DistributionError):self.cleanup(snapshot=wrong)
+                self.retained(before)
+    def test_changed_or_foreign_lease_or_model_after_capture_retains_pair(self):
+        for target in ('lease','model'):
+            for field,value in (('installation_id','foreign'),('startup_id','3'*32),('argv_sha256','4'*64),
+                                ('binary_sha256','0'*64),('engine_source_commit','0'*40),('profile_id','ctx64k')):
+                with self.subTest(target=target,field=field):
+                    self.write(self.record);changed={**self.record,field:value}
+                    trust.atomic_private_json(self.lease/'lease.json' if target=='lease' else self.model,changed)
+                    before=self.before()
+                    with self.patches(),self.assertRaises(DistributionError):self.cleanup()
+                    self.retained(before)
+    def test_missing_or_changed_captured_runner_child_identity_retains_pair(self):
+        for target in ('runner','child'):
+            for fault in ('missing','started','command_sha256','uid'):
+                with self.subTest(target=target,fault=fault):
+                    captured=copy.deepcopy(self.captured);index=0 if target=='runner' else 1
+                    if fault=='missing':captured.pop(index)
+                    elif fault=='uid':captured[index][fault]+=1
+                    else:captured[index][fault]='0'*64
+                    before=self.before()
+                    with self.patches(),self.assertRaises(DistributionError):self.cleanup(captured=captured)
+                    self.retained(before)
+    def test_live_reused_or_changed_process_never_authorizes_shared_cleanup(self):
+        for target in ('runner','child'):
+            for fault in ('live','started','uid','command_sha256'):
+                with self.subTest(target=target,fault=fault):
+                    current=copy.deepcopy(self.record[target]);self.live={current['pid']:current}
+                    if fault=='uid':current[fault]+=1
+                    elif fault!='live':current[fault]='0'*64
+                    before=self.before()
+                    with self.patches(),self.assertRaises(DistributionError):self.cleanup()
+                    self.retained(before)
+        self.live={}
+    def test_revoked_checkpoint_receipt_or_changed_installed_source_binary_retains_pair(self):
+        f=self.fixture.f
+        for target in (f.data/'runtime/checkpoint-verified.json',f.source/'scripts/distribution/agent.py',
+                       f.data/shared.BINARY_PATH):
+            with self.subTest(target=target.name):
+                original=target.read_bytes();before=self.before()
+                try:
+                    if target.name=='checkpoint-verified.json':
+                        value=json.loads(original);value['validation']='metadata_only';value['payload_verified']=False
+                        target.write_text(json.dumps(value))
+                    else:target.write_bytes(original+b'CPU-only corruption\n')
+                    with self.patches(),self.assertRaises(DistributionError):self.cleanup()
+                    self.retained(before)
+                finally:target.write_bytes(original)
+    def test_changed_record_during_quarantine_restores_owned_inodes_without_deleting(self):
+        original=self.before();lease_stamp=self.lease.stat().st_ino;model_stamp=self.model.stat().st_ino
+        rename=os.rename
+        def drift(source,target):
+            rename(source,target)
+            if Path(source)==self.model:
+                trust.atomic_private_json(Path(target),{**self.record,'startup_id':'4'*32})
+        with self.patches(),patch.object(agent.os,'rename',side_effect=drift),self.assertRaises(DistributionError):self.cleanup()
+        # atomic_private_json replaced the model inode; unknown quarantine stays
+        # retained for review. The untouched exact lease inode is restored.
+        self.assertEqual(self.lease.stat().st_ino,lease_stamp)
+        self.assertEqual((self.lease/'lease.json').read_bytes(),original[0]);self.assertFalse(self.model.exists())
+        retained=list(self.model.parent.glob('mtp2-shared-model.json.portable-stopped-*'))
+        self.assertEqual(len(retained),1);self.assertNotEqual(retained[0].stat().st_ino,model_stamp)
+        self.assertEqual(json.loads(retained[0].read_text())['startup_id'],'4'*32)
+    def test_mtp0_cleanup_keeps_original_binary_path_and_never_calls_shared_classifier(self):
+        self.model.unlink();record={**self.record,'profile_id':'ctx64k',
+                                  'binary_sha256':self.base['trust']['binaries']['lily']['sha256']}
+        trust.atomic_private_json(self.lease/'lease.json',record)
+        obj(self.base['data_root'],'run/model.json',record)
+        with self.patches(),patch.object(fs,'shared_model_record',side_effect=AssertionError('MTP0 must not select shared')):
+            agent._force_clear_model_records(self.base,self.captured,fs)
+        self.assertFalse(self.lease.exists());self.assertFalse((self.base['data_root']/'run/model.json').exists())
+    def test_normal_source_generator_copies_stop_fix_and_binds_installed_hash(self):
+        f=self.fixture.f;name='scripts/distribution/agent.py'
+        view,copied=build.install_shared_source_view(f.source,f.data,f.record)
+        expected=trust.sha256(ROOT/name)
+        self.assertEqual((view/name).read_bytes(),(ROOT/name).read_bytes())
+        self.assertEqual(next(row['sha256'] for row in copied if row['path']==name),expected)
+        self.assertEqual(next(row['sha256'] for row in f.record['source_files'] if row['path']==name),expected)
+        f.config['source_root']=str(view);f.record['runtime_source_copy']=copied
+        trust.atomic_private_json(f.data/'install.json',f.config);self.fixture.save()
+        selected=trust.validate(f.data,shared_context=True)
+        self.assertEqual(selected['source_root'],view)
+        self.assertEqual(selected['trust']['binaries']['lily'],self.base['trust']['binaries']['lily'])
+        self.assertEqual(selected['trust']['mtp2_shared_runtime'],self.base['trust']['mtp2_shared_runtime'])
+    def normal_stop(self,*,change_after_exit=False,wrong_argv=False):
+        cfg=self.base['config'];data=self.base['data_root'];source=self.base['source_root']
+        args=[str(self.base['binaries']['compat_python']),str(source/'scripts/distribution/agent.py'),
+              '--data-root',str(data),'--mtp2-shared-context']
+        owner={**self.record['runner'],'pid':self.record['runner']['ppid'],'ppid':1,
+               'command_sha256':hashlib.sha256(' '.join(args).encode()).hexdigest()}
+        self.commands[owner['pid']]=' '.join(args)
+        if wrong_argv:
+            child=self.record['child'];self.commands[child['pid']]+=' --unauthorized'
+            child['command_sha256']=hashlib.sha256(self.commands[child['pid']].encode()).hexdigest();self.write(self.record)
+        self.live={value['pid']:copy.deepcopy(value) for value in [owner,self.record['runner'],self.record['child']]}
+        state=obj(data,'run/agent.json',{'schema_version':1,'installation_id':cfg['installation_id'],
+                                     'agent':owner,'children':{'runner':self.record['runner']},'postgres':None})
+        plist=put(data,'run/stack.plist',plistlib.dumps({'Label':cfg['launchd_label'],
+                   'WorkingDirectory':str(source),'ProgramArguments':args}))
+        def terminate(values,**kwargs):
+            for value in values:self.live.pop(value['pid'],None)
+            if change_after_exit:trust.atomic_private_json(self.model,{**self.record,'startup_id':'5'*32})
+        probe=SimpleNamespace(_state=lambda:None,_probe=lambda *_:True)
+        with self.patches(),patch.object(agent,'validate',return_value=self.base),patch.object(agent,'unchanged',return_value=True), \
+             patch.object(agent,'drain'),patch.object(agent,'guard_admission_status',return_value={
+                 'admission_paused':True,'pause_reason':'session_maintenance','active_inferences':0,'pending_inferences':0}), \
+             patch('runtime_proof.RunnerResourceProbe',return_value=probe),patch.object(agent,'_force_pg_identity',return_value=(None,None)), \
+             patch.object(fs,'descendants',side_effect=lambda _:list(self.live.values())[1:]), \
+             patch.object(fs,'send',side_effect=lambda value,number:self.signals.append((value['pid'],number)) or True), \
+             patch.object(fs,'terminate_all',side_effect=terminate) as ended, \
+             patch.object(agent.subprocess,'Popen',return_value=SimpleNamespace(wait=lambda timeout:0,returncode=0)) as bootout, \
+             patch.object(agent.subprocess,'run',side_effect=[subprocess.CompletedProcess([],0,'pid = '+str(owner['pid'])+'\n',''),
+                                                             subprocess.CompletedProcess([],1,'','Could not find service')]), \
+             patch.object(fs,'shared_model_record',wraps=fs.shared_model_record) as classify:
+            if change_after_exit or wrong_argv:
+                with self.assertRaises(DistributionError):agent.stop(data)
+                self.assertTrue(state.exists());self.assertTrue(plist.exists());self.assertTrue(self.lease.exists());self.assertTrue(self.model.exists())
+                if wrong_argv:bootout.assert_not_called();ended.assert_not_called()
+            else:
+                result=agent.stop(data);self.assertTrue(result['normal_idle_drain']);self.assertFalse(result['force'])
+                self.assertFalse(state.exists());self.assertFalse(plist.exists());self.assertFalse(self.lease.exists());self.assertFalse(self.model.exists())
+                self.assertEqual(classify.call_count,2)
+    def test_real_normal_stop_dispatch_carries_authenticated_snapshot_through_cleanup(self):self.normal_stop()
+    def test_normal_stop_changed_record_after_teardown_retains_lifecycle_for_review(self):self.normal_stop(change_after_exit=True)
+    def test_normal_stop_wrong_native_argv_rejects_before_bootout_or_termination(self):self.normal_stop(wrong_argv=True)
 
 if __name__=='__main__':unittest.main()
