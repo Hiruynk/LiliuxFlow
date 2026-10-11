@@ -843,6 +843,7 @@ def _force_stop(trusted,*,dry_run=False):
             or decoded.get('Label')!=label or decoded.get('WorkingDirectory')!=str(source)
             or not isinstance(arguments,list) or arguments[:4]!=prefix or arguments[4:] not in ([],['--controlplane-only'],['--mtp2-shared-context'])):
         raise DistributionError('force stop owned registry/plist installation differs')
+    shared_shutdown=record.get('shared_context') is True and arguments[4:]==['--mtp2-shared-context']
     owner=fs.identity(record.get('agent'))
     if not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):raise DistributionError('force stop agent identity/command differs')
     target='gui/'+str(os.getuid())+'/'+label
@@ -881,13 +882,21 @@ def _force_stop(trusted,*,dry_run=False):
             for value in fs.shared_model_record(trusted,shared_record):
                 if fs.exact(value) and bypid.get(value['pid'])!=value:
                     raise DistributionError('owned shared model lies outside verified agent tree')
-        bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        # Shared descendants retain their captured parent while they exit.
+        # Remove the launchd job before allowing the frozen owner to exit,
+        # so KeepAlive cannot restart it between teardown and job removal.
+        if not shared_shutdown:
+            bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         fs.terminate_all(captured,resume=True)
         if pg is not None:
             if fs.exact(pg):
                 if private_file(data/'postgres/data/postmaster.pid').read_bytes()!=pgcontent:raise DistributionError('owned PGDATA PID file changed before fast stop')
                 private_run([postgres_tools(trusted)/'pg_ctl','-D',data/'postgres/data','-m','fast','-w','-t','30','stop'],env=pg_environment(trusted),timeout=40)
             if not fs.exited(pg):raise DistributionError('owned PostgreSQL remains after normal fast stop')
+        if shared_shutdown:
+            if not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):
+                raise DistributionError('shared stop frozen agent identity/command differs')
+            bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         fs.terminate_all([owner],grace=5,resume=True)
         bootout.wait(timeout=15)
         if bootout.returncode or any(not fs.exited(x) for x in captured+[owner]):raise DistributionError('owned force shutdown incomplete; registry retained')
