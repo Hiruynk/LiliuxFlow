@@ -390,8 +390,8 @@ def build(data,*,cargo=None,go=None,node=None,npm_cli=None,pg_bin=None,ui_manife
         if not model_configured(config):
             raise DistributionError('shared MTP2 build requires the configured external Q4 checkpoint')
         from mtp2_shared_runner import RELEASE_EXPECTATION
-        from mtp2_shared_runtime import BOUNDED_OUTPUT_EXPECTATION
-        if RELEASE_EXPECTATION != BOUNDED_OUTPUT_EXPECTATION:
+        from mtp2_shared_runtime import AUTHORITATIVE_IDENTITY_EXPECTATION
+        if RELEASE_EXPECTATION != AUTHORITATIVE_IDENTITY_EXPECTATION:
             raise DistributionError('shared MTP2 normal release recipe is unavailable')
         shared_model_preflight(source,config)
         shared_plan=build_shared_source_candidate(data,cargo=cargo,enable_shared=True,performance_candidate=True)
@@ -628,12 +628,12 @@ def install_generated_shared_extension(source,data,base_trust,built):
     Original engine/binary/profile/grant records are retained byte for byte.
     """
     from mtp2_shared_runner import RELEASE_EXPECTATION
-    from mtp2_shared_runtime import (BOUNDED_OUTPUT_EXPECTATION,BINARY_PATH,PROFILE_IDS,
+    from mtp2_shared_runtime import (AUTHORITATIVE_IDENTITY_EXPECTATION,BINARY_PATH,PROFILE_IDS,
         from_generated_trust,verify_source_inventory,runtime_policy)
     from mtp2_shared_recipe import source_preflight
     from trust import append_shared_serving_sources
     expected=RELEASE_EXPECTATION
-    if expected != BOUNDED_OUTPUT_EXPECTATION:
+    if expected != AUTHORITATIVE_IDENTITY_EXPECTATION:
         raise DistributionError('shared MTP2 normal release recipe is unavailable')
     if (type(built) is not dict or built.get('state')!='built'
         or built.get('native_build_only') is not True or built.get('source_replay')!='PASS'

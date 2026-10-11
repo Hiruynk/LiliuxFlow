@@ -304,5 +304,132 @@
     "source_inventory_sha256": "9a37b17dd44c8da9f5c1d70594251c04497c55c1f16b703040fada01f2c94652",
     "source_file_count": 241,
     "default": false
+  },
+  "lily_mtp2_shared_authoritative_usage": {
+    "repository": "fabiogreter/lily-qwen3.8-flash-next",
+    "commit": "13f7b540937dfafb33184aa0162a0e2d0fbfe65a",
+    "archive_sha256": "4406664bdb4df433a660dee85b6338b28e968d92ee5756c2656add17affe8758",
+    "patches": [
+      {
+        "path": "scripts/distribution/patches/lily-opt64/00-verified-event-defer.patch",
+        "sha256": "2e6a1a17c3c0a82ff0708c6e070ff69ac1b0f4a046cd8002cfcca868c73d075f",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-opt64/01-prefix-privacy.patch",
+        "sha256": "5a63f673c72eb20b360059f37754f76b8c7814da6c350c1b9c988337bdd09f94",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-opt64/02-cancel-drop-queue-terminal.patch",
+        "sha256": "eeeeeb30f92452a08eea37e1052f0ae1e67f84ece5ffcb84337e6ae569c1a534",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-opt64/03-effective-native-metadata.patch",
+        "sha256": "a84a99f1b70b177befa33842ade62894879ffa173395ac5149005c3ea08eccd9",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/04-shared-context-policy.patch",
+        "sha256": "285e22c430a77d91cb124e8b6d67af87a6edb41a31013de7ad8dc1a97d50ffcf",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/05-shared-mtp2-scheduler.patch",
+        "sha256": "ecdc592566f80817915d3a481869d14e238dcfe08d342d6428457ac2a1c72d41",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/06-authenticated-control-tenant-cache.patch",
+        "sha256": "c136811ae91658a5964f6519f8f62eeebc286021974ea7339e587fc0d8e7bb9f",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/07-shared-idle-cpu-copy.patch",
+        "sha256": "a24bc39fe50e6f4c4d94663623355ba4fd39ab06c46c36634b7d6822d86db6f3",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/08-controlled-output-queue.patch",
+        "sha256": "45683e2f314c400cfdf6a70401b3152aab8c2cd5df8e507143f2b12c746f1f2d",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/09-authoritative-request-usage.patch",
+        "sha256": "683cf8663c8c0d244155eaff7c4fd32e5ee2633e3d2f579643a5993437f6f0a0",
+        "unidiff_zero": false
+      }
+    ],
+    "baseline": "manifests/distribution/lily-mtp2-shared-authoritative-usage-source-baseline.json",
+    "source_inventory_sha256": "18b2cd24014a1e6be2c458ce85578f1dd97ade52b730e63972585a6cb7cd6791",
+    "source_file_count": 241,
+    "default": false
+  },
+  "lily_mtp2_shared_admission_identity": {
+    "repository": "fabiogreter/lily-qwen3.8-flash-next",
+    "commit": "13f7b540937dfafb33184aa0162a0e2d0fbfe65a",
+    "archive_sha256": "4406664bdb4df433a660dee85b6338b28e968d92ee5756c2656add17affe8758",
+    "patches": [
+      {
+        "path": "scripts/distribution/patches/lily-opt64/00-verified-event-defer.patch",
+        "sha256": "2e6a1a17c3c0a82ff0708c6e070ff69ac1b0f4a046cd8002cfcca868c73d075f",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-opt64/01-prefix-privacy.patch",
+        "sha256": "5a63f673c72eb20b360059f37754f76b8c7814da6c350c1b9c988337bdd09f94",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-opt64/02-cancel-drop-queue-terminal.patch",
+        "sha256": "eeeeeb30f92452a08eea37e1052f0ae1e67f84ece5ffcb84337e6ae569c1a534",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-opt64/03-effective-native-metadata.patch",
+        "sha256": "a84a99f1b70b177befa33842ade62894879ffa173395ac5149005c3ea08eccd9",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/04-shared-context-policy.patch",
+        "sha256": "285e22c430a77d91cb124e8b6d67af87a6edb41a31013de7ad8dc1a97d50ffcf",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/05-shared-mtp2-scheduler.patch",
+        "sha256": "ecdc592566f80817915d3a481869d14e238dcfe08d342d6428457ac2a1c72d41",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/06-authenticated-control-tenant-cache.patch",
+        "sha256": "c136811ae91658a5964f6519f8f62eeebc286021974ea7339e587fc0d8e7bb9f",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/07-shared-idle-cpu-copy.patch",
+        "sha256": "a24bc39fe50e6f4c4d94663623355ba4fd39ab06c46c36634b7d6822d86db6f3",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/08-controlled-output-queue.patch",
+        "sha256": "45683e2f314c400cfdf6a70401b3152aab8c2cd5df8e507143f2b12c746f1f2d",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/09-authoritative-request-usage.patch",
+        "sha256": "683cf8663c8c0d244155eaff7c4fd32e5ee2633e3d2f579643a5993437f6f0a0",
+        "unidiff_zero": false
+      },
+      {
+        "path": "scripts/distribution/patches/lily-mtp2-shared/10-admission-response-identity.patch",
+        "sha256": "7208c1a0ba50296ab5d5c0c38249384fe859f001c5ceefe218e7fdea523c3afd",
+        "unidiff_zero": false
+      }
+    ],
+    "baseline": "manifests/distribution/lily-mtp2-shared-admission-identity-source-baseline.json",
+    "source_inventory_sha256": "0b005d7da43781f5cd8d8973b29f129ec542660fd388bf6e8398496cbed5889d",
+    "source_file_count": 241,
+    "default": false
   }
 }

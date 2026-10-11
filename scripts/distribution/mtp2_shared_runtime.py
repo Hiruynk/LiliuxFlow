@@ -58,6 +58,12 @@ OUTPUT_PATCH_PATH = 'scripts/distribution/patches/lily-mtp2-shared/08-controlled
 OUTPUT_BASELINE_PATH = 'manifests/distribution/lily-mtp2-shared-bounded-output-source-baseline.json'
 OUTPUT_PATCH_SHA256 = '45683e2f314c400cfdf6a70401b3152aab8c2cd5df8e507143f2b12c746f1f2d'
 PERFORMANCE_PATCH_SHA256 = 'a24bc39fe50e6f4c4d94663623355ba4fd39ab06c46c36634b7d6822d86db6f3'
+USAGE_PATCH_PATH = 'scripts/distribution/patches/lily-mtp2-shared/09-authoritative-request-usage.patch'
+USAGE_BASELINE_PATH = 'manifests/distribution/lily-mtp2-shared-authoritative-usage-source-baseline.json'
+USAGE_PATCH_SHA256 = '683cf8663c8c0d244155eaff7c4fd32e5ee2633e3d2f579643a5993437f6f0a0'
+IDENTITY_PATCH_PATH = 'scripts/distribution/patches/lily-mtp2-shared/10-admission-response-identity.patch'
+IDENTITY_BASELINE_PATH = 'manifests/distribution/lily-mtp2-shared-admission-identity-source-baseline.json'
+IDENTITY_PATCH_SHA256 = '7208c1a0ba50296ab5d5c0c38249384fe859f001c5ceefe218e7fdea523c3afd'
 # These must be bound by generated release trust before installation selection.
 # Runner and transport require the final frozen native recipe; merely finding
 # these helpers is insufficient to admit an installed shared runtime.
@@ -103,6 +109,8 @@ class RecipeExpectation:
     service_patch_sha256: str | None = None
     performance_patch_sha256: str | None = None
     output_patch_sha256: str | None = None
+    usage_patch_sha256: str | None = None
+    identity_patch_sha256: str | None = None
 
     def __post_init__(self):
         values = (self.p1_patch_sha256, self.p2_patch_sha256,
@@ -116,7 +124,13 @@ class RecipeExpectation:
                     or self.performance_patch_sha256 != PERFORMANCE_PATCH_SHA256)
                 or self.output_patch_sha256 is not None and (self.performance_patch_sha256 is None
                     or type(self.output_patch_sha256) is not str
-                    or self.output_patch_sha256 != OUTPUT_PATCH_SHA256)):
+                    or self.output_patch_sha256 != OUTPUT_PATCH_SHA256)
+                or self.usage_patch_sha256 is not None and (self.output_patch_sha256 is None
+                    or type(self.usage_patch_sha256) is not str
+                    or self.usage_patch_sha256 != USAGE_PATCH_SHA256)
+                or self.identity_patch_sha256 is not None and (self.usage_patch_sha256 is None
+                    or type(self.identity_patch_sha256) is not str
+                    or self.identity_patch_sha256 != IDENTITY_PATCH_SHA256)):
             raise DistributionError('shared MTP2 code-side recipe expectation is malformed')
 
     @property
@@ -127,18 +141,30 @@ class RecipeExpectation:
         performance_hash = () if self.performance_patch_sha256 is None else (self.performance_patch_sha256,)
         output = () if self.output_patch_sha256 is None else (OUTPUT_PATCH_PATH,)
         output_hash = () if self.output_patch_sha256 is None else (self.output_patch_sha256,)
+        usage = () if self.usage_patch_sha256 is None else (USAGE_PATCH_PATH,)
+        usage_hash = () if self.usage_patch_sha256 is None else (self.usage_patch_sha256,)
+        identity = () if self.identity_patch_sha256 is None else (IDENTITY_PATCH_PATH,)
+        identity_hash = () if self.identity_patch_sha256 is None else (self.identity_patch_sha256,)
         return tuple({'path': path, 'sha256': digest, 'unidiff_zero': False}
-                     for path, digest in zip(BASE_PATCH_PATHS + SHARED_PATCH_PATHS + service + performance + output,
-                                             PATCHES + (self.p1_patch_sha256, self.p2_patch_sha256) + hashes + performance_hash + output_hash))
+                     for path, digest in zip(BASE_PATCH_PATHS + SHARED_PATCH_PATHS + service + performance + output + usage + identity,
+                                             PATCHES + (self.p1_patch_sha256, self.p2_patch_sha256) + hashes + performance_hash + output_hash + usage_hash + identity_hash))
 
     @property
     def baseline_path(self):
+        if self.identity_patch_sha256 is not None:
+            return IDENTITY_BASELINE_PATH
+        if self.usage_patch_sha256 is not None:
+            return USAGE_BASELINE_PATH
         if self.output_patch_sha256 is not None:
             return OUTPUT_BASELINE_PATH
         return BASELINE_PATH if self.performance_patch_sha256 is None else COPY_BASELINE_PATH
 
     @property
     def pin_key(self):
+        if self.identity_patch_sha256 is not None:
+            return 'lily_mtp2_shared_admission_identity'
+        if self.usage_patch_sha256 is not None:
+            return 'lily_mtp2_shared_authoritative_usage'
         if self.output_patch_sha256 is not None:
             return 'lily_mtp2_shared_bounded_output'
         return 'lily_mtp2_shared' if self.performance_patch_sha256 is None else 'lily_mtp2_shared_cpu_copy'
@@ -182,10 +208,32 @@ BOUNDED_OUTPUT_EXPECTATION = RecipeExpectation(
     output_patch_sha256=OUTPUT_PATCH_SHA256,
 )
 
+# Append09 only: old 238/240/241 source recipes remain exact historical inputs.
+# This schema change requires a fresh normal native build and generated trust.
+AUTHORITATIVE_USAGE_EXPECTATION = RecipeExpectation(
+    BOUNDED_OUTPUT_EXPECTATION.p1_patch_sha256, BOUNDED_OUTPUT_EXPECTATION.p2_patch_sha256,
+    '9a4405bcd1d19baa2781a9e4f5a8e876ff3cd2536f8cf97a5c39418110ff2220', '18b2cd24014a1e6be2c458ce85578f1dd97ade52b730e63972585a6cb7cd6791', 241,
+    service_patch_sha256=BOUNDED_OUTPUT_EXPECTATION.service_patch_sha256,
+    performance_patch_sha256=PERFORMANCE_PATCH_SHA256,
+    output_patch_sha256=OUTPUT_PATCH_SHA256,
+    usage_patch_sha256=USAGE_PATCH_SHA256,
+)
+
+# Append10 reuses the actual native ID for cancelled-prefill billing/timings.
+AUTHORITATIVE_IDENTITY_EXPECTATION = RecipeExpectation(
+    AUTHORITATIVE_USAGE_EXPECTATION.p1_patch_sha256, AUTHORITATIVE_USAGE_EXPECTATION.p2_patch_sha256,
+    'fe25b4def4a984cab8e8987fc58278d13ccbc5dcb43104411cb9e68cf78ad32f', '0b005d7da43781f5cd8d8973b29f129ec542660fd388bf6e8398496cbed5889d', 241,
+    service_patch_sha256=AUTHORITATIVE_USAGE_EXPECTATION.service_patch_sha256,
+    performance_patch_sha256=PERFORMANCE_PATCH_SHA256,
+    output_patch_sha256=OUTPUT_PATCH_SHA256,
+    usage_patch_sha256=USAGE_PATCH_SHA256,
+    identity_patch_sha256=IDENTITY_PATCH_SHA256,
+)
+
 def candidate_expectation(performance_candidate=False):
     if type(performance_candidate) is not bool:
         raise DistributionError('shared MTP2 performance candidate must be an exact boolean')
-    return BOUNDED_OUTPUT_EXPECTATION if performance_candidate else FROZEN_SOURCE_EXPECTATION
+    return AUTHORITATIVE_IDENTITY_EXPECTATION if performance_candidate else FROZEN_SOURCE_EXPECTATION
 
 def _expectation(value):
     if type(value) is not RecipeExpectation:
@@ -409,7 +457,7 @@ def normal_shared_view(trusted):
     """
     from mtp2_shared_runner import RELEASE_EXPECTATION
     expected = _expectation(RELEASE_EXPECTATION)
-    if expected != BOUNDED_OUTPUT_EXPECTATION:
+    if expected != AUTHORITATIVE_IDENTITY_EXPECTATION:
         raise DistributionError('shared MTP2 normal release recipe is unavailable')
     if '_mtp2_validation_binding' in trusted or '_mtp2_config_binding' in trusted:
         raise DistributionError('validation bindings cannot select the normal shared extension')

@@ -9,7 +9,9 @@ from common import DistributionError, no_symlinks, read_object, relative_path
 from trust import verified_file, sha256
 from ui_recipe import patch_paths
 from mtp2_shared_runtime import (ENGINE_ID, BASELINE_PATH, BOUNDARY_SOURCES,
-    FROZEN_SOURCE_EXPECTATION as EXPECTED, select_shared_recipe, _baseline, candidate_expectation)
+    FROZEN_SOURCE_EXPECTATION as EXPECTED, BOUNDED_OUTPUT_EXPECTATION, OUTPUT_BASELINE_PATH,
+    AUTHORITATIVE_USAGE_EXPECTATION, USAGE_BASELINE_PATH,
+    select_shared_recipe, _baseline, candidate_expectation)
 
 NATIVE_BUILD_INPUTS = frozenset('scripts/distribution/' + name for name in (
     'build_native.py', 'native_recipe.py', 'mtp2_shared_recipe.py',
@@ -20,7 +22,7 @@ NATIVE_BUILD_INPUTS = frozenset('scripts/distribution/' + name for name in (
         row['path'] for row in EXPECTED.patches}
 SERVING_INPUTS = BOUNDARY_SOURCES | NATIVE_BUILD_INPUTS | frozenset(
     'scripts/distribution/' + name for name in (
-        'mtp2_shared_gateway.py', 'mtp2_shared_ui.py', 'mtp2_shared_journal.py', 'mtp2_shared_upgrade.py', 'agent.py', 'liliuxflow.py',
+        'mtp2_shared_gateway.py', 'mtp2_shared_usage_accounting.py', 'mtp2_shared_ui.py', 'mtp2_shared_journal.py', 'mtp2_shared_upgrade.py', 'agent.py', 'liliuxflow.py',
         'litellm_profile_policy.py', 'patch_litellm_profiles.py')) | frozenset(
     'services/compat/src/compat_api/' + name for name in (
         'portable.py', 'app.py', 'profile.py', 'llama_guard.py', '__init__.py')) | {
@@ -30,7 +32,9 @@ SERVING_INPUTS = BOUNDARY_SOURCES | NATIVE_BUILD_INPUTS | frozenset(
 
 def native_build_inputs(performance_candidate=False):
     expected = candidate_expectation(performance_candidate)
-    return NATIVE_BUILD_INPUTS | {expected.baseline_path} | {row['path'] for row in expected.patches}
+    prior = {OUTPUT_BASELINE_PATH} if expected.usage_patch_sha256 is not None else set()
+    if expected.identity_patch_sha256 is not None:prior.add(USAGE_BASELINE_PATH)
+    return NATIVE_BUILD_INPUTS | {expected.baseline_path} | {row['path'] for row in expected.patches} | prior
 
 def serving_inputs(performance_candidate=False):
     return SERVING_INPUTS | native_build_inputs(performance_candidate)
@@ -42,6 +46,10 @@ def source_preflight(source, *, performance_candidate=False):
     lock = read_object(source / 'manifests/distribution/native-sources.json')
     pin, baseline = select_shared_recipe(lock, expected)
     rows = _baseline(source, expected)
+    if expected.usage_patch_sha256 is not None:
+        _baseline(source, BOUNDED_OUTPUT_EXPECTATION)
+    if expected.identity_patch_sha256 is not None:
+        _baseline(source, AUTHORITATIVE_USAGE_EXPECTATION)
     for item in expected.patches:
         patch = verified_file(source, item)
         for path in patch_paths(patch, 1):

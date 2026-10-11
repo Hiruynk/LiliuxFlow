@@ -462,9 +462,9 @@ class GuardIntegrationTests(unittest.IsolatedAsyncioTestCase):
             if request.url.path in protocol.PATHS['infer']:
                 value=json.loads(request.content);value['model']='Qwen3.8-Flash-Next';value['liliuxflow_profile']=request.headers[protocol.HEADER_PREFIX+'profile']
                 proof=protocol.verify_native_request(request.method,request.url.path,tuple(request.headers.items()),json.dumps(value).encode(),native_key=self.key,now=int(__import__('time').time()),actual_epoch=EPOCH)
-                row={'nonce':proof.nonce,'alias':proof.alias,'profile':proof.profile,'phase':'acquired','revision':1,'acquired':1,'released':0}
+                row={'nonce':proof.nonce,'alias':proof.alias,'profile':proof.profile,'phase':'acquired','revision':1,'acquired':1,'released':0,'usage':None}
                 self.records[proof.nonce]=row
-                body=json.dumps({'model':proof.alias,'choices':[{'message':{'content':'synthetic answer'}}]}).encode()
+                body=json.dumps({'model':proof.alias,**({'id':self.synthetic_response_id} if hasattr(self,'synthetic_response_id') else {}),'choices':[{'message':{'content':'synthetic answer'}}]}).encode()
                 gate=self.reader_gate
                 class ReaderStream(httpx.AsyncByteStream):
                     async def __aiter__(self):
@@ -487,6 +487,7 @@ class GuardIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 result.append({'nonce':nonce,'phase':'unknown'});continue
             if not self.hold_release:
                 row.update(phase='released',revision=2,released=1,proof=dict(protocol._RELEASE_PROOF))
+                row['usage']=copy.deepcopy(getattr(self,'synthetic_usage_documents',{}).get(nonce))
             result.append(row)
         return self.signed(proof,{'v':1,'epoch':EPOCH,'records':result})
 
@@ -506,6 +507,39 @@ class GuardIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.unloads,0)
         status=await self.guard.status()
         self.assertEqual((status['active_inferences'],status['pending_inferences']),(0,0))
+
+    async def test_signed_usage_poll_cache_then_cancelled_LP_dispatch_exactly_once_same_caller(self):
+        # A real typed signed control reply exercises _poll BEFORE forget_terminal;
+        # only CPU native HTTP/scalar fixtures and official LP logging are used.
+        import mtp2_shared_usage_accounting as accounting
+        from test_mtp2_shared_usage_accounting import fixture,official
+        import litellm
+        body,headers=self.request()
+        admitted=ingress.verify_capability(headers[ingress.CAPABILITY_HEADER],json.loads(body),self.registry,backend_secret=SECRET.encode())
+        self.synthetic_response_id='chatcmpl-1000-1'
+        commitment=hashlib.sha256(protocol._lp(protocol.USAGE_DOMAIN,(EPOCH,admitted.request_id,admitted.tenant,admitted.alias,admitted.profile_id))).hexdigest()
+        self.synthetic_usage_documents={admitted.request_id:{'v':1,'tenant_binding':commitment,'response_id':self.synthetic_response_id,
+            'finish_reason':'stop','cancelled':True,'usage':{'prompt_tokens':150,'completion_tokens':1000,'total_tokens':1150,
+                'prompt_tokens_details':{'cached_tokens':20},'completion_tokens_details':{'reasoning_tokens':900,'accepted_prediction_tokens':80,'rejected_prediction_tokens':20}}}}
+        result=await self.client.post('/v1/chat/completions',content=body,headers=headers)
+        self.assertEqual(result.status_code,200);self.assertEqual(result.json()['id'],self.synthetic_response_id)
+        retained=self.guard.terminal_usage[admitted.request_id][1]
+        self.assertIs(type(retained),protocol.VerifiedUsage);self.assertNotIn(admitted.request_id,self.guard.shared_rows)
+        self.assertFalse(self.guard.native_actor._handles)  # no new/reconstructed handle used by the cache
+        owner,_,_,logger,seen,response,data,_,order=fixture()
+        ticket=accounting.UsageTicket(admitted.request_id,admitted.tenant,admitted.alias,admitted.profile_id,owner)
+        response.chunks[0].id=result.json()['id'];response._response_headers=result.headers
+        async def resolve(t,epoch,response_id):
+            reply=await self.client.post(accounting.USAGE_PATH,headers={'Authorization':'Bearer '+SECRET},
+                json={'nonce':t.nonce,'tenant':t.tenant,'alias':t.alias,'profile':t.profile,'epoch':epoch,'response_id':response_id})
+            self.assertEqual(reply.status_code,200);return reply.json()
+        with patch.object(litellm,'disable_streaming_logging',False):
+            self.assertTrue(await accounting.bill_native_partial(ticket,owner,data,response,resolve=resolve,official_bill=official))
+            self.assertTrue(await accounting.bill_native_partial(ticket,owner,data,response,resolve=resolve,official_bill=official))
+        self.assertEqual(len(seen),1);self.assertEqual(data['litellm_call_id'],'actual-LP-own-call-id')
+        usage=seen[0].usage;self.assertEqual((usage.prompt_tokens,usage.completion_tokens,usage.total_tokens),(150,1000,1150))
+        self.assertEqual(usage.completion_tokens_details.reasoning_tokens,900);self.assertEqual(usage.prompt_tokens_details.cached_tokens,20)
+        self.assertEqual(order,['close']);self.assertNotEqual(usage.completion_tokens,retained.drafted_tokens)
 
     async def test_same_alias_two_requests_independent_and_bounded_busy(self):
         self.hold_release=True

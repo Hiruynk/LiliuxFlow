@@ -19,7 +19,8 @@ from types import MethodType
 
 from common import DistributionError
 from mtp2_shared_config import PUBLIC_ALIASES, PHYSICAL_MODEL_ID
-from mtp2_shared_ingress import CAPABILITY_HEADER, issue_capability, validate_raw_ingress
+from mtp2_shared_ingress import CAPABILITY_HEADER, issue_capability, validate_raw_ingress, verify_capability
+from mtp2_shared_usage_accounting import UsageTicket, EPOCH_HEADER, USAGE_PATH, _FIELDS, bill_native_partial
 
 FEATURE_ENV = "LILIUXFLOW_MTP2_SHARED_GATEWAY"
 VALIDATION_ENV = "LILIUXFLOW_MTP2_SHARED_VALIDATION"
@@ -57,6 +58,7 @@ class _PrivateRouteBoundary:
         if (type(expected_sha256) is not str or len(expected_sha256) != 64
                 or any(char not in "0123456789abcdef" for char in expected_sha256)):
             raise DistributionError("private candidate config expectation is unavailable")
+        self.guard_port = guard_port
         self.expected_sha256 = expected_sha256
         document = self._source()
         allowed = {row.public_alias for row in registry.profiles}
@@ -189,6 +191,37 @@ class _PrivateRouteBoundary:
         logging.pre_call_hook = MethodType(final_pre_call, logging)
         self._logging, self._final_pre_call = logging, logging.pre_call_hook
         self._final_pre_call_function = final_pre_call
+        # Existing pinned partial-disconnect dispatch remains the only logger.
+        # Scope is the original authenticated ASGI context, never request JSON.
+        import litellm.proxy.common_request_processing as stream_cleanup
+        original_partial = stream_cleanup._bill_partial_streamed_spend_on_disconnect
+        original_partial=getattr(original_partial,'_liliuxflow_original_partial',original_partial)
+        import inspect
+        if (hashlib.sha256(inspect.getsource(original_partial).encode()).hexdigest()
+                !='820e34025e4434627286d2bacaf17602093000ffaa106f65499139fd6d99aed5'):
+            raise DistributionError('private candidate pinned partial hook changed')
+        async def resolve_usage(ticket, epoch, response_id):
+            import httpx
+            async with httpx.AsyncClient(timeout=65, trust_env=False) as client:
+                async with client.stream('POST', 'http://127.0.0.1:'+str(boundary.guard_port)+USAGE_PATH,
+                    headers={'Authorization':'Bearer '+_callback_config[1].decode('utf-8')},
+                    json={'nonce':ticket.nonce,'tenant':ticket.tenant,'alias':ticket.alias,'profile':ticket.profile,
+                          'epoch':epoch,'response_id':response_id}) as reply:
+                    if reply.status_code!=200:raise DistributionError('shared_usage_unavailable')
+                    raw=bytearray()
+                    async for part in reply.aiter_bytes():
+                        if len(raw)+len(part)>4096:raise DistributionError('shared_usage_reply_too_large')
+                        raw.extend(part)
+                    return json.loads(raw)
+        async def native_partial(request_data,response):
+            capture=_raw_context.get()
+            ticket=capture.accounting[0] if capture is not None and capture.accounting else None
+            return await bill_native_partial(ticket,_callback_config[2],request_data,response,
+                resolve=resolve_usage,official_bill=original_partial)
+        native_partial._liliuxflow_native_partial=True
+        native_partial._liliuxflow_original_partial=original_partial
+        stream_cleanup._bill_partial_streamed_spend_on_disconnect=native_partial
+        self._partial_module,self._partial_hook=stream_cleanup,native_partial
 
     def assert_no_late_mutators(self):
         """Pre-call processing finishes before issuance; later hooks must be inert.
@@ -221,6 +254,8 @@ class _PrivateRouteBoundary:
         if self._callback is not None:
             import litellm
             from litellm.proxy.utils import ProxyLogging
+            if self._partial_module._bill_partial_streamed_spend_on_disconnect is not self._partial_hook:
+                raise DistributionError('private candidate accounting hook changed')
             if type(litellm.callbacks) is not list:
                 raise DistributionError("private candidate callback registry changed")
             callbacks = ProxyLogging._callback_capabilities().resolved_callbacks
@@ -287,6 +322,7 @@ class _RawCapture:
     body: bytes = field(repr=False)
     headers: tuple = field(repr=False)
     owner: object = field(repr=False)
+    accounting: list = field(default_factory=list, repr=False, compare=False)
 
 
 class _Pairs(list):
@@ -373,7 +409,12 @@ class RawMtp2Ingress:
                 return message
             return await receive()
         try:
-            return await self.app(scope, replay, send)
+            async def public_send(message):
+                if token is not None and message.get('type')=='http.response.start':
+                    private={EPOCH_HEADER.encode('ascii'),('llm_provider-'+EPOCH_HEADER).encode('ascii')}
+                    message={**message,'headers':[(k,v) for k,v in message.get('headers',()) if k.lower() not in private]}
+                await send(message)
+            return await self.app(scope, replay, public_send)
         finally:
             if token is not None:
                 _raw_context.reset(token)
@@ -429,6 +470,10 @@ def create_callback():
             headers = data.get("extra_headers", {})
             if type(headers) is not dict or any(type(key) is not str or key.lower().startswith("x-liliuxflow-") for key in headers):
                 raise HTTPException(400, "caller cannot supply internal MTP2 headers")
+            admitted=verify_capability(capability,json.loads(capture.body),registry,backend_secret=backend_secret)
+            if capture.accounting:
+                raise HTTPException(503,'MTP2 accounting ticket already issued')
+            capture.accounting.append(UsageTicket(admitted.request_id,admitted.tenant,admitted.alias,admitted.profile_id,_owner))
             data["extra_headers"] = {**headers, CAPABILITY_HEADER: capability}
             return data
 
@@ -575,6 +620,7 @@ def _make_shared_guard(*, owner_probe, **kwargs):
             self.idle_task = None
             self.last_shared_work = None
             self.shared_rows = {}
+            self.terminal_usage = {}
             self.shared_resident = SimpleNamespace(profile_id="mtp2-shared", public_alias=PHYSICAL_MODEL_ID,
                                                    engine_id="latest13f-defer-pc123-mtp2-shared-context-v1")
             self.shared = Mtp2SharedCoordinator(prepare_runtime=self._shared_ready,
@@ -800,6 +846,13 @@ def _make_shared_guard(*, owner_probe, **kwargs):
                         terminal = await self.shared.apply_verified_record(self.native_actor, row.handle, record,
                                                                          owned_runtime=self.shared_owner)
                         if terminal:
+                            usage=self.native_actor.verified_usage(row.handle,record)
+                            # Retain only exact terminal scalars, bounded60s/128 rows.
+                            now=asyncio.get_running_loop().time()
+                            self.terminal_usage={k:v for k,v in self.terminal_usage.items() if v[0]>now}
+                            if len(self.terminal_usage)>=128:
+                                self.terminal_usage.pop(next(iter(self.terminal_usage)))
+                            self.terminal_usage[row.handle.nonce]=(now+60,usage)
                             self.native_actor.forget_terminal(row.handle, record)
                             row.native_done = True
                             row.stage = "cleanup"
@@ -907,6 +960,7 @@ def _make_shared_guard(*, owner_probe, **kwargs):
                         del public_headers[key]
                 public_headers["X-LiliuxFlow-Context-Tokens"] = str(profile.context_tokens)
                 public_headers["X-LiliuxFlow-Profile"] = profile.profile_id
+                public_headers[EPOCH_HEADER] = row.handle.epoch
                 async def chunks():
                     nonlocal complete
                     iterator = response.aiter_raw().__aiter__()
@@ -989,7 +1043,36 @@ def _make_shared_guard(*, owner_probe, **kwargs):
             return _ProfileStreamingResponse(chunks(),disconnect=disconnect,cleanup=cleanup,
                 status_code=response.status_code,headers=dict(_filter_headers(response.headers,request_side=False)))
 
+        async def _usage_summary(self,request):
+            from starlette.responses import JSONResponse
+            if request.method!='POST' or not hmac.compare_digest(request.headers.get('authorization',''),'Bearer '+self.backend_token):
+                return _control_body(403,'route_not_allowed','native usage is private')
+            body=bytearray()
+            async for part in request.stream():
+                if len(body)+len(part)>1024:return _control_body(400,'invalid_usage_query','invalid native usage query')
+                body.extend(part)
+            try:
+                value=json.loads(body)
+                fields={'nonce','tenant','alias','profile','epoch','response_id'}
+                if type(value) is not dict or set(value)!=fields:raise ValueError()
+                nonce=value['nonce']
+                if type(nonce) is not str or len(nonce)!=32 or any(c not in '0123456789abcdef' for c in nonce):raise ValueError()
+                row=self.shared_rows.get(nonce)
+                if row is not None:
+                    handle=row.handle
+                    if handle is None or any(getattr(handle,k)!=value[k] for k in ('epoch','nonce','tenant','alias','profile')):raise ValueError()
+                    await asyncio.wait_for(asyncio.shield(row.settled),timeout=60)
+                entry=self.terminal_usage.get(nonce)
+                if entry is None or entry[0]<=asyncio.get_running_loop().time() or entry[1] is None:raise ValueError()
+                usage=entry[1]
+                if any(getattr(usage,k)!=value[k] for k in ('epoch','nonce','tenant','alias','profile')):raise ValueError()
+                if value['response_id'] is not None and value['response_id']!=usage.response_id:raise ValueError()
+                return JSONResponse({k:getattr(usage,k) for k in _FIELDS},headers={'Cache-Control':'no-store'})
+            except (ValueError,KeyError,TypeError,asyncio.TimeoutError,DistributionError,_GuardError):
+                return _control_body(503,'unverified_native_usage','native terminal usage is unverified')
+
         async def proxy_http(self, request, *, inference):
+            if request.url.path==USAGE_PATH:return await self._usage_summary(request)
             if (request.method=="GET" and request.url.path=="/v1/models"
                     and request.headers.get("authorization","")!="Bearer "+self.backend_token):
                 if request.headers.get("authorization"):return await self._ui_relay(request)

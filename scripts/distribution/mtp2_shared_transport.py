@@ -27,6 +27,7 @@ from mtp2_shared_ingress import validate_raw_ingress, verify_capability, _reject
 KDF_DOMAIN = b"LiliuxFlow/MTP2/native-control/v1\x00"
 REQUEST_DOMAIN = b"LiliuxFlow/MTP2/native-request/v1\x00"
 RESPONSE_DOMAIN = b"LiliuxFlow/MTP2/native-response/v1\x00"
+USAGE_DOMAIN = b"LiliuxFlow/MTP2/native-usage/v1\x00"
 HEADER_PREFIX = "x-liliuxflow-control-"
 REQUEST_HEADERS = tuple(HEADER_PREFIX + key for key in (
     "version", "operation", "epoch", "nonce", "tenant", "alias", "profile",
@@ -49,6 +50,7 @@ ALIAS_PROFILES = dict(zip(PUBLIC_ALIASES, PROFILE_IDS))
 _HEX64 = re.compile(r"[a-f0-9]{64}\Z")
 _HEX32 = re.compile(r"[a-f0-9]{32}\Z")
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_NATIVE_ID = re.compile(r"(chatcmpl|cmpl)-(0|[1-9][0-9]{0,19})-(0|[1-9][0-9]{0,19})\Z")
 _RELEASE_PROOF = {"registered": True, "queue_reservation_returned": True,
                   "job_disposed": True, "session_disposed": True,
                   "pin_released": True, "gpu_fault": False}
@@ -360,6 +362,72 @@ class RawReply:
 
 
 @dataclass(frozen=True, slots=True)
+class VerifiedUsage:
+    """Terminal native scalars for exactly one actor-owned admission."""
+    epoch: str
+    nonce: str
+    tenant: str = field(repr=False)
+    alias: str
+    profile: str
+    response_id: str | None
+    prompt_tokens: int
+    cached_tokens: int
+    completion_tokens: int
+    reasoning_tokens: int | None
+    drafted_tokens: int
+    accepted_tokens: int
+    finish_reason: str
+    cancelled: bool
+    _owner: object = field(repr=False, compare=False)
+
+
+def _verified_usage(value, handle, *, chat, owner):
+    if value is None:
+        return None
+    _exact(value, ("v", "tenant_binding", "response_id", "finish_reason", "cancelled", "usage"))
+    _int(value["v"], 1, 1)
+    binding = hashlib.sha256(_lp(USAGE_DOMAIN, (handle.epoch, handle.nonce, handle.tenant,
+                                               handle.alias, handle.profile))).hexdigest()
+    if not hmac.compare_digest(_hex(value["tenant_binding"], 64), binding):
+        _fail("usage_binding")
+    if type(value["cancelled"]) is not bool or type(value["finish_reason"]) is not str or value["finish_reason"] not in {"stop", "length", "tool_calls", "cancelled"}:
+        _fail("usage_terminal")
+    usage = value["usage"]
+    if type(usage) is not dict:
+        _fail("usage_schema")
+    _exact(usage, {"prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details"}
+           | ({"completion_tokens_details"} if "completion_tokens_details" in usage else set()))
+    prompt = _int(usage["prompt_tokens"], 1)
+    completion = _int(usage["completion_tokens"], 0, 65536)
+    if _int(usage["total_tokens"]) != prompt + completion:
+        _fail("usage_total")
+    _exact(usage["prompt_tokens_details"], ("cached_tokens",))
+    cached = _int(usage["prompt_tokens_details"]["cached_tokens"], 0, prompt)
+    details = usage.get("completion_tokens_details", {})
+    if type(details) is not dict or set(details) - {"reasoning_tokens", "accepted_prediction_tokens", "rejected_prediction_tokens"}:
+        _fail("usage_details")
+    if chat != ("reasoning_tokens" in details):
+        _fail("usage_reasoning")
+    reasoning = _int(details["reasoning_tokens"], 0, completion) if chat else None
+    if ("accepted_prediction_tokens" in details) != ("rejected_prediction_tokens" in details):
+        _fail("usage_speculation")
+    accepted = _int(details.get("accepted_prediction_tokens", 0))
+    rejected = _int(details.get("rejected_prediction_tokens", 0))
+    drafted = _int(accepted + rejected)
+    response_id = value["response_id"]
+    if response_id is not None:
+        match = _NATIVE_ID.fullmatch(response_id) if type(response_id) is str else None
+        if (match is None or match[1] != ("chatcmpl" if chat else "cmpl")
+                or any(int(match[index]) > 2**64 - 1 for index in (2, 3))):
+            _fail("usage_response_id")
+    elif completion or not value["cancelled"] or value["finish_reason"] != "cancelled":
+        _fail("usage_response_id")
+    return VerifiedUsage(handle.epoch, handle.nonce, handle.tenant, handle.alias, handle.profile,
+                         response_id, prompt, cached, completion, reasoning, drafted, accepted,
+                         value["finish_reason"], value["cancelled"], owner)
+
+
+@dataclass(frozen=True, slots=True)
 class VerifiedRecord:
     epoch: str
     nonce: str
@@ -371,6 +439,7 @@ class VerifiedRecord:
     released: int
     changed: bool
     _owner: object = field(repr=False, compare=False)
+    usage: VerifiedUsage | None = field(default=None, repr=False)
 
     @property
     def release_proven(self):
@@ -545,7 +614,7 @@ class NativeTransport:
             raise UnknownNativeRecord(handle.nonce, self._owner)
         if type(row) is not dict or type(row.get("phase")) is not str:
             _fail("record_phase")
-        keys = {"nonce", "alias", "profile", "phase", "revision", "acquired", "released"}
+        keys = {"nonce", "alias", "profile", "phase", "revision", "acquired", "released", "usage"}
         terminal = row["phase"] in {"released", "rejected_without_native_state"}
         _exact(row, keys | ({"proof"} if terminal else set()))
         if row["nonce"] != handle.nonce or row["alias"] != handle.alias or row["profile"] != handle.profile:
@@ -565,6 +634,13 @@ class NativeTransport:
             if any(type(row["proof"][key]) is not bool or row["proof"][key] is not value
                    for key, value in expected_proof.items()):
                 _fail("terminal_proof")
+        if phase != "released" and row["usage"] is not None:
+            _fail("usage_before_release")
+        admitted = self._admissions.get(handle.nonce)
+        if admitted is None:
+            _fail("usage_admission")
+        usage = _verified_usage(row["usage"], handle,
+                                chat=admitted.target == "/v1/chat/completions", owner=self._owner)
         previous = self._observations.get((handle.epoch, handle.nonce))
         canonical = json.dumps(row, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
         changed = previous is None or revision > previous[0]
@@ -581,7 +657,7 @@ class NativeTransport:
             if order[phase] < order[old_phase]:
                 _fail("record_phase_regression")
         return (VerifiedRecord(handle.epoch, handle.nonce, handle.alias, handle.profile,
-                               phase, revision, acquired, released, changed, self._owner),
+                               phase, revision, acquired, released, changed, self._owner, usage),
                 (revision, canonical, phase, acquired))
 
     def _call_slot(self, table, wire):
@@ -687,6 +763,20 @@ class NativeTransport:
         return (type(error) is UnknownNativeRecord and error._owner is self._owner
                 and error.nonce == handle.nonce
                 and (handle.epoch, handle.nonce) not in self._observations)
+
+    def verified_usage(self, handle, record, expected_response_id=None):
+        """Read before forget_terminal; no signed release/usage means unknown."""
+        self.require_verified_record(handle, record)
+        usage = record.usage
+        if usage is None:
+            return None
+        if (not record.release_proven or type(usage) is not VerifiedUsage or usage._owner is not self._owner
+                or any(getattr(usage, key) != getattr(handle, key)
+                       for key in ("epoch", "nonce", "tenant", "alias", "profile"))):
+            _fail("usage_origin")
+        if expected_response_id is not None and (type(expected_response_id) is not str or usage.response_id != expected_response_id):
+            _fail("usage_response_binding")
+        return usage
 
     async def exchange(self, wire, send):
         """Inject a callback sending wire.body exactly; no condition/physical lock.

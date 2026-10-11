@@ -30,9 +30,10 @@ class RecipeAndInstallationTests(unittest.TestCase):
     def test_bounded_candidate_is_explicit_and_preserves_older_recipes(self):
         lock = json.loads((ROOT / 'manifests/distribution/native-sources.json').read_text())
         self.assertIs(shared.candidate_expectation(), shared.FROZEN_SOURCE_EXPECTATION)
-        self.assertIs(shared.candidate_expectation(True), shared.BOUNDED_OUTPUT_EXPECTATION)
+        self.assertIs(shared.candidate_expectation(True), shared.AUTHORITATIVE_IDENTITY_EXPECTATION)
         for expected in (shared.FROZEN_SOURCE_EXPECTATION, shared.CPU_COPY_EXPECTATION,
-                         shared.BOUNDED_OUTPUT_EXPECTATION):
+                         shared.BOUNDED_OUTPUT_EXPECTATION, shared.AUTHORITATIVE_USAGE_EXPECTATION,
+                         shared.AUTHORITATIVE_IDENTITY_EXPECTATION):
             self.assertEqual(shared.select_shared_recipe(lock, expected)[0], expected.pin())
         self.assertEqual(native_recipe.select_lily_recipe(self.lock)[0], self.lock['lily'])
         self.assertFalse(self.lock[shared.BOUNDED_OUTPUT_EXPECTATION.pin_key]['default'])
@@ -50,6 +51,28 @@ class RecipeAndInstallationTests(unittest.TestCase):
         self.assertEqual(shared.select_shared_recipe(bad, shared.CPU_COPY_EXPECTATION)[0],
                          shared.CPU_COPY_EXPECTATION.pin())
 
+    def test_authoritative_usage_is_append_only_and_requires_exact_full_chain(self):
+        expected=shared.AUTHORITATIVE_USAGE_EXPECTATION
+        self.assertEqual(expected.patches[:-1],shared.BOUNDED_OUTPUT_EXPECTATION.patches)
+        self.assertEqual(expected.patches[-1]['path'],shared.USAGE_PATCH_PATH)
+        for change in ({'output_patch_sha256':None},{'performance_patch_sha256':None},
+                       {'usage_patch_sha256':'0'*64},{'usage_patch_sha256':True}):
+            with self.subTest(change=change),self.assertRaises(DistributionError):replace(expected,**change)
+        bad=copy.deepcopy(self.lock);bad[expected.pin_key]['patches'].pop()
+        with self.assertRaises(DistributionError):shared.select_shared_recipe(bad,expected)
+        self.assertEqual(shared.select_shared_recipe(bad,shared.BOUNDED_OUTPUT_EXPECTATION)[0],shared.BOUNDED_OUTPUT_EXPECTATION.pin())
+
+    def test_actual_admission_identity_is_exact_append10_and_cannot_replace_append09(self):
+        expected=shared.AUTHORITATIVE_IDENTITY_EXPECTATION
+        self.assertEqual(expected.patches[:-1],shared.AUTHORITATIVE_USAGE_EXPECTATION.patches)
+        self.assertEqual(expected.patches[-1]['path'],shared.IDENTITY_PATCH_PATH)
+        for change in ({'usage_patch_sha256':None},{'identity_patch_sha256':True},
+                       {'identity_patch_sha256':'0'*64}):
+            with self.subTest(change=change),self.assertRaises(DistributionError):replace(expected,**change)
+        bad=copy.deepcopy(self.lock);bad[expected.pin_key]['patches'].pop()
+        with self.assertRaises(DistributionError):shared.select_shared_recipe(bad,expected)
+        self.assertEqual(shared.select_shared_recipe(bad,shared.AUTHORITATIVE_USAGE_EXPECTATION)[0],shared.AUTHORITATIVE_USAGE_EXPECTATION.pin())
+
     def test_bounded_serving_closure_requires_queue_patch_and_inventory(self):
         import mtp2_shared_recipe as recipe
         records = recipe.serving_source_records(ROOT, performance_candidate=True)
@@ -57,6 +80,12 @@ class RecipeAndInstallationTests(unittest.TestCase):
         self.assertEqual(actual[shared.OUTPUT_PATCH_PATH], shared.OUTPUT_PATCH_SHA256)
         self.assertEqual(actual[shared.OUTPUT_BASELINE_PATH],
                          shared.BOUNDED_OUTPUT_EXPECTATION.baseline_sha256)
+        self.assertEqual(actual[shared.USAGE_PATCH_PATH], shared.USAGE_PATCH_SHA256)
+        self.assertEqual(actual[shared.USAGE_BASELINE_PATH],
+                         shared.AUTHORITATIVE_USAGE_EXPECTATION.baseline_sha256)
+        self.assertEqual(actual[shared.IDENTITY_PATCH_PATH], shared.IDENTITY_PATCH_SHA256)
+        self.assertEqual(actual[shared.IDENTITY_BASELINE_PATH],
+                         shared.AUTHORITATIVE_IDENTITY_EXPECTATION.baseline_sha256)
         baseline = shared._baseline(ROOT, shared.BOUNDED_OUTPUT_EXPECTATION)
         self.assertIn('src/serve/output_queue.rs', baseline)
         self.assertEqual(len(baseline), 241)

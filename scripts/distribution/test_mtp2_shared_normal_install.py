@@ -234,7 +234,7 @@ class InstalledTrustTests(unittest.TestCase):
         manifest=json.loads((f.source/'manifests/distribution/checkpoint-files.json').read_bytes())
         manifest['revision']=profile_registry.SHARED['model_revision'];obj(f.source,'manifests/distribution/checkpoint-files.json',manifest)
         binary=put(f.data,shared.BINARY_PATH,b'INERT_CPU_NATIVE_BYTES_NEVER_EXECUTED\n');binary.chmod(0o700)
-        expected=shared.BOUNDED_OUTPUT_EXPECTATION
+        expected=shared.candidate_expectation(True)
         engine={'engine_id':shared.ENGINE_ID,'source_commit':shared.LATEST_COMMIT,'archive_sha256':shared.ARCHIVE_SHA256,
             'patch_sha256':[r['sha256'] for r in expected.patches],'source_inventory_sha256':expected.source_inventory_sha256,
             'source_file_count':expected.source_file_count,'default':False,'binary_sha256':trust.sha256(binary)}

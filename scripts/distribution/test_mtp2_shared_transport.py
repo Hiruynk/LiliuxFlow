@@ -83,7 +83,7 @@ class TransportTests(unittest.TestCase):
                   "released": (1, 1), "rejected_without_native_state": (0, 0), "faulted": (1, 0)}
         acquired, released = counts[phase]
         result = {"nonce": handle.nonce, "alias": handle.alias, "profile": handle.profile,
-                  "phase": phase, "revision": revision, "acquired": acquired, "released": released}
+                  "phase": phase, "revision": revision, "acquired": acquired, "released": released, "usage": None}
         if phase == "released":
             result["proof"] = dict(transport._RELEASE_PROOF)
         if phase == "rejected_without_native_state":

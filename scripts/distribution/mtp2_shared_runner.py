@@ -33,8 +33,8 @@ from trust import atomic_private_json, validate
 # Code-side activation belongs to the reviewed source release after acceptance.
 # Normal agent/factories still require explicit installed shared opt-in.
 # No environment, operator receipt or caller input can replace this recipe.
-from mtp2_shared_runtime import BOUNDED_OUTPUT_EXPECTATION
-RELEASE_EXPECTATION = BOUNDED_OUTPUT_EXPECTATION
+from mtp2_shared_runtime import AUTHORITATIVE_IDENTITY_EXPECTATION
+RELEASE_EXPECTATION = AUTHORITATIVE_IDENTITY_EXPECTATION
 
 
 def authenticated_launch(installation, port, backend_secret, directory):
