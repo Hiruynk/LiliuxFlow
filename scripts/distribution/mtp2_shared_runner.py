@@ -25,7 +25,7 @@ from mtp2_shared_runtime import (SharedInstallation, shared_argv, shared_env, CA
                                 global_gpu_lease, runtime_identity_fields,
                                 validate_shared_extension)
 from mtp2_shared_key_fd import inherited_control_key
-from mtp2_shared_journal import NumericJournal, provenance
+from mtp2_shared_journal import NumericJournal, provenance, MAX_BYTES
 from model_runner import (DiskCacheBudget, memory_available, pending_owned_identity)
 from ownership import capture, terminate, unchanged
 from trust import atomic_private_json, validate
@@ -166,7 +166,7 @@ def execute_trusted(trusted, installation, port):
         atomic_private_json(lease / 'lease.json', record)
         atomic_private_json(run_root / 'mtp2-shared-model.json', record)
         try:
-            journal = NumericJournal(run_root, provenance(record))
+            journal = NumericJournal(run_root, provenance(record), max_bytes=MAX_BYTES)
         except Exception:
             journal_init_errors = 1  # No raw exception/record is persisted.
         drain = threading.Thread(target=drain_stderr, args=(child.stderr,), daemon=True)

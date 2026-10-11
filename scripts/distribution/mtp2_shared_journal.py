@@ -7,7 +7,8 @@ from common import DistributionError, no_symlinks, private_directory
 
 MAX_LINE=4096
 CHUNK=65536
-MAX_BYTES=4*1024**2
+DEFAULT_BYTES=4*1024**2
+MAX_BYTES=8*1024**2
 QUEUE_LIMIT=512
 UINT=(1<<64)-1
 _ISSUER=object()
@@ -139,7 +140,7 @@ def _record_safe(record):
 
 class NumericJournal:
     """Reader never waits for writer I/O; losses remain explicit in snapshot()."""
-    def __init__(self,run_root,header,*,max_bytes=MAX_BYTES,queue_limit=QUEUE_LIMIT,sink_factory=None):
+    def __init__(self,run_root,header,*,max_bytes=DEFAULT_BYTES,queue_limit=QUEUE_LIMIT,sink_factory=None):
         if type(max_bytes) is not int or not 2048<=max_bytes<=MAX_BYTES or type(queue_limit) is not int or not 1<=queue_limit<=QUEUE_LIMIT:raise DistributionError('numeric journal bound differs')
         try:_valid_header(header)
         except (ValueError,TypeError):raise DistributionError('numeric journal header differs') from None
