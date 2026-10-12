@@ -1,0 +1,830 @@
+diff --git a/src/engine.rs b/src/engine.rs
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -775,6 +775,23 @@
+         Ok(tokens.len())
+     }
+ 
++    /// The same prefill and stop boundaries, with optional serving evidence
++    /// after a completed chunk's state advance. Models without this hook
++    /// keep their original path and emit no inferred progress.
++    fn prefill_until_with_progress(
++        &self,
++        ctx: &MetalContext,
++        state: &mut Self::State,
++        scratch: &mut Self::Scratch,
++        tokens: &[u32],
++        vision: Option<&crate::qwen4exp::VisionInput<'_>>,
++        stop: &dyn Fn() -> bool,
++        on_completed_chunk: &mut dyn FnMut(usize, usize),
++    ) -> Result<usize> {
++        let _ = on_completed_chunk;
++        self.prefill_until(ctx, state, scratch, tokens, vision, stop)
++    }
++
+     /// Runs the vision tower over one preprocessed image
+     /// (`[grid_h * grid_w, patch_dim]` f32 rows in block-major patch order,
+     /// [`crate::qwen4exp::image::preprocess`]) and returns its merged rows
+diff --git a/src/qwen4exp/model.rs b/src/qwen4exp/model.rs
+--- a/src/qwen4exp/model.rs
++++ b/src/qwen4exp/model.rs
+@@ -2063,7 +2063,7 @@
+         draw: Option<Draw<'_>>,
+         vision: Option<&VisionInput<'_>>,
+     ) -> Result<()> {
+-        self.prefill_chunks(ctx, state, s, tokens, draw, vision, None).map(drop)
++        self.prefill_chunks(ctx, state, s, tokens, draw, vision, None, None).map(drop)
+     }
+ 
+     /// [`Self::prefill_with_vision`] without a draw that stops before the
+@@ -2082,7 +2082,24 @@
+         vision: Option<&VisionInput<'_>>,
+         stop: &dyn Fn() -> bool,
+     ) -> Result<usize> {
+-        self.prefill_chunks(ctx, state, s, tokens, None, vision, Some(stop))
++        self.prefill_chunks(ctx, state, s, tokens, None, vision, Some(stop), None)
++    }
++
++    /// Serving progress after the GPU completed and position, n-gram history
++    /// and convolution slot advanced; chunk sizes and stop polls are unchanged.
++    pub fn prefill_until_with_progress(
++        &self,
++        ctx: &MetalContext,
++        state: &mut DecodeState,
++        s: &mut Scratch,
++        tokens: &[u32],
++        vision: Option<&VisionInput<'_>>,
++        stop: &dyn Fn() -> bool,
++        on_completed_chunk: &mut dyn FnMut(usize, usize),
++    ) -> Result<usize> {
++        self.prefill_chunks(
++            ctx, state, s, tokens, None, vision, Some(stop), Some(on_completed_chunk),
++        )
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+@@ -2095,6 +2112,7 @@
+         draw: Option<Draw<'_>>,
+         vision: Option<&VisionInput<'_>>,
+         stop: Option<&dyn Fn() -> bool>,
++        mut on_completed_chunk: Option<&mut dyn FnMut(usize, usize)>,
+     ) -> Result<usize> {
+         ensure!(!tokens.is_empty(), "empty prompt");
+         ensure!(state.spec.is_none(), "prefill during a pending speculative step");
+@@ -2260,6 +2278,9 @@
+             }
+             // The chunk's recurrent kernels wrote the other window buffers.
+             state.conv_slot = 1 - state.conv_slot;
++            if let Some(on_completed_chunk) = on_completed_chunk.as_deref_mut() {
++                on_completed_chunk(chunk.len(), state.pos);
++            }
+         }
+         Ok(fed)
+     }
+@@ -4548,6 +4569,21 @@
+         Qwen4ExpModel::prefill_until(self, ctx, state, scratch, tokens, vision, stop)
+     }
+ 
++    fn prefill_until_with_progress(
++        &self,
++        ctx: &MetalContext,
++        state: &mut DecodeState,
++        scratch: &mut Scratch,
++        tokens: &[u32],
++        vision: Option<&VisionInput<'_>>,
++        stop: &dyn Fn() -> bool,
++        on_completed_chunk: &mut dyn FnMut(usize, usize),
++    ) -> Result<usize> {
++        Qwen4ExpModel::prefill_until_with_progress(
++            self, ctx, state, scratch, tokens, vision, stop, on_completed_chunk,
++        )
++    }
++
+     fn encode_image(
+         &self,
+         ctx: &MetalContext,
+diff --git a/src/serve.rs b/src/serve.rs
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -41,7 +41,7 @@
+ };
+ use std::path::Path;
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::mpsc::{
+     self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
+ };
+@@ -615,6 +615,49 @@
+     tx: Sender<Out>,
+     cancelled: Arc<AtomicBool>,
+     started: bool,
++    metadata: RequestMeta,
++}
++
++/// Native request evidence only. Response completion does not release a lane:
++/// the engine explicitly closes it after session and pin cleanup.
++struct RequestMeta {
++    request_id: String,
++    began: Option<Instant>,
++    acquired: usize,
++    released: usize,
++}
++
++fn queue_rejection_line(request_id: &str, status: u16) -> String {
++    format!(
++        "[lily-meta] request_id={request_id} phase=queue_rejected status={status} queue_slot_released=true"
++    )
++}
++
++impl RequestMeta {
++    fn new(request_id: String) -> Self {
++        Self { request_id, began: None, acquired: 0, released: 0 }
++    }
++
++    fn acquire(&mut self, now: Instant, queued: Duration) -> Option<String> {
++        if self.acquired != 0 || self.released != 0 {
++            return None;
++        }
++        self.began = Some(now);
++        self.acquired = 1;
++        Some(format!(
++            "[lily-meta] request_id={} phase=lane_acquired queue_wait_ms={}",
++            self.request_id, queued.as_millis()
++        ))
++    }
++
++    fn release(&mut self, now: Instant, cancelled: bool) -> Option<String> {
++        let began = self.began.take()?;
++        self.released = 1;
++        Some(format!(
++            "[lily-meta] request_id={} phase=lane_released cancelled={cancelled} lane_ms={}",
++            self.request_id, now.saturating_duration_since(began).as_millis()
++        ))
++    }
+ }
+ 
+ impl Sink {
+@@ -1299,6 +1342,10 @@
+         else {
+             return Ok(());
+         };
++        if sink.cancelled() {
++            drop(admitted);
++            return Ok(());
++        }
+ 
+         let Engine { ctx, model, scratch, drafts, shutdown, .. } = self;
+         let n = admitted.facts.n;
+@@ -1731,6 +1778,7 @@
+     /// Connection threads still running (the listener waits for them a
+     /// little at shutdown so responses in flight get written).
+     connections: Arc<AtomicUsize>,
++    request_sequence: AtomicU64,
+     model_id: &'static str,
+     idle_unload_secs: u64,
+ }
+@@ -1829,6 +1877,14 @@
+         match cmd {
+             Ok(Cmd::Job(job)) => {
+                 queue.left();
++                if job.sink.cancelled() {
++                    eprintln!(
++                        "[lily-meta] request_id={} phase=queue_cancelled queue_wait_ms={} queue_slot_released=true",
++                        job.sink.metadata.request_id, job.queued_at.elapsed().as_millis()
++                    );
++                    job.sink.end();
++                    continue;
++                }
+                 if shutdown.requested() {
+                     job.reject(503, "the server is shutting down");
+                     break;
+@@ -1851,6 +1907,15 @@
+                             fatal("engine failed to reload", error, &rx);
+                         }
+                     }
++                }
++                if job.sink.cancelled() {
++                    eprintln!(
++                        "[lily-meta] request_id={} phase=cancelled_after_engine_ready queue_wait_ms={} model_load_aborted=false",
++                        job.sink.metadata.request_id, job.queued_at.elapsed().as_millis()
++                    );
++                    job.sink.end();
++                    idle.touch(Instant::now());
++                    continue;
+                 }
+                 served += 1;
+                 if inject_fault_at.take_if(|at| *at == served).is_some() {
+@@ -2190,6 +2255,7 @@
+         jobs,
+         lifecycle,
+         connections: connections.clone(),
++        request_sequence: AtomicU64::new(1),
+         model_id: M::MODEL_ID,
+         idle_unload_secs: options.idle_unload_secs,
+     });
+@@ -2281,6 +2347,10 @@
+             }),
+         ),
+         ("POST", "/v1/chat/completions" | "/v1/completions") => {
++            // A generated identifier only; no caller-supplied data enters it.
++            let request_id = format!(
++                "req-{}-{}", now(), front.request_sequence.fetch_add(1, Ordering::Relaxed)
++            );
+             // Before parsing and tokenizing, so the GPU's return from idle
+             // runs meanwhile. Only a loaded engine has a GPU to wake; a busy
+             // one takes the message after its request, a no-op then.
+@@ -2366,7 +2436,10 @@
+             let cancelled = Arc::new(AtomicBool::new(false));
+             let job = Job {
+                 prepared,
+-                sink: Sink { tx, cancelled: cancelled.clone(), started: false },
++                sink: Sink {
++                    tx, cancelled: cancelled.clone(), started: false,
++                    metadata: RequestMeta::new(request_id.clone()),
++                },
+                 queued_at: Instant::now(),
+             };
+             if !queue.admit() {
+@@ -2379,10 +2452,14 @@
+                 );
+                 return;
+             }
++            // Admission owns a queue reservation now. Log before publishing
++            // the job so dequeue/acquire cannot precede its enter evidence.
++            eprintln!("[lily-meta] request_id={request_id} phase=queue_enter");
+             match front.jobs.try_send(Cmd::Job(Box::new(job))) {
+                 Ok(()) => relay(stream, request.http11, rx, cancelled),
+                 Err(TrySendError::Full(_)) => {
+                     queue.left();
++                    eprintln!("{}", queue_rejection_line(&request_id, 503));
+                     refuse(
+                         stream,
+                         &what,
+@@ -2393,6 +2470,7 @@
+                 }
+                 Err(TrySendError::Disconnected(_)) => {
+                     queue.left();
++                    eprintln!("{}", queue_rejection_line(&request_id, 500));
+                     refuse(stream, &what, 500, "server_error", "engine stopped");
+                 }
+             }
+diff --git a/src/serve/batch.rs b/src/serve/batch.rs
+--- a/src/serve/batch.rs
++++ b/src/serve/batch.rs
+@@ -514,17 +514,19 @@
+         tokens: &[u32],
+         vision: Option<&VisionInput<'_>>,
+         stop: &dyn Fn() -> bool,
++        on_completed_chunk: &mut dyn FnMut(usize, usize),
+     ) -> Result<usize> {
+         let mut fed = 0;
+         while fed < tokens.len() {
+             if self.rows.is_empty() {
+-                fed += engine.model.prefill_until(
++                fed += engine.model.prefill_until_with_progress(
+                     &engine.ctx,
+                     &mut session.state,
+                     &mut engine.scratch,
+                     &tokens[fed..],
+                     vision,
+                     stop,
++                    on_completed_chunk,
+                 )?;
+                 break;
+             }
+@@ -532,13 +534,14 @@
+             // chunk, the first included.
+             let first = Cell::new(true);
+             let one_chunk = || stop() || !first.replace(false);
+-            let chunk = engine.model.prefill_until(
++            let chunk = engine.model.prefill_until_with_progress(
+                 &engine.ctx,
+                 &mut session.state,
+                 &mut engine.scratch,
+                 &tokens[fed..],
+                 vision,
+                 &one_chunk,
++                on_completed_chunk,
+             )?;
+             fed += chunk;
+             if chunk == 0 || stop() {
+@@ -1004,7 +1007,9 @@
+     ) {
+         let Row { sink, req, slot, in_flight, .. } = row;
+         slots.give(slot);
+-        self.close(sink, in_flight, req.p.stream, Ending::FailedUnder(error, fault));
++        let stream = req.p.stream;
++        drop(req);
++        self.close(sink, in_flight, stream, Ending::FailedUnder(error, fault));
+     }
+ 
+     // --- admission ----------------------------------------------------------
+@@ -1050,6 +1055,11 @@
+                 return;
+             }
+         };
++        if sink.cancelled() {
++            drop(req);
++            self.close(sink, in_flight, stream, Ending::Answered);
++            return;
++        }
+         // The first draw (`Generator::generate`'s start), into the engine's
+         // sampler, whose counts it resets; the row then takes a slot and the
+         // counts go with it. A failed request's session is dropped before
+diff --git a/src/serve/request.rs b/src/serve/request.rs
+--- a/src/serve/request.rs
++++ b/src/serve/request.rs
+@@ -55,6 +55,51 @@
+         "prompt/cache divergence: agreement_tokens={agreement_tokens} reused_tokens={reused_tokens} \
+          prompt_tokens={prompt_tokens} cached_tail_tokens={cached_tail_tokens}"
+     )
++}
++
++/// Actual completed chunk boundaries, scoped to this request's resumed prefix.
++#[derive(Default)]
++struct PrefillEvidence {
++    reused: usize,
++    position: usize,
++    completed_chunks: usize,
++    emitted: bool,
++}
++
++impl PrefillEvidence {
++    fn new(reused: usize) -> Self {
++        Self { reused, position: reused, ..Self::default() }
++    }
++
++    fn completed(&mut self, request_id: &str, chunk_tokens: usize, position: usize) -> Option<String> {
++        if chunk_tokens == 0 || position.checked_sub(self.position) != Some(chunk_tokens) {
++            return None;
++        }
++        self.position = position;
++        self.completed_chunks += 1;
++        if std::mem::replace(&mut self.emitted, true) {
++            return None;
++        }
++        Some(format!(
++            "[lily-meta] request_id={request_id} phase=prefill_progress completed_chunks={} prefilled_tokens={}",
++            self.completed_chunks, position - self.reused
++        ))
++    }
++}
++
++/// A cancellation observed at disposal never puts its partial state in LRU.
++/// The release callback is not called at all in that branch.
++fn release_or_drop_cancelled_session<S>(
++    session: S,
++    client_cancelled: bool,
++    release: impl FnOnce(S) -> Evictions,
++) -> Evictions {
++    if client_cancelled {
++        drop(session);
++        Evictions::default()
++    } else {
++        release(session)
++    }
+ }
+ 
+ /// What a request's admission measured, for its timings and log line.
+@@ -225,8 +270,13 @@
+     store: &str,
+     details: &str,
+ ) -> String {
++    let disposition = if by == "client" {
++        "session_disposition=dropped".to_owned()
++    } else {
++        format!("kept {at} tokens as a session")
++    };
+     format!(
+-        "{id}: {} prompt tokens ({} cached{}{}), cancelled by the {by} at {at} after {} prefilled in {:.2}s, kept {at} tokens as a session, {store}{details}",
++        "{id}: {} prompt tokens ({} cached{}{}), cancelled by the {by} at {at} after {} prefilled in {:.2}s, {disposition}, {store}{details}",
+         f.n,
+         f.reused,
+         describe_reuse(f.cut_back, f.forked),
+@@ -470,6 +520,7 @@
+         tokens: &[u32],
+         vision: Option<&VisionInput<'_>>,
+         stop: &dyn Fn() -> bool,
++        on_completed_chunk: &mut dyn FnMut(usize, usize),
+     ) -> Result<usize>;
+ 
+     /// Bytes of the sessions other requests hold checked out, which the
+@@ -494,14 +545,16 @@
+         tokens: &[u32],
+         vision: Option<&VisionInput<'_>>,
+         stop: &dyn Fn() -> bool,
++        on_completed_chunk: &mut dyn FnMut(usize, usize),
+     ) -> Result<usize> {
+-        engine.model.prefill_until(
++        engine.model.prefill_until_with_progress(
+             &engine.ctx,
+             &mut session.state,
+             &mut engine.scratch,
+             tokens,
+             vision,
+             stop,
++            on_completed_chunk,
+         )
+     }
+ 
+@@ -525,7 +578,8 @@
+     ///
+     /// Returns `None` when the request was answered here: a departed client
+     /// or the end of the shutdown's grace stopped its prefill, and the
+-    /// prefix fed so far stays a session for a retry.
++    /// client-cancelled partial session is dropped; shutdown retains the
++    /// upstream prefix policy for a live client that receives its 503.
+     pub(super) fn admit<'g>(
+         &mut self,
+         p: Prepared,
+@@ -535,6 +589,7 @@
+         generator: &'g Generator,
+         prefill: &mut impl PrefillChunks<M>,
+     ) -> Result<Option<Admitted<'g, M>>> {
++        let request_id = sink.metadata.request_id.clone();
+         // The HTTP thread validated against the same limit; this only guards
+         // the engine's buffers if the two ever disagree.
+         ensure!(
+@@ -567,6 +622,11 @@
+         let mut session = acquired.session;
+         let reused = acquired.reused;
+         let agreement = acquired.agreement;
++        if sink.cancelled() {
++            drop(session);
++            eprintln!("[lily-meta] request_id={request_id} phase=prefill_cancelled stage=after_session_acquire completed_chunks=0 prefilled_tokens=0 session_disposition=dropped");
++            return Ok(None);
++        }
+         ensure!(reused < n, "session cache returned the whole prompt");
+         ensure!(
+             reused <= agreement,
+@@ -592,6 +652,11 @@
+         let mut encoded: Vec<(usize, crate::tensor::Tensor)> = Vec::new();
+         for (k, image) in p.images.iter().enumerate() {
+             if image.span.end() > reused {
++                if sink.cancelled() {
++                    drop(session);
++                    eprintln!("[lily-meta] request_id={request_id} phase=prefill_cancelled stage=before_vision_image completed_chunks=0 prefilled_tokens=0 session_disposition=dropped");
++                    return Ok(None);
++                }
+                 let pixels =
+                     image.rows().with_context(|| format!("image {}", k + 1))?;
+                 let rows = self
+@@ -605,6 +670,11 @@
+                     )
+                     .with_context(|| format!("vision tower over image {}", k + 1))?;
+                 encoded.push((k, rows));
++                if sink.cancelled() {
++                    drop(session);
++                    eprintln!("[lily-meta] request_id={request_id} phase=prefill_cancelled stage=after_vision_image completed_chunks=0 prefilled_tokens=0 session_disposition=dropped");
++                    return Ok(None);
++                }
+             }
+         }
+         let vision_secs = vision_started.elapsed().as_secs_f64();
+@@ -650,6 +720,12 @@
+         let shutdown = self.shutdown.clone();
+         let cancelled = sink.cancelled.clone();
+         let stop = || cancelled.load(Ordering::Relaxed) || shutdown.cancel();
++        let progress = RefCell::new(PrefillEvidence::new(reused));
++        let mut on_completed_chunk = |chunk_tokens, position| {
++            if let Some(line) = progress.borrow_mut().completed(&request_id, chunk_tokens, position) {
++                eprintln!("{line}");
++            }
++        };
+         let mut cancelled_at: Option<usize> = None;
+         let mut durable: Option<(usize, f64)> = None;
+         let mut durable_secs = 0.0;
+@@ -662,6 +738,7 @@
+                     &p.prompt[prefilled..b],
+                     vision.as_ref(),
+                     &stop,
++                    &mut on_completed_chunk,
+                 )?;
+             }
+             // A stopped request writes no durable entry: one it never wrote
+@@ -671,6 +748,12 @@
+             } else {
+                 let write_started = Instant::now();
+                 let snapshot = session.state.snapshot(&self.ctx)?;
++                if sink.cancelled() {
++                    drop(snapshot);
++                    drop(session);
++                    eprintln!("[lily-meta] request_id={request_id} phase=prefill_cancelled stage=after_durable_snapshot completed_chunks={} prefilled_tokens={} session_disposition=dropped", progress.borrow().completed_chunks, progress.borrow().position - reused);
++                    return Ok(None);
++                }
+                 match self.sessions.store_durable(
+                     &p.prompt[..b],
+                     &images,
+@@ -703,6 +786,7 @@
+                     &p.prompt[prefilled..n - 1],
+                     vision.as_ref(),
+                     &stop,
++                    &mut on_completed_chunk,
+                 )?;
+             }
+             if prefilled < n - 1 || stop() {
+@@ -711,27 +795,24 @@
+         }
+         if let Some(at) = cancelled_at {
+             let prefix_secs = started.elapsed().as_secs_f64();
+-            // The prefix fed so far stays an ordinary session whose live end
+-            // is the chunk boundary, so a retry of the prompt resumes there.
+-            // It is released like any request's session: under the budget
+-            // (evictions write ahead or spill as usual), never written ahead
+-            // itself while it is the latest, its checkpoints those it had,
+-            // all at or below the position it was acquired at (the live end
+-            // needs none). An image the stop cut through is left out of the
+-            // lineage's spans, so no prompt resumes inside it.
+-            session.stop_at(&p.prompt, reused, at)?;
++            // A confirmed departed client loses this acquired partial state.
++            // Shutdown keeps the upstream coherent prefix for the live client.
++            let client_cancelled = sink.cancelled();
++            if !client_cancelled {
++                session.stop_at(&p.prompt, reused, at)?;
++            }
+             self.sessions.set_in_flight_bytes(prefill.in_flight_bytes());
+-            let released = self.sessions.release(
+-                &self.ctx,
+-                session,
+-                &images,
+-                p.cache_key.as_deref(),
+-            );
++            let released = release_or_drop_cancelled_session(session, client_cancelled, |session| {
++                self.sessions.release(&self.ctx, session, &images, p.cache_key.as_deref())
++            });
++            if client_cancelled {
++                eprintln!("[lily-meta] request_id={request_id} phase=prefill_cancelled stage=prefill_chunk completed_chunks={} prefilled_tokens={} session_disposition=dropped", progress.borrow().completed_chunks, at - reused);
++            }
+             let counters_end = crate::stats::counters();
+             let vm_end = crate::stats::vm_counters();
+             let created = now();
+             let id = response_id(p.kind, created, &mut self.next_id);
+-            let by = if sink.cancelled() { "client" } else { "shutdown" };
++            let by = if client_cancelled { "client" } else { "shutdown" };
+             // The prefill ended at the stop: its samples are the stop's.
+             let facts = Facts {
+                 n,
+@@ -803,7 +884,18 @@
+         drop(embeds);
+         drop(encoded);
+         let checkpoint_started = Instant::now();
++        if sink.cancelled() {
++            drop(session);
++            eprintln!("[lily-meta] request_id={request_id} phase=prefill_cancelled stage=before_session_checkpoint completed_chunks={} prefilled_tokens={} session_disposition=dropped", progress.borrow().completed_chunks, progress.borrow().position - reused);
++            return Ok(None);
++        }
+         let snapshot = session.state.snapshot(&self.ctx)?;
++        if sink.cancelled() {
++            drop(snapshot);
++            drop(session);
++            eprintln!("[lily-meta] request_id={request_id} phase=prefill_cancelled stage=after_session_checkpoint completed_chunks={} prefilled_tokens={} session_disposition=dropped", progress.borrow().completed_chunks, progress.borrow().position - reused);
++            return Ok(None);
++        }
+         session.add_checkpoint(snapshot);
+         let checkpoint_secs = checkpoint_started.elapsed().as_secs_f64();
+         let prefix_secs = started.elapsed().as_secs_f64();
+@@ -1138,7 +1230,10 @@
+     /// warning meanwhile releases the pin then, not under the prefill or the
+     /// decode.
+     pub(super) fn open(&mut self, job: Job) -> Opened {
+-        let Job { prepared, sink, queued_at } = job;
++        let Job { prepared, mut sink, queued_at } = job;
++        if let Some(line) = sink.metadata.acquire(Instant::now(), queued_at.elapsed()) {
++            eprintln!("{line}");
++        }
+         let in_flight = self.pin.before_request(Instant::now());
+         let queued = queued_at.elapsed();
+         Opened { p: prepared, sink, in_flight, queued }
+@@ -1158,6 +1253,7 @@
+     ) -> Option<String> {
+         self.pin.after_request(Instant::now());
+         let fault = self.ctx.fault();
++        let faulted = fault.is_some() || matches!(&ending, Ending::FailedUnder(_, Some(_)));
+         match ending {
+             Ending::Answered => sink.end(),
+             Ending::Failed(error) => {
+@@ -1168,6 +1264,15 @@
+             }
+         }
+         drop(in_flight);
++        // Session disposal returned before close; deferred pin cleanup is now
++        // complete. A fault never fabricates a successful release event.
++        let fault = fault.or_else(|| self.ctx.fault());
++        if !faulted && fault.is_none() {
++            let cancelled = sink.cancelled();
++            if let Some(line) = sink.metadata.release(Instant::now(), cancelled) {
++                eprintln!("{line}");
++            }
++        }
+         fault
+     }
+ 
+@@ -1228,8 +1333,13 @@
+         // The sessions other requests hold are checked out: the store makes
+         // room among the others.
+         self.sessions.set_in_flight_bytes(in_flight_others);
+-        let released =
+-            self.sessions.release(&self.ctx, session, &images, p.cache_key.as_deref());
++        let client_cancelled = sink.cancelled();
++        let released = release_or_drop_cancelled_session(session, client_cancelled, |session| {
++            self.sessions.release(&self.ctx, session, &images, p.cache_key.as_deref())
++        });
++        if client_cancelled {
++            eprintln!("[lily-meta] request_id={} phase=decode_session_cancelled session_disposition=dropped", sink.metadata.request_id);
++        }
+ 
+         // Every pass recorded since the last answer: under batching, other
+         // requests' steps and prefills included.
+diff --git a/tests/unit/qwen4exp/prefill.rs b/tests/unit/qwen4exp/prefill.rs
+--- a/tests/unit/qwen4exp/prefill.rs
++++ b/tests/unit/qwen4exp/prefill.rs
+@@ -79,6 +79,67 @@
+         assert!(logits_a == logits_b, "{len}: logits differ");
+         assert!(caches_a == caches_b, "{len}: per-token caches differ");
+         assert!(rec_a == rec_b, "{len}: recurrent state differs");
++    }
++}
++
++/// Same call/chunk grid and stop predicate with the progress hook absent or
++/// present. This checks real control order and every state byte, not timings.
++#[test]
++#[ignore = "requires LILY_MODEL_DIR_FLASH and master GPU window"]
++fn completed_chunk_callback_preserves_absent_callback_state_and_stop_order() {
++    let dir = std::env::var("LILY_MODEL_DIR_FLASH").expect("explicit test checkpoint");
++    let ctx = MetalContext::new().expect("metal context");
++    let mut model = <Qwen4ExpModel as LanguageModel>::load(
++        &ctx, Path::new(&dir), &LoadOptions::default(),
++    ).expect("load");
++    model.set_kv_format(crate::kernels::attention::KvFormat::Bf16);
++    let chunk = 256;
++    model.set_prefill_chunk(chunk).expect("chunk");
++    let prompt: Vec<u32> = (0..4 * chunk + 37)
++        .map(|i| 1000 + (i * 37 % 5000) as u32).collect();
++    let run = |observe: bool, stop_after: Option<usize>| {
++        let capacity = prompt.len() + 64;
++        let mut scratch = model.new_scratch_with_capacity(&ctx, capacity).expect("scratch");
++        let mut state = model.new_state(&ctx, capacity).expect("state");
++        let asked = std::cell::Cell::new(0usize);
++        let stop = || {
++            asked.set(asked.get() + 1);
++            stop_after.is_some_and(|n| asked.get() > n)
++        };
++        let completed = std::cell::RefCell::new(Vec::new());
++        let mut progress = |tokens, position| completed.borrow_mut().push((tokens, position));
++        let before = crate::stats::counters();
++        let fed = if observe {
++            model.prefill_until_with_progress(
++                &ctx, &mut state, &mut scratch, &prompt, None, &stop, &mut progress,
++            )
++        } else {
++            model.prefill_until(&ctx, &mut state, &mut scratch, &prompt, None, &stop)
++        }.expect("prefill");
++        let chunks = crate::stats::counters().since(before).prefill.chunks;
++        assert_eq!(state.pos, fed);
++        let marks = completed.into_inner();
++        if observe {
++            assert_eq!(marks.len() as u64, chunks);
++            assert_eq!(marks.iter().map(|m| m.0).sum::<usize>(), fed);
++            assert_eq!(marks.last().map_or(0, |m| m.1), fed);
++        } else {
++            assert!(marks.is_empty());
++        }
++        // The same next draw reads everything this controlled prefill left.
++        model.prefill(&ctx, &mut state, &mut scratch, &[4242], Some(crate::engine::Draw {
++            params: &crate::kernels::sample::SamplingParams::greedy(), step: 0,
++        })).expect("draw");
++        let logits = scratch.logits().raw_bytes().to_vec();
++        let mut caches = Vec::new();
++        state.write_prefix(fed + 1, &mut caches).expect("prefix");
++        let mut recurrent = Vec::new();
++        state.snapshot(&ctx).expect("snapshot").write_to(&mut recurrent).expect("write");
++        (fed, chunks, asked.get(), logits, caches, recurrent)
++    };
++    for stop_after in [None, Some(0), Some(1), Some(3)] {
++        assert_eq!(run(false, stop_after), run(true, stop_after),
++            "callback changed state or stop order at {stop_after:?}");
+     }
+ }
+ 
+diff --git a/tests/unit/serve/request.rs b/tests/unit/serve/request.rs
+--- a/tests/unit/serve/request.rs
++++ b/tests/unit/serve/request.rs
+@@ -4,6 +4,8 @@
+ 
+ use super::*;
+ use crate::serve::Collected;
++use crate::serve::RequestMeta;
++use crate::serve::queue_rejection_line;
+ use crate::serve::timings::{
+     EvictionPhase, EvictionTimings, MemoryStats, NgramStats, PrefillParts,
+     PrefillPhases, Timings,
+@@ -23,6 +25,76 @@
+         prompt_cache_divergence_summary(42, 35, 100, 12),
+         "prompt/cache divergence: agreement_tokens=42 reused_tokens=35 prompt_tokens=100 cached_tail_tokens=12"
+     );
++}
++
++#[test]
++fn native_lane_events_keep_exact_id_and_counters_balance_only_once() {
++    let mut meta = RequestMeta::new("req-100-7".into());
++    let now = std::time::Instant::now();
++    assert!(meta.release(now, true).is_none());
++    let acquired = meta.acquire(now, Duration::from_millis(3)).expect("acquire");
++    assert_eq!(acquired, "[lily-meta] request_id=req-100-7 phase=lane_acquired queue_wait_ms=3");
++    assert!(meta.acquire(now, Duration::ZERO).is_none());
++    let released = meta.release(now + Duration::from_millis(5), true).expect("release");
++    assert_eq!(released, "[lily-meta] request_id=req-100-7 phase=lane_released cancelled=true lane_ms=5");
++    assert!(meta.release(now, false).is_none());
++    assert_eq!((meta.acquired, meta.released), (1, 1));
++}
++
++#[test]
++fn a_cancelled_queued_job_has_no_native_lane_to_release() {
++    let mut meta = RequestMeta::new("req-100-8".into());
++    assert!(meta.release(std::time::Instant::now(), true).is_none());
++    assert_eq!((meta.acquired, meta.released), (0, 0));
++}
++
++#[test]
++fn rejected_queue_reservation_has_exact_id_terminal_and_no_native_lane() {
++    for status in [503, 500] {
++        let mut meta = RequestMeta::new("req-100-9".into());
++        assert_eq!(queue_rejection_line(&meta.request_id, status), format!(
++            "[lily-meta] request_id=req-100-9 phase=queue_rejected status={status} queue_slot_released=true"
++        ));
++        assert!(meta.release(std::time::Instant::now(), true).is_none());
++        assert_eq!((meta.acquired, meta.released), (0, 0));
++    }
++}
++
++#[test]
++fn prefill_evidence_is_positive_and_from_coherent_completed_positions_only() {
++    let mut progress = PrefillEvidence::new(4096);
++    assert!(progress.completed("req-100-7", 0, 4096).is_none());
++    assert!(progress.completed("req-100-7", 4096, 8191).is_none());
++    assert_eq!(progress.completed_chunks, 0);
++    assert_eq!(progress.completed("req-100-7", 4096, 8192).expect("progress"),
++        "[lily-meta] request_id=req-100-7 phase=prefill_progress completed_chunks=1 prefilled_tokens=4096");
++    assert!(progress.completed("req-100-7", 37, 8229).is_none());
++    assert_eq!((progress.completed_chunks, progress.position), (2, 8229));
++}
++
++#[test]
++fn cancelled_session_is_dropped_and_release_callback_never_runs() {
++    struct Probe(std::rc::Rc<std::cell::Cell<usize>>);
++    impl Drop for Probe {
++        fn drop(&mut self) { self.0.set(self.0.get() + 1); }
++    }
++    let dropped = std::rc::Rc::new(std::cell::Cell::new(0));
++    let released = release_or_drop_cancelled_session(Probe(dropped.clone()), true, |_| {
++        panic!("cancelled session must never reach the cache release callback")
++    });
++    assert_eq!(dropped.get(), 1);
++    assert_eq!(released.evicted, 0);
++}
++
++#[test]
++fn uncancelled_session_ownership_is_returned_to_release_callback() {
++    let cache = std::cell::RefCell::new(None);
++    let returned = release_or_drop_cancelled_session(vec![10, 20], false, |session| {
++        cache.replace(Some(session));
++        Evictions::default()
++    });
++    assert_eq!(cache.into_inner(), Some(vec![10, 20]));
++    assert_eq!(returned.evicted, 0);
+ }
+ 
+ fn counters(chunks: u64, secs: f64, batches: u64, pages: u64) -> Counters {
+@@ -577,7 +649,7 @@
+ }
+ 
+ #[test]
+-fn the_stopped_line_is_what_both_paths_printed_before() {
++fn client_stopped_line_reports_drop_and_shutdown_keeps_its_original_line() {
+     let with_disk = (5, 30_000_000_000, 40_000_000_000, Some((17, 7_512_000_000)));
+     let mut f = busy();
+     f.prefix_secs = 4.1;
+@@ -585,11 +657,12 @@
+     assert_eq!(
+         now,
+         before_stopped_line("chatcmpl-1-8", &f, "client", 13_096, with_disk, "")
++            .replace("kept 13096 tokens as a session", "session_disposition=dropped")
+     );
+     assert_eq!(
+         now,
+         "chatcmpl-1-8: 31200 prompt tokens (9000 cached, forked, from disk in 1.23s), cancelled by the \
+-         client at 13096 after 4096 prefilled in 4.10s, kept 13096 tokens as a session, sessions=5 \
++         client at 13096 after 4096 prefilled in 4.10s, session_disposition=dropped, sessions=5 \
+          (30.0/40.0 GB), disk 17 (7.5 GB)"
+     );
+     let resident = (0, 0, 8_000_000_000, None);
+@@ -691,7 +764,7 @@
+ fn sink() -> (Sink, std::sync::mpsc::Receiver<crate::serve::Out>) {
+     let (tx, rx) = std::sync::mpsc::channel();
+     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+-    (Sink { tx, cancelled, started: false }, rx)
++    (Sink { tx, cancelled, started: false, metadata: RequestMeta::new("req-100-1".into()) }, rx)
+ }
+ 
+ /// What the responder thread would get, one line per message.

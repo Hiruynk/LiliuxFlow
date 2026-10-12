@@ -69,5 +69,58 @@
       "validation_only": false,
       "minimum_ram_headroom_gib": 13
     }
+  ],
+  "optin_profiles": [
+    {
+      "profile_id": "ctx64k-mtp2",
+      "public_alias": "qwen3.8-flash-next-lily-q4-mtp2-64k",
+      "context_tokens": 65536,
+      "default_output_tokens": 65536,
+      "total_deadline_seconds": 3672,
+      "queue_wait_seconds": 300,
+      "idle_ttl_seconds": 1800,
+      "cache_bytes": 8589934592,
+      "max_sessions": 1,
+      "disk_cache_bytes": 0,
+      "cache_namespace": "lily-q4-afde8b8e-13f7b540-pc123-split-scalar-bf16-mtp2-ctx64k",
+      "production_enabled": false,
+      "validation_only": false,
+      "minimum_ram_headroom_gib": 15,
+      "engine_id": "latest13f-defer-pc123-mtp2-opt64k"
+    },
+    {
+      "profile_id": "ctx128k-mtp2",
+      "public_alias": "qwen3.8-flash-next-lily-q4-mtp2-128k",
+      "context_tokens": 131072,
+      "default_output_tokens": 65536,
+      "total_deadline_seconds": 4272,
+      "queue_wait_seconds": 600,
+      "idle_ttl_seconds": 1800,
+      "cache_bytes": 8589934592,
+      "max_sessions": 1,
+      "disk_cache_bytes": 0,
+      "cache_namespace": "lily-q4-afde8b8e-13f7b540-pc123-split-scalar-bf16-mtp2-ctx128k",
+      "production_enabled": false,
+      "validation_only": false,
+      "minimum_ram_headroom_gib": 15,
+      "engine_id": "latest13f-defer-pc123-mtp2-opt64k"
+    },
+    {
+      "profile_id": "ctx262k-mtp2",
+      "public_alias": "qwen3.8-flash-next-lily-q4-mtp2-262k",
+      "context_tokens": 262144,
+      "default_output_tokens": 65536,
+      "total_deadline_seconds": 4872,
+      "queue_wait_seconds": 900,
+      "idle_ttl_seconds": 1800,
+      "cache_bytes": 8589934592,
+      "max_sessions": 1,
+      "disk_cache_bytes": 0,
+      "cache_namespace": "lily-q4-afde8b8e-13f7b540-pc123-split-scalar-bf16-mtp2-ctx262k",
+      "production_enabled": false,
+      "validation_only": false,
+      "minimum_ram_headroom_gib": 13,
+      "engine_id": "latest13f-defer-pc123-mtp2-opt64k"
+    }
   ]
 }

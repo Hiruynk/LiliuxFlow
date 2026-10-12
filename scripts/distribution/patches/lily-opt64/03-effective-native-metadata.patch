@@ -1,0 +1,210 @@
+diff --git a/src/kernels/qsa.rs b/src/kernels/qsa.rs
+--- a/src/kernels/qsa.rs
++++ b/src/kernels/qsa.rs
+@@ -641,14 +641,45 @@
+     /// `LILY_QSA_ROUTE`: `query` (the default, see docs/architecture.md) or
+     /// `split` (the decode-style split kernel for every sub-batch).
+     pub fn from_env() -> Self {
+-        match std::env::var("LILY_QSA_ROUTE").as_deref() {
+-            Ok("query") | Err(_) => Self::Query,
+-            Ok("split") => Self::Split,
+-            Ok(other) => {
+-                eprintln!("LILY_QSA_ROUTE={other}: unknown route, using query");
+-                Self::Query
+-            }
++        let value = std::env::var("LILY_QSA_ROUTE").ok();
++        let (route, requested) = Self::from_value(value.as_deref());
++        // Record once, but preserve upstream's fresh selection on each call.
++        // No raw environment value is retained or copied into the record.
++        static RECORDED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
++        RECORDED.get_or_init(|| {
++            eprintln!(
++                "LILY_QSA_ROUTE_EFFECTIVE requested={requested} route={}",
++                route.label()
++            );
++        });
++        route
++    }
++
++    fn from_value(value: Option<&str>) -> (Self, &'static str) {
++        match value {
++            None => (Self::Query, "unset"),
++            Some("query") => (Self::Query, "query"),
++            Some("split") => (Self::Split, "split"),
++            Some(_) => (Self::Query, "invalid"),
+         }
++    }
++
++    fn label(self) -> &'static str {
++        match self {
++            Self::Split => "split",
++            Self::Query => "query",
++        }
++    }
++
++    fn dispatch_metadata(self, rows: usize) -> String {
++        let (split_count, query_count) = match self {
++            Self::Split => (1, 0),
++            Self::Query => (0, 1),
++        };
++        format!(
++            "LILY_QSA_DISPATCH_METADATA sparse_prefill_rows={rows} route={} split_dispatch_count={split_count} query_dispatch_count={query_count}",
++            self.label()
++        )
+     }
+ 
+     /// The route for a sub-batch of `rows` queries: batches under
+@@ -656,10 +687,18 @@
+     /// kernel, whose splits fill the GPU where two threadgroups per query
+     /// would not.
+     pub fn for_rows(self, rows: usize) -> Self {
+-        match self {
++        let route = match self {
+             Self::Query if rows >= QSA_QUERY_MIN_ROWS => self,
+             _ => Self::Split,
++        };
++        // This exact return value is consumed by model.rs's Split/Query match.
++        // Only the first sparse-prefill decision is recorded; no timings or
++        // per-token/per-kernel counters are observed.
++        if rows >= QSA_QUERY_MIN_ROWS {
++            static RECORDED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
++            RECORDED.get_or_init(|| eprintln!("{}", route.dispatch_metadata(rows)));
+         }
++        route
+     }
+ }
+ 
+diff --git a/src/qwen4exp/model.rs b/src/qwen4exp/model.rs
+--- a/src/qwen4exp/model.rs
++++ b/src/qwen4exp/model.rs
+@@ -3990,7 +3990,35 @@
+ /// loaders' default): measurement and tests run either format through the
+ /// same binaries.
+ fn kv_format_from_env() -> Result<Option<KvFormat>> {
+-    std::env::var("LILY_KV_CACHE").ok().map(|v| v.parse()).transpose()
++    kv_format_from_value(std::env::var("LILY_KV_CACHE").ok().as_deref())
++}
++
++fn kv_format_from_value(value: Option<&str>) -> Result<Option<KvFormat>> {
++    value.map(|v| {
++        v.parse::<KvFormat>().map_err(|_| {
++            anyhow::anyhow!("LILY_KV_CACHE: invalid enum (bf16 or q8)")
++        })
++    }).transpose()
++}
++
++#[cfg(test)]
++mod managed_kv_env_tests {
++    use super::{KvFormat, kv_format_from_value};
++
++    #[test]
++    fn env_kv_acceptance_and_missing_value_are_unchanged() {
++        assert_eq!(kv_format_from_value(None).unwrap(), None);
++        assert_eq!(kv_format_from_value(Some("bf16")).unwrap(), Some(KvFormat::Bf16));
++        assert_eq!(kv_format_from_value(Some("q8")).unwrap(), Some(KvFormat::Q8));
++    }
++
++    #[test]
++    fn invalid_env_kv_is_rejected_without_raw_input_or_fallback() {
++        for value in ["", "BF16", " bf16", "secret-canary\nprivate-value"] {
++            let error = kv_format_from_value(Some(value)).unwrap_err();
++            assert_eq!(format!("{error:#}"), "LILY_KV_CACHE: invalid enum (bf16 or q8)");
++        }
++    }
+ }
+ 
+ /// Rounds a requested capacity up to the growth step, within the kernel limit.
+diff --git a/src/serve.rs b/src/serve.rs
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -630,6 +630,18 @@
+ fn queue_rejection_line(request_id: &str, status: u16) -> String {
+     format!(
+         "[lily-meta] request_id={request_id} phase=queue_rejected status={status} queue_slot_released=true"
++    )
++}
++
++fn engine_effective_metadata(
++    context_tokens: usize,
++    kv_cache: KvFormat,
++    mtp_drafts: usize,
++    max_batch: usize,
++) -> String {
++    format!(
++        "LILY_ENGINE_EFFECTIVE context_tokens={context_tokens} kv_cache={} mtp_drafts={mtp_drafts} max_batch={max_batch}",
++        kv_cache.name()
+     )
+ }
+ 
+@@ -1212,6 +1224,10 @@
+             }
+             _ => None,
+         };
++        eprintln!(
++            "{}",
++            engine_effective_metadata(max_seq, model.kv_format(), drafts, max_batch)
++        );
+         Ok(Self {
+             ctx,
+             model,
+diff --git a/tests/unit/kernels/qsa.rs b/tests/unit/kernels/qsa.rs
+--- a/tests/unit/kernels/qsa.rs
++++ b/tests/unit/kernels/qsa.rs
+@@ -1329,3 +1329,40 @@
+         assert!(rel < 0.04, "{at}: relative RMS error {rel}");
+     }
+ }
++#[test]
++fn managed_route_metadata_preserves_query_default_and_split_selection() {
++    let (unset, label) = SparseAttnRoute::from_value(None);
++    assert_eq!((unset, label), (SparseAttnRoute::Query, "unset"));
++    let (query, label) = SparseAttnRoute::from_value(Some("query"));
++    assert_eq!((query, label), (SparseAttnRoute::Query, "query"));
++    let (split, label) = SparseAttnRoute::from_value(Some("split"));
++    assert_eq!((split, label), (SparseAttnRoute::Split, "split"));
++    for rows in [0, 1, QSA_QUERY_MIN_ROWS - 1, QSA_QUERY_MIN_ROWS, 4096] {
++        assert_eq!(split.for_rows(rows), SparseAttnRoute::Split);
++        assert_eq!(query.for_rows(rows), if rows < QSA_QUERY_MIN_ROWS {
++            SparseAttnRoute::Split
++        } else {
++            SparseAttnRoute::Query
++        });
++    }
++}
++
++#[test]
++fn invalid_route_metadata_never_echoes_environment_input() {
++    for invalid in ["", "tile", "secret-canary", "split\nprivate-value"] {
++        let (route, requested) = SparseAttnRoute::from_value(Some(invalid));
++        assert_eq!((route, requested), (SparseAttnRoute::Query, "invalid"));
++        assert_eq!(route.label(), "query");
++        assert!(!route.dispatch_metadata(16).contains("secret-canary"));
++    }
++}
++
++#[test]
++fn managed_dispatch_metadata_reports_selected_return_not_requested_route() {
++    let selected = SparseAttnRoute::Query.for_rows(QSA_QUERY_MIN_ROWS - 1);
++    assert_eq!(selected, SparseAttnRoute::Split);
++    assert_eq!(selected.dispatch_metadata(15),
++        "LILY_QSA_DISPATCH_METADATA sparse_prefill_rows=15 route=split split_dispatch_count=1 query_dispatch_count=0");
++    assert_eq!(SparseAttnRoute::Query.for_rows(16).dispatch_metadata(16),
++        "LILY_QSA_DISPATCH_METADATA sparse_prefill_rows=16 route=query split_dispatch_count=0 query_dispatch_count=1");
++}
+diff --git a/tests/unit/serve.rs b/tests/unit/serve.rs
+--- a/tests/unit/serve.rs
++++ b/tests/unit/serve.rs
+@@ -1,5 +1,13 @@
+ use super::*;
+ use crate::qwen4exp::ImageSpan;
++
++#[test]
++fn effective_engine_metadata_uses_bounded_enum_and_exact_numeric_values() {
++    assert_eq!(engine_effective_metadata(131072, KvFormat::Bf16, 2, 1),
++        "LILY_ENGINE_EFFECTIVE context_tokens=131072 kv_cache=bf16 mtp_drafts=2 max_batch=1");
++    assert_eq!(engine_effective_metadata(262144, KvFormat::Q8, 0, 4),
++        "LILY_ENGINE_EFFECTIVE context_tokens=262144 kv_cache=q8 mtp_drafts=0 max_batch=4");
++}
+ 
+ #[test]
+ fn call_ids_are_stable_per_request_and_index() {

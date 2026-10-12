@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "services/compat/src"))
 from compat_api.app import CompatModelProfile, Settings, create_app
 
 PROFILES = tuple(CompatModelProfile("qwen3.8-flash-next-lily-q4-" + name, tokens, deadline)
-                 for name, tokens, deadline in (("64k", 65536, 600), ("128k", 131072, 1200), ("262k", 262144, 1800)))
+                 for name, tokens, deadline in (("64k", 65536, 3672), ("128k", 131072, 4272), ("262k", 262144, 4872)))
 
 
 class ProfilesTests(unittest.IsolatedAsyncioTestCase):
@@ -48,11 +48,11 @@ class ProfilesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_simultaneous_requests_keep_model_budget_timeout_key_and_thinking_local(self):
         responses = await asyncio.gather(self.chat(PROFILES[0], token="first", think=False),
-                                         self.chat(PROFILES[1], budget=70000, token="second", think="low"),
-                                         self.chat(PROFILES[2], budget=140000, token="third"))
+                                         self.chat(PROFILES[1], budget=32768, token="second", think="low"),
+                                         self.chat(PROFILES[2], budget=65536, token="third"))
         self.assertEqual([r.status_code for r in responses], [200, 200, 200])
         by_model = {body["model"]: (body, key, timeout) for body, key, timeout in self.calls}
-        for profile, budget, token in zip(PROFILES, (4096, 70000, 140000), ("first", "second", "third")):
+        for profile, budget, token in zip(PROFILES, (4096, 32768, 65536), ("first", "second", "third")):
             body, key, timeout = by_model[profile.public_alias]
             self.assertEqual(body["max_tokens"], budget)
             self.assertEqual(key, "Bearer " + token)
@@ -66,6 +66,8 @@ class ProfilesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_output_over_profile_cap_rejected_without_forward(self):
         self.assertEqual((await self.chat(PROFILES[0], budget=65537)).status_code, 400)
+        self.assertEqual((await self.chat(PROFILES[1], budget=70000)).status_code, 400)
+        self.assertEqual((await self.chat(PROFILES[2], budget=140000)).status_code, 400)
         self.assertEqual(self.calls, [])
 
     async def test_acl_denial_precedes_generation(self):
@@ -110,7 +112,7 @@ class ProfilesTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(app_module, "_send_before_disconnect", spy):
             self.assertEqual((await self.chat(PROFILES[1])).status_code, 200)
         self.assertEqual(len(records), 1)
-        self.assertAlmostEqual(records[0], 1200, places=8)
+        self.assertAlmostEqual(records[0], 4272, places=8)
 
 
 if __name__ == "__main__":

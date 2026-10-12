@@ -1,0 +1,206 @@
+--- a/src/metal.rs
++++ b/src/metal.rs
+@@ -1504,7 +1504,23 @@
+         };
+         let feedback = Feedback::new(cmds, profile);
+         let fence_value = ctx.submit(&program, &feedback)?;
+-        Ok(PendingPass { ctx, program, fence_value, done, feedback, slot: Some(slot) })
++        Ok(PendingPass { ctx, program, fence_value, done, feedback, slot: Some(slot), submitted: true })
++    }
++
++    /// Keep a host-dependent parked program encoded until its inputs are
++    /// staged and its shared event is signaled. It is not GPU work yet.
++    pub(crate) fn defer_parked_commit(self) -> Result<PendingPass<'a>> {
++        let EncodedPass { ctx, program, done, slot, label, names } = self;
++        ensure!(program.iter().any(|i| matches!(i, Item::Wait(_, _))),
++            "deferred parked pass has no wait");
++        let cmds = program.iter().filter(|item| matches!(item, Item::Cmd(_))).count();
++        let profile = if ctx.profile {
++            ensure!(names.len() == cmds, "profile names differ from commands");
++            Some(ProfileInfo { label, names })
++        } else { None };
++        let feedback = Feedback::new(cmds, profile);
++        Ok(PendingPass { ctx, program, fence_value: 0, done, feedback,
++            slot: Some(slot), submitted: false })
+     }
+ 
+     /// Drops the context lifetime so the pass can be kept inside long-lived
+@@ -1554,10 +1570,11 @@
+     pub len: usize,
+ }
+ 
+-/// A committed-but-unawaited pass. Holding one while encoding the next pass
+-/// is the decode pipelining primitive; hosts must not read buffers the
+-/// pending pass writes until [`Self::wait`] returns. Dropping it without
+-/// waiting blocks until the GPU is done (its command memory is recycled).
++/// A pass retaining its encoded program and command memory until completion.
++/// Normal commits submit immediately; an internal parked pass stays unsubmitted
++/// until [`Self::submit_released`]. Hosts must not read submitted output before
++/// [`Self::wait`] returns. Drop waits for submitted work before recycling command
++/// memory; an unsubmitted pass can be discarded without a GPU fence.
+ pub struct PendingPass<'a> {
+     ctx: &'a MetalContext,
+     /// Kept alive until completion.
+@@ -1566,12 +1583,15 @@
+     done: Option<(SharedEvent, u64)>,
+     feedback: Arc<Feedback>,
+     slot: Option<Slot>,
++    submitted: bool,
+ }
+ 
+ impl Drop for PendingPass<'_> {
+     fn drop(&mut self) {
+         if self.slot.is_some() {
+-            let _ = self.ctx.wait_fence(self.fence_value);
++            if self.submitted {
++                let _ = self.ctx.wait_fence(self.fence_value);
++            }
+             self.program.clear();
+             self.slot = None;
+         }
+@@ -1636,6 +1656,23 @@
+ }
+ 
+ impl PendingPass<'_> {
++    /// Submit a deferred program only after every encoded wait is ready.
++    /// Retain those waits on the queue: they still provide synchronization.
++    pub(crate) fn submit_released(mut self) -> Result<Self> {
++        if !self.submitted {
++            for item in &self.program {
++                if let Item::Wait(event, value) = item {
++                    ensure!(event.signaled_value() >= *value,
++                        "deferred parked pass was not released before submission");
++                }
++            }
++            let fence = self.ctx.submit(&self.program, &self.feedback)?;
++            self.fence_value = fence;
++            self.submitted = true;
++        }
++        Ok(self)
++    }
++
+     /// Blocks until the GPU finishes this pass.
+     pub fn wait(self) -> Result<()> {
+         self.wait_retain().map(|_| ())
+@@ -1644,6 +1681,7 @@
+     /// Blocks until completion while retaining the pass's feedback.
+     /// Benchmarks query its GPU clock only after their cadence timer ends.
+     pub fn wait_retain(mut self) -> Result<CompletedPass> {
++        ensure!(self.submitted, "cannot wait for an unsubmitted parked pass");
+         self.ctx.wait_fence(self.fence_value)?;
+         self.finished()
+     }
+@@ -1659,6 +1697,7 @@
+     }
+ 
+     pub fn wait_retain_paced(mut self, pacer: &mut Pacer) -> Result<CompletedPass> {
++        ensure!(self.submitted, "cannot wait for an unsubmitted parked pass");
+         let (event, value) = match &self.done {
+             Some((event, value)) => (event.clone(), *value),
+             None => (self.ctx.fence.clone(), self.fence_value),
+--- a/src/qwen4exp/spec.rs
++++ b/src/qwen4exp/spec.rs
+@@ -15,11 +15,12 @@
+ //! positions, and writes the next verify pass's ids. Attention caches are
+ //! position indexed, so rejected rows are simply overwritten later.
+ //!
+-//! The host meanwhile reads the draws, emits tokens, and commits the next
++//! The host meanwhile reads the draws, emits tokens, and selects the next
+ //! verify pass (encoded ahead for every possible accepted count while the
+-//! verify pass ran) parked behind the draft pass. When a generation ends at a
+-//! row before the one the GPU accepted (a stop token among accepted drafts),
+-//! a small host-encoded pass rolls the state back further.
++//! verify pass ran). It submits that pass after the draft completes and the
++//! host stages and releases its inputs. When a generation ends at a row before
++//! the one the GPU accepted (a stop token among accepted drafts), a small
++//! host-encoded pass rolls the state back further.
+ //!
+ //! Outputs are exact: every emitted token is a draw from the trunk's own
+ //! distribution for its prefix; the drafts only decide how many rows a pass
+@@ -116,9 +117,9 @@
+         // Whatever happens below, a parked pass must be let go.
+         let _release = parked.as_ref().map(|_| s.sync.release_on_drop());
+         let capacity = s.prefill.as_ref().expect("prefill scratch just ensured");
+-        // The token-dependent inputs. A parked pass is already running with
+-        // ids the draft pass wrote; only the n-gram rows are staged here, read
+-        // after its wait. Otherwise both are written now and the pass encoded.
++        // The token-dependent inputs. A parked pass retains ids the draft
++        // pass wrote; stage its n-gram rows before releasing and submitting it.
++        // Otherwise both inputs are written now and the pass is encoded.
+         let ps = if parked.is_some() {
+             capacity.rows(m)?
+         } else {
+@@ -133,7 +134,7 @@
+         let committed = match parked {
+             Some(pass) => {
+                 s.sync.release()?;
+-                pass
++                pass.submit_released()?
+             }
+             None => {
+                 let pass = self
+@@ -174,7 +175,7 @@
+             )?
+             .commit()?;
+         // While the GPU works, encode the next verify pass for every possible
+-        // outcome; finish_speculation then only commits the matching one.
++        // outcome; finish_speculation retains only the matching one.
+         let prepared = if can_prepare {
+             self.prepare_variants(ctx, state, s, pos_before, m, chain, params, step0)?
+         } else {
+@@ -348,8 +349,8 @@
+                     .then(|| pending.prepared.swap_remove(accepted));
+                 match ahead {
+                     Some(prep) => {
+-                        // Encoded ahead, ids written by the draft pass: commit
+-                        // it parked, then read the proposals.
++                        // Keep the selected program encoded while collecting
++                        // proposals. verify stages/releases before submitting it.
+                         let s = &*s;
+                         let value = s.sync.arm()?;
+                         ensure!(
+@@ -357,15 +358,22 @@
+                             "step sync value {value} does not match the prepared pass ({})",
+                             prep.park
+                         );
+-                        let parked = match prep.verify.attach(ctx).commit() {
++                        let parked = match prep.verify.attach(ctx).defer_parked_commit() {
+                             Ok(pass) => pass,
+                             Err(e) => {
+                                 s.sync.release()?;
+                                 return Err(e);
+                             }
+                         };
+-                        let proposals =
+-                            self.collect_drafts(s, draft, chain, &pending)?;
++                        let proposals = match self.collect_drafts(s, draft, chain, &pending) {
++                            Ok(proposals) => proposals,
++                            Err(error) => {
++                                // The deferred program never reached the GPU,
++                                // but the claimed StepSync value must be cleared.
++                                s.sync.release()?;
++                                return Err(error);
++                            }
++                        };
+                         (proposals, Some(parked))
+                     }
+                     None => {
+@@ -388,7 +396,7 @@
+                         };
+                         match self
+                             .encode_batch(ctx, state, s, &ps, mode)
+-                            .and_then(|pass| pass.commit())
++                            .and_then(|pass| pass.defer_parked_commit())
+                         {
+                             Ok(pass) => (proposals, Some(pass)),
+                             Err(e) => {
+@@ -409,7 +417,8 @@
+             );
+         }
+         if parked.is_some() {
+-            // The parked verify pass starts when the draft pass finishes.
++            // Preserve the original predictor start point; the next verify
++            // program remains unsubmitted until its host inputs are ready.
+             let mut pace = s.sync.pace_verify.get();
+             pace.begin(Instant::now());
+             s.sync.pace_verify.set(pace);

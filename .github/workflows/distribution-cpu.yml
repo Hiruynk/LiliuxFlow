@@ -31,6 +31,8 @@ jobs:
           python3 -m unittest discover -s scripts/distribution -p test_public_screenshot_policy.py
           python3 -m unittest discover -s scripts/distribution -p test_advisory_resources.py
           python3 -m unittest discover -s scripts/distribution -p test_context_profiles.py
+          python3 -m unittest discover -s scripts/distribution -p test_profile_policy.py
+          python3 -m unittest discover -s scripts/distribution -p test_ui_user_acl.py
           python3 -m unittest discover -s scripts/distribution -p test_guard_recovery_ops.py
           python3 -m unittest discover -s scripts/distribution -p test_ui_recipe.py
           python3 -m unittest discover -s scripts/distribution -p test_native_cleanroom.py

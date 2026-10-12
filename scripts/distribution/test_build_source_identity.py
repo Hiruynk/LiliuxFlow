@@ -60,6 +60,8 @@ class SourceIdentityTests(unittest.TestCase):
         target = self.source / 'manifests/distribution/native-sources.json'
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / 'manifests/distribution/native-sources.json', target)
+        baseline = self.source / 'manifests/distribution/lily-source-baseline.json'
+        shutil.copyfile(ROOT / 'manifests/distribution/lily-source-baseline.json', baseline)
 
     def plan(self):
         with patch.object(builder, 'installation', return_value=self.config):
@@ -162,7 +164,8 @@ class SourceIdentityTests(unittest.TestCase):
             stack.enter_context(patch.object(builder, 'install_project_node', return_value={}))
             stack.enter_context(patch.object(builder.shutil, 'which', return_value='/fixture/uv'))
             stack.enter_context(patch.object(builder, 'verified_file', side_effect=lambda base, item: base / item['path']))
-            for target in ('native_recipe.apply_manager_source_patches', 'welcome_native.install_welcome',
+            for target in ('native_recipe.apply_lily_source_patches', 'native_recipe.apply_manager_source_patches',
+                           'welcome_native.install_welcome',
                            'patch_litellm_profiles.install_runtime_policy', 'model_catalog.load_catalog', 'profile_registry.load_registry'):
                 stack.enter_context(patch(target, return_value={}))
             resolve = stack.enter_context(patch.object(builder, 'resolve_source_commit', wraps=builder.resolve_source_commit))
