@@ -1,0 +1,2068 @@
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -46,6 +46,14 @@
+     /// Requires the fixed BF16/two-draft configuration; P1 serves one at a time.
+     #[arg(long, default_value_t = false)]
+     liliuxflow_mtp2_shared_context: bool,
++
++    /// Opt-in authenticated control for the shared MTP2 product runner.
++    #[arg(long, default_value_t = false)]
++    liliuxflow_mtp2_control: bool,
++    /// Inherited read-only descriptor of an owned mode0600 regular key file.
++    /// Contains exact64 lowercase hex bytes; never key material in argv/env.
++    #[arg(long)]
++    liliuxflow_mtp2_control_key_fd: Option<i32>,
+ 
+     /// GPU memory for cached sessions (KV caches and recurrent checkpoints),
+     /// e.g. `24G`. Default: what the device's recommended working set leaves
+@@ -321,6 +329,8 @@
+         bind: cli.bind,
+         max_seq: cli.max_seq,
+         liliuxflow_mtp2_shared_context: cli.liliuxflow_mtp2_shared_context,
++        liliuxflow_mtp2_control: cli.liliuxflow_mtp2_control,
++        liliuxflow_mtp2_control_key_fd: cli.liliuxflow_mtp2_control_key_fd,
+         cache_bytes: cli.cache_bytes.as_deref().map(parse_bytes).transpose()?,
+         max_sessions: cli.max_sessions,
+         disk_cache_dir: Some(cli.disk_cache_dir.unwrap_or_else(default_disk_cache_dir)),
+diff --git a/src/serve.rs b/src/serve.rs
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -30,6 +30,7 @@
+ pub mod disk;
+ pub mod http;
+ pub mod mtp2;
++pub mod mtp2_control;
+ pub mod pin;
+ pub mod request;
+ pub mod session;
+@@ -41,6 +42,8 @@
+     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+ };
+ use std::path::Path;
++use std::cell::RefCell;
++use std::rc::Rc;
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::mpsc::{
+@@ -68,6 +71,7 @@
+ use crate::thinking::{ThinkingTexts, ThinkingTokens};
+ use api::{Defaults, ImagePolicy, Kind, Prepared};
+ use request::{Admitted, Alone, Decoded, Ending, Opened};
++type EngineControlOwner = Rc<RefCell<mtp2_control::EngineAuthority>>;
+ use session::SessionStore;
+ use timings::TimingsLog;
+ use tools::ParsedToolCall;
+@@ -235,6 +239,8 @@
+     pub max_seq: usize,
+     /// Explicit candidate capability; legacy serving remains the default.
+     pub liliuxflow_mtp2_shared_context: bool,
++    pub liliuxflow_mtp2_control: bool,
++    pub liliuxflow_mtp2_control_key_fd: Option<i32>,
+     pub cache_bytes: Option<usize>,
+     /// The attention K/V caches' element format (`None`: the default, q8).
+     pub kv_format: Option<KvFormat>,
+@@ -296,6 +302,12 @@
+ }
+ 
+ fn check_shared_mtp2_options(options: &ServeOptions) -> Result<()> {
++    ensure!(!options.liliuxflow_mtp2_control || options.liliuxflow_mtp2_shared_context,
++        "mtp2_control_requires_shared_candidate");
++    ensure!(options.liliuxflow_mtp2_control == options.liliuxflow_mtp2_control_key_fd.is_some(),
++        "mtp2_control_key_configuration");
++    ensure!(!options.liliuxflow_mtp2_control || options.idle_unload_secs==0,
++        "mtp2_control_requires_resident_idle_policy");
+     if !options.liliuxflow_mtp2_shared_context { return Ok(()); }
+     ensure!(options.max_seq == mtp2::RESIDENT_CONTEXT_TOKENS,
+         "shared MTP2 requires --max-seq 262144");
+@@ -648,6 +660,47 @@
+     cancelled: Arc<AtomicBool>,
+     started: bool,
+     metadata: RequestMeta,
++    // Last field: a CPU-only guard drops after response metadata/buffers.
++    control_admission: Option<CpuAdmissionGuard>,
++}
++
++/// Sole HTTP/CPU owner. Its drop marks pending disposal facts, not a release.
++/// The engine pumps these at settled boundaries with its private authority.
++struct CpuAdmissionGuard {
++    control: Arc<mtp2_control::Control>, token: mtp2_control::RequestToken,
++    queue: Arc<EngineQueue>, jobs: SyncSender<Cmd>, cancelled: Arc<AtomicBool>,
++    expected_profile: &'static str, reserved: bool, ever_reserved: bool, acquired: bool,
++    scope:Option<mtp2_control::TenantScope>, session_started:bool, session_disposed:bool,
++}
++impl CpuAdmissionGuard {
++    fn publish(&mut self) -> Result<()> {
++        self.control.before_publish(&self.token,||self.queue.admit())?;
++        self.reserved=true;self.ever_reserved=true;Ok(())
++    }
++    fn dequeued(&mut self, owner:&EngineControlOwner) -> Result<()> {
++        ensure!(self.reserved,"mtp2_control_queue_ownership");
++        self.queue.left();self.reserved=false;
++        let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++        self.control.queue_returned(&mut authority,&self.token)?;Ok(())
++    }
++}
++impl Drop for CpuAdmissionGuard {
++    fn drop(&mut self) {
++        if self.acquired {return;} // Only explicit engine cleanup may release.
++        if self.reserved {self.queue.left();self.reserved=false;}
++        let fact=if self.ever_reserved {mtp2_control::CpuDisposal::ReservationReturned}
++            else {mtp2_control::CpuDisposal::NeverReserved};
++        if self.control.note_cpu_disposed(&self.token,fact).is_ok() {
++            // Ledger mutex has returned. This is nonblocking and never wakes GPU.
++            // A full inbox already wakes its receiver; pending bit also yields solo.
++            let _=self.jobs.try_send(Cmd::Wake);
++        }
++    }
++}
++fn dequeue_job(job:&mut Job, queue:&EngineQueue, owner:Option<&EngineControlOwner>) -> Result<()> {
++    if let Some(guard)=job.sink.control_admission.as_mut() {
++        guard.dequeued(owner.context("mtp2_control_owner_missing")?)
++    } else {queue.left();Ok(())}
+ }
+ 
+ /// Native request evidence only. Response completion does not release a lane:
+@@ -743,6 +796,11 @@
+ impl Job {
+     /// Answers the request without running it.
+     fn reject(self, status: u16, message: &str) {
++        if self.sink.control_admission.is_some() {
++            let Job{prepared,mut sink,..}=self;
++            sink.start(status,"application/json");sink.send(error_json("server_error",message));sink.end();
++            drop(prepared);drop(sink);return; // RAII receipt follows actual CPU drop.
++        }
+         let mut sink = self.sink;
+         sink.start(status, "application/json");
+         sink.send(error_json("server_error", message));
+@@ -902,6 +960,9 @@
+     /// lacks them (the controls are then ignored).
+     thinking_tokens: Option<Arc<ThinkingTokens>>,
+     mtp2_residency: Option<mtp2::WeightResidency>,
++    control: Option<Arc<mtp2_control::Control>>,
++    control_owner: Option<EngineControlOwner>,
++    control_disk_bytes: u64,
+     mtp2_step_id: u64,
+     mtp2_scratch_bytes: usize,
+ }
+@@ -915,13 +976,94 @@
+ }
+ 
+ impl<M: LanguageModel> Engine<M> {
++    /// Called only after this request's Admitted/Session and continuation have
++    /// been dropped or returned to the inactive cache. The caller has returned
++    /// from the whole quantum/prefill, so every PendingPass is already out of
++    /// scope. begin() owns an empty program and never submits another pass's
++    /// deferred program; release_parked clears the shared scratch wait first.
++    /// An actual queue fence then proves settled work. Errors retire ownership.
++    fn control_session_disposed(&self,sink:&mut Sink) -> Result<()> {
++        let needed=sink.control_admission.as_ref().is_some_and(|g|g.session_started&&!g.session_disposed);
++        if needed {
++            let disposed=(|| -> Result<()> {
++                self.model.release_parked(&self.scratch)?;
++                self.ctx.begin()?.commit_wait()?;
++                ensure!(self.ctx.fault().is_none(),"mtp2_control_cleanup_fault");
++                self.control_transition(sink,mtp2_control::OwnerTransition::GpuSettled)?;
++                self.control_transition(sink,mtp2_control::OwnerTransition::SessionDisposed)?;
++                Ok(())
++            })();
++            if let Err(error)=disposed {let _=self.control_retire();return Err(error);}
++            if let Some(g)=sink.control_admission.as_mut(){g.session_disposed=true;}
++        }Ok(())
++    }
++    fn control_transition(&self,sink:&Sink,action:mtp2_control::OwnerTransition) -> Result<()> {
++        if let Some(control)=&self.control {
++            let guard=sink.control_admission.as_ref().context("mtp2_control_admission_missing")?;
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            control.owner_transition(&mut authority,&guard.token,action)?;
++        }Ok(())
++    }
++    fn release_session_controlled(&mut self,session:session::Session<M>,images:&[session::CachedImage],
++        cache_key:Option<&str>,sink:&Sink)->Result<session::Evictions> {
++        if let Some(guard)=&sink.control_admission {
++            self.control_observe()?;
++            self.sessions.release_scoped(&self.ctx,session,images,cache_key,guard.scope.context("mtp2_control_scope_missing")?)
++        } else {Ok(self.sessions.release(&self.ctx,session,images,cache_key))}
++    }
++    fn control_pump(&self) -> Result<()> {
++        if let Some(control)=&self.control {
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            control.pump_cpu_disposals(&mut authority,now())?;
++        } Ok(())
++    }
++    fn control_observe(&self) -> Result<()> {
++        if let Some(control)=&self.control {
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let observation=self.sessions.control_observation(self.control_disk_bytes);
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            control.observe_cache(&mut authority,observation)?;
++        } Ok(())
++    }
++    fn control_publish_ready(&self) -> Result<()> {
++        if let Some(control)=&self.control {
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let residency=self.mtp2_residency.as_ref().context("mtp2_control_residency_missing")?;
++            ensure!(residency.generation>0 && residency.load_count>0 && residency.load_count<=residency.generation
++                && residency.buffer_count>0 && residency.allocation_bytes>0 && residency.max_batch==self.max_batch,
++                "mtp2_control_actual_residency");
++            let observation=self.sessions.control_observation(self.control_disk_bytes);
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            control.publish_epoch(&mut authority,&residency.allocation_id,observation)?;
++        } Ok(())
++    }
++    fn control_retire(&self) -> Result<()> {
++        if let Some(control)=&self.control {
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            control.retire_epoch(&mut authority)?;
++        } Ok(())
++    }
++    fn control_before_resources(&self,job:&Job) -> Result<()> {
++        if let Some(control)=&self.control {
++            self.control_observe()?;
++            let guard=job.sink.control_admission.as_ref().context("mtp2_control_admission_missing")?;
++            let residency=self.mtp2_residency.as_ref().context("mtp2_control_residency_missing")?;
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            control.before_native_resources(&mut authority,&guard.token,&residency.allocation_id)?;
++        } Ok(())
++    }
+     fn load(
+         model_dir: &Path,
+         options: &ServeOptions,
+         shared: &Shared,
++        control_owner: Option<&EngineControlOwner>,
+         next_id: u64,
+     ) -> Result<Self> {
+-        let Shared { generator, shutdown, timings, queue: _, thinking_tokens, weight_loads } =
++        let Shared { generator, shutdown, timings, queue: _, thinking_tokens, weight_loads, .. } =
+             shared.clone();
+         // `LILY_KERNEL_PROFILE=1`: per-kernel GPU times per pass, printed
+         // after every answered request (diagnostic; the profile transport
+@@ -1313,6 +1455,8 @@
+             pin,
+             thinking_tokens,
+             mtp2_residency,
++            control:shared.control.clone(),control_owner:control_owner.cloned(),
++            control_disk_bytes:options.disk_cache_bytes,
+             mtp2_step_id: 0,
+             mtp2_scratch_bytes,
+         })
+@@ -1324,6 +1468,13 @@
+     /// GPU buffers and the n-gram mapping. Returns the request counter so
+     /// ids stay unique across a reload.
+     fn unload(self, reason: &str) -> u64 {
++        let resident_only=self.control.is_some();
++        // Validate the concrete store before teardown. Shared control never
++        // enters a disk spill path, including an unexpected attached tier.
++        if resident_only {let _=self.control_observe();}
++        // Revoke the epoch before any actual model/cache resource drop.
++        // An error never grants release; process-owned teardown still proceeds.
++        let _=self.control_retire();
+         let started = Instant::now();
+         let Engine {
+             ctx,
+@@ -1351,7 +1502,7 @@
+         // earlier copies were written by a healthy queue and stay valid).
+         let faulted = ctx.fault().is_some();
+         let (spilled, dropped) =
+-            if faulted { (0, sessions.drop_all()) } else { sessions.spill_all(&ctx) };
++            if faulted || resident_only { (0, sessions.drop_all()) } else { sessions.spill_all(&ctx) };
+         let spill_secs = started.elapsed().as_secs_f64();
+         drop(scratch);
+         drop(sessions);
+@@ -1382,6 +1533,7 @@
+     /// ahead (see [`SessionStore::write_ahead`]). Returns whether a write is
+     /// in flight, which the engine loop then polls for.
+     fn write_ahead(&mut self) -> bool {
++        if self.control.is_some() {let _=self.control_observe();return false;}
+         self.sessions.write_ahead(&self.ctx)
+     }
+ 
+@@ -1395,9 +1547,15 @@
+     /// recorded, if any: the engine is then unusable and must be replaced,
+     /// even when this request happened to finish before the feedback arrived.
+     fn serve(&mut self, job: Job) -> Option<String> {
+-        let Opened { p, mut sink, in_flight, queued } = self.open(job);
++        let Opened { p, mut sink, in_flight, queued } = match self.open(job) {
++            Ok(opened)=>opened,Err(_)=>return None,
++        };
+         let stream = p.stream;
+         let result = self.run(p, &mut sink, queued, in_flight.pinned());
++        // run returned: its Session/Admitted and every pending generation pass
++        // are gone or in the inactive resident cache, including error unwinds.
++        let disposal=self.control_session_disposed(&mut sink);
++        let result=result.and(disposal);
+         let ending = match &result {
+             Ok(()) => Ending::Answered,
+             Err(error) => Ending::Failed(error),
+@@ -1829,8 +1987,41 @@
+ }
+ 
+ /// Serves the checkpoint at `model_dir` with the engine its `model_type` names.
++/// Called before any listener/thread/model operation. Descriptor contents are
++/// exact64 lowercase hex and immediately dropped; no environment key is read.
++fn read_control_key(fd:i32) -> Result<(mtp2_control::Control,mtp2_control::EngineAuthority)> {
++    use std::os::fd::FromRawFd;
++    use std::os::unix::fs::MetadataExt;
++    use std::io::Read;
++    ensure!(fd>=3,"mtp2_control_key_descriptor");
++    // The product runner owns and passes this read-only descriptor once.
++    let file=unsafe{std::fs::File::from_raw_fd(fd)};
++    let before=file.metadata().map_err(|_|anyhow::anyhow!("mtp2_control_key_metadata"))?;
++    let flags=unsafe{libc::fcntl(fd,libc::F_GETFL)};
++    ensure!(flags>=0 && flags&libc::O_ACCMODE==libc::O_RDONLY && before.file_type().is_file()
++        && before.uid()==unsafe{libc::getuid()} && before.mode()&0o7777==0o600 && before.len()==64,
++        "mtp2_control_key_ownership");
++    let mut bytes=Vec::with_capacity(65);
++    // All failures after reading pass through the bounded buffer wipe.
++    let parsed=(|| -> Result<mtp2_control::Key> {
++        let mut limited=(&file).take(65);
++        limited.read_to_end(&mut bytes).map_err(|_|anyhow::anyhow!("mtp2_control_key_read"))?;
++        let after=file.metadata().map_err(|_|anyhow::anyhow!("mtp2_control_key_metadata"))?;
++        ensure!(bytes.len()==64 && before.dev()==after.dev() && before.ino()==after.ino()
++            && before.len()==after.len() && before.mtime()==after.mtime() && before.mtime_nsec()==after.mtime_nsec()
++            && before.ctime()==after.ctime() && before.ctime_nsec()==after.ctime_nsec()
++            && before.uid()==after.uid() && before.mode()==after.mode(),"mtp2_control_key_changed");
++        Ok(mtp2_control::Key::from_hex(std::str::from_utf8(&bytes).map_err(|_|anyhow::anyhow!("mtp2_control_key_format"))?)?)
++    })();
++    for b in &mut bytes {unsafe{std::ptr::write_volatile(b,0);}}
++    std::sync::atomic::compiler_fence(Ordering::SeqCst);
++    drop(file);Ok(mtp2_control::Control::new(parsed?))
++}
+ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
+     check_shared_mtp2_options(&options)?;
++    let control_init=if options.liliuxflow_mtp2_control {
++        Some(read_control_key(options.liliuxflow_mtp2_control_key_fd.context("mtp2_control_key_missing")?)?)
++    } else {None};
+     if options.liliuxflow_mtp2_shared_context {
+         check_shared_mtp2_route(std::env::var("LILY_QSA_ROUTE").ok().as_deref(),
+             std::env::var("LILY_QSA_SCORES").ok().as_deref())?;
+@@ -1844,7 +2035,7 @@
+     // stop signals only ever reach the thread that waits for them.
+     let signals = signal::Signals::block()?;
+     match checkpoint_model_type(model_dir)?.as_str() {
+-        "qwen4_exp" => run_with::<Qwen4ExpModel>(model_dir, options, signals),
++        "qwen4_exp" => run_with::<Qwen4ExpModel>(model_dir, options, signals,control_init),
+         other => anyhow::bail!(
+             "unsupported model_type {other:?}; lily serves qwen4_exp \
+              (Qwen3.8-Flash-Next)"
+@@ -1864,6 +2055,7 @@
+     thinking_tokens: Option<Arc<ThinkingTokens>>,
+     /// Persisted across Engine::load/unload, including device-fault recovery.
+     weight_loads: Option<Arc<mtp2::WeightLoads>>,
++    control: Option<Arc<mtp2_control::Control>>,
+ }
+ 
+ /// Everything the HTTP thread needs without the engine.
+@@ -1896,7 +2088,10 @@
+     rx: Receiver<Cmd>,
+     lifecycle: &Lifecycle,
+     address: SocketAddr,
++    authority: Option<mtp2_control::EngineAuthority>,
+ ) {
++    // Created inside the sole engine thread. HTTP Shared has no owner handle.
++    let control_owner=authority.map(|a|Rc::new(RefCell::new(a)));
+     let Shared { shutdown, queue, .. } = &shared;
+     // Exits with `code` after logging `what` and refusing the queued
+     // requests with `status`/`client_message`.
+@@ -1908,7 +2103,7 @@
+      -> ! {
+         eprintln!("{what}");
+         lifecycle.set(State::Stopping);
+-        let refused = refuse_queued(rx, queue, status, client_message);
++        let refused = refuse_queued(rx, queue, status, client_message,control_owner.as_ref());
+         if refused > 0 {
+             eprintln!("exiting: refused {refused} queued requests with {status}");
+         }
+@@ -1926,8 +2121,8 @@
+             code,
+         )
+     };
+-    let mut engine = match Engine::<M>::load(model_dir, options, &shared, 1) {
+-        Ok(engine) => Some(engine),
++    let mut engine = match Engine::<M>::load(model_dir, options, &shared,control_owner.as_ref(), 1) {
++        Ok(engine) => {if let Err(error)=engine.control_publish_ready(){fatal("control ready refused",error,&rx);}Some(engine)},
+         Err(error) => fatal("engine failed to start", error, &rx),
+     };
+     let mut next_id = 1;
+@@ -1950,6 +2145,9 @@
+     let mut idle = IdleTimer::new(options.idle_unload_secs, Instant::now());
+     let mut keep_alive = KeepAlive::new(KEEP_ALIVE_INTERVAL, Instant::now());
+     while !shutdown.requested() {
++        if let (Some(control),Some(owner))=(&shared.control,&control_owner) {
++            if let Ok(mut authority)=owner.try_borrow_mut() {let _=control.pump_cpu_disposals(&mut authority,now());}
++        }
+         // An unloaded engine has nothing to time out; wait for a request.
+         // A loaded one wakes for the idle unload or the end of the pin's hold.
+         // A write ahead in flight is polled for, so its entry is indexed and
+@@ -1976,8 +2174,10 @@
+             }
+         };
+         match cmd {
+-            Ok(Cmd::Job(job)) => {
+-                queue.left();
++            Ok(Cmd::Job(mut job)) => {
++                if dequeue_job(&mut job,queue,control_owner.as_ref()).is_err() {
++                    job.reject(503,"mtp2_control_queue_ownership");continue;
++                }
+                 if job.sink.cancelled() {
+                     eprintln!(
+                         "[lily-meta] request_id={} phase=queue_cancelled queue_wait_ms={} queue_slot_released=true",
+@@ -1993,13 +2193,14 @@
+                 if engine.is_none() {
+                     lifecycle.set(State::Reloading);
+                     let started = Instant::now();
+-                    match Engine::<M>::load(model_dir, options, &shared, next_id) {
++                    match Engine::<M>::load(model_dir, options, &shared,control_owner.as_ref(), next_id) {
+                         Ok(loaded) => {
+                             eprintln!(
+                                 "reloaded {} in {:.1}s for a waiting request",
+                                 M::MODEL_ID,
+                                 started.elapsed().as_secs_f64()
+                             );
++                            if let Err(error)=loaded.control_publish_ready(){fatal("control ready refused",error,&rx);}
+                             engine = Some(loaded);
+                             lifecycle.set(State::Ready);
+                         }
+@@ -2062,7 +2263,7 @@
+                     );
+                     next_id = faulted.unload("GPU fault");
+                     let started = Instant::now();
+-                    match Engine::<M>::load(model_dir, options, &shared, next_id) {
++                    match Engine::<M>::load(model_dir, options, &shared,control_owner.as_ref(), next_id) {
+                         Ok(loaded) => {
+                             eprintln!(
+                                 "recovered: reloaded {} in {:.1}s after the GPU fault; resident sessions were \
+@@ -2070,6 +2271,7 @@
+                                 M::MODEL_ID,
+                                 started.elapsed().as_secs_f64()
+                             );
++                            if let Err(error)=loaded.control_publish_ready(){fatal("control ready refused",error,&rx);}
+                             engine = Some(loaded);
+                             lifecycle.set(State::Ready);
+                             idle.touch(Instant::now());
+@@ -2113,7 +2315,7 @@
+         }
+     }
+     lifecycle.set(State::Stopping);
+-    let refused = refuse_queued(&rx, queue, 503, "the server is shutting down");
++    let refused = refuse_queued(&rx, queue, 503, "the server is shutting down",control_owner.as_ref());
+     if refused > 0 {
+         eprintln!("stopping: refused {refused} queued requests");
+     }
+@@ -2129,12 +2331,13 @@
+     queue: &EngineQueue,
+     status: u16,
+     message: &str,
++    control_owner:Option<&EngineControlOwner>,
+ ) -> usize {
+     let mut refused = 0usize;
+     while let Ok(cmd) = rx.try_recv() {
+         match cmd {
+-            Cmd::Job(job) => {
+-                queue.left();
++            Cmd::Job(mut job) => {
++                let _=dequeue_job(&mut job,queue,control_owner);
+                 job.reject(status, message);
+                 refused += 1;
+             }
+@@ -2224,6 +2427,7 @@
+     model_dir: &Path,
+     options: ServeOptions,
+     signals: signal::Signals,
++    control_init:Option<(mtp2_control::Control,mtp2_control::EngineAuthority)>,
+ ) -> Result<()> {
+     let address = options
+         .bind
+@@ -2306,6 +2510,7 @@
+     let (jobs, job_rx) = mpsc::sync_channel::<Cmd>(queue.capacity());
+     let lifecycle = Arc::new(Lifecycle::new(State::Loading));
+     let shutdown = Arc::new(Shutdown::default());
++    let (control,authority)=match control_init {Some((c,a))=>(Some(Arc::new(c)),Some(a)),None=>(None,None)};
+     let shared = Shared {
+         generator,
+         shutdown: shutdown.clone(),
+@@ -2315,6 +2520,7 @@
+         weight_loads: if options.liliuxflow_mtp2_shared_context {
+             Some(Arc::new(mtp2::WeightLoads::new()?))
+         } else { None },
++        control,
+     };
+     let engine_thread = {
+         let model_dir = model_dir.to_path_buf();
+@@ -2326,6 +2532,7 @@
+             .spawn(move || {
+                 engine_loop::<M>(
+                     &model_dir, &options, shared, job_rx, &lifecycle, address,
++                    authority,
+                 )
+             })
+             .context("spawning the engine thread")?
+@@ -2426,6 +2633,16 @@
+         front.lifecycle.get()
+     };
+     match (request.method.as_str(), path.as_str()) {
++        ("POST","/_liliuxflow/mtp2/state"|"/_liliuxflow/mtp2/status"|"/_liliuxflow/mtp2/cancel")
++            if front.shared.control.is_some() => {
++            let control=front.shared.control.as_ref().expect("guarded");
++            let reply=control.authenticate(&request.method,&request.path,&request.headers,now())
++                .and_then(|e|control.private_reply(&e,&request.body,now()));
++            match reply {
++                Ok(reply)=>{let _=http::respond_control(stream,reply);}
++                Err(_)=>refuse(stream,"mtp2 control",400,"invalid_request_error","mtp2_control_rejected"),
++            }
++        }
+         ("GET", "/health") => {
+             let (code, status) = state.health();
+             send_json(
+@@ -2458,6 +2675,19 @@
+             }),
+         ),
+         ("POST", "/v1/chat/completions" | "/v1/completions") => {
++            let mut control_admission=if let Some(control)=&front.shared.control {
++                let admitted=control.authenticate(&request.method,&request.path,&request.headers,now())
++                    .and_then(|e|{
++                        let profile=e.profile_id()?;let (token,cancelled)=control.register(&e,now())?;
++                        Ok((token,cancelled,profile))
++                    });
++                match admitted {
++                    Ok((token,cancelled,expected_profile))=>Some(CpuAdmissionGuard{control:control.clone(),token,
++                        queue:front.shared.queue.clone(),jobs:front.jobs.clone(),cancelled,expected_profile,
++                        reserved:false,ever_reserved:false,acquired:false,scope:None,session_started:false,session_disposed:true}),
++                    Err(_)=>{refuse(stream,"mtp2 admission",400,"invalid_request_error","mtp2_control_admission_rejected");return;}
++                }
++            } else {None};
+             // A generated identifier only; no caller-supplied data enters it.
+             let request_id = format!(
+                 "req-{}-{}", now(), front.request_sequence.fetch_add(1, Ordering::Relaxed)
+@@ -2466,7 +2696,9 @@
+             // runs meanwhile. Only a loaded engine has a GPU to wake; a busy
+             // one takes the message after its request, a no-op then.
+             let queue = &front.shared.queue;
+-            if state == State::Ready
++            // Shared control preparation is strictly CPU-only: a rejected
++            // body must not enqueue even the original queue-level GPU wake.
++            if front.shared.control.is_none() && state == State::Ready
+                 && queue.claim_arrival()
+                 && front.jobs.try_send(Cmd::Arrival).is_err()
+             {
+@@ -2502,16 +2734,24 @@
+             let mut prepared = match prepared {
+                 Ok(p) => p,
+                 Err(error) => {
++                    drop(control_admission.take()); // Pending owner receipt before response I/O.
+                     refuse(
+                         stream,
+                         &what,
+                         400,
+                         "invalid_request_error",
+-                        format!("{error:#}"),
++                        if front.shared.control.is_some(){"mtp2_control_preparation_rejected".to_owned()}
++                        else {format!("{error:#}")},
+                     );
+                     return;
+                 }
+             };
++            if let Some(guard)=&control_admission {
++                if prepared.mtp2_policy.map(|p|p.profile().id())!=Some(guard.expected_profile) {
++                    drop(prepared);drop(control_admission.take());
++                    refuse(stream,"mtp2 profile",400,"invalid_request_error","mtp2_control_profile_binding");return;
++                }
++            }
+             prepared.prepare_secs = prepare_started.elapsed().as_secs_f64();
+             if let Some(asked) = prepared.clamped_from {
+                 eprintln!(
+@@ -2524,6 +2764,7 @@
+             }
+             match state {
+                 State::Stopping => {
++                    if control_admission.is_some(){drop(prepared);drop(control_admission.take());}
+                     refuse(
+                         stream,
+                         &what,
+@@ -2534,6 +2775,7 @@
+                     return;
+                 }
+                 State::Loading => {
++                    if control_admission.is_some(){drop(prepared);drop(control_admission.take());}
+                     refuse(
+                         stream,
+                         &what,
+@@ -2546,16 +2788,21 @@
+                 State::Ready | State::Idle | State::Reloading | State::Recovering => {}
+             }
+             let (tx, rx) = mpsc::channel();
+-            let cancelled = Arc::new(AtomicBool::new(false));
++            let cancelled = control_admission.as_ref().map_or_else(||Arc::new(AtomicBool::new(false)),|g|g.cancelled.clone());
++            if let Some(guard)=control_admission.as_mut() {
++                if guard.publish().is_err() {drop(prepared);drop(control_admission.take());
++                    refuse(stream,"mtp2 queue",503,"server_error","mtp2_control_queue_rejected");return;}
++            }
+             let job = Job {
+                 prepared,
+                 sink: Sink {
+                     tx, cancelled: cancelled.clone(), started: false,
+                     metadata: RequestMeta::new(request_id.clone()),
++                    control_admission,
+                 },
+                 queued_at: Instant::now(),
+             };
+-            if !queue.admit() {
++            if job.sink.control_admission.is_none() && !queue.admit() {
+                 refuse(
+                     stream,
+                     &what,
+@@ -2570,8 +2817,9 @@
+             eprintln!("[lily-meta] request_id={request_id} phase=queue_enter");
+             match front.jobs.try_send(Cmd::Job(Box::new(job))) {
+                 Ok(()) => relay(stream, request.http11, rx, cancelled),
+-                Err(TrySendError::Full(_)) => {
+-                    queue.left();
++                Err(TrySendError::Full(failed)) => {
++                    if front.shared.control.is_none(){queue.left();}
++                    else {drop(failed);} // Actual prepared/sink disposal precedes socket I/O.
+                     eprintln!("{}", queue_rejection_line(&request_id, 503));
+                     refuse(
+                         stream,
+@@ -2581,8 +2829,9 @@
+                         "the request queue is full; retry later",
+                     );
+                 }
+-                Err(TrySendError::Disconnected(_)) => {
+-                    queue.left();
++                Err(TrySendError::Disconnected(failed)) => {
++                    if front.shared.control.is_none(){queue.left();}
++                    else {drop(failed);}
+                     eprintln!("{}", queue_rejection_line(&request_id, 500));
+                     refuse(stream, &what, 500, "server_error", "engine stopped");
+                 }
+diff --git a/src/serve/batch.rs b/src/serve/batch.rs
+--- a/src/serve/batch.rs
++++ b/src/serve/batch.rs
+@@ -531,7 +531,8 @@
+     ) -> Result<usize> {
+         let mut fed = 0;
+         while fed < tokens.len() {
+-            if self.rows.is_empty() {
++            engine.control_pump()?;
++            if self.rows.is_empty() && engine.control.is_none() {
+                 fed += engine.model.prefill_until_with_progress(
+                     &engine.ctx,
+                     &mut session.state,
+@@ -557,6 +558,7 @@
+                 on_completed_chunk,
+             )?;
+             fed += chunk;
++            engine.control_pump()?;
+             if chunk == 0 || stop() {
+                 break;
+             }
+@@ -620,11 +622,14 @@
+         let mut slots = Slots::new(self.max_batch);
+         let mut held = Some(first);
+         let mut seq = 0u64;
++        let pending_control=self.control.clone();
+         while self.ctx.fault().is_none() {
++            let _=self.control_pump(); // Previous full speculative quantum settled.
+             if held.is_none() && rows.len() < self.max_batch {
+                 held = self.next_job(rx, queue);
+             }
+             if let Some(job) = held.take() {
++                if self.control_before_resources(&job).is_err() {job.reject(503,"mtp2_control_epoch_or_state");continue;}
+                 if self.fits(&job, &rows) {
+                     seq += 1;
+                     self.start_row(job, seq, &generator, &mut rows, &mut slots);
+@@ -641,7 +646,8 @@
+                 Next::Solo { preempt } => {
+                     if self.mtp2_residency.is_some() {
+                         self.step_mtp2_rows(&generator, &mut rows, &mut slots, 0,
+-                            usize::MAX, &|| preempt && queue.has_waiting());
++                            usize::MAX, &|| preempt && queue.has_waiting()
++                                || pending_control.as_ref().is_some_and(|c|c.has_pending_cpu()));
+                     } else { self.run_solo(&generator, &mut rows, &mut slots, preempt, queue) }
+                 }
+                 Next::Step => {
+@@ -653,7 +659,8 @@
+                     let admission = || can_admit && queue.has_waiting();
+                     if self.mtp2_residency.is_some() {
+                         self.step_mtp2_rows(&generator, &mut rows, &mut slots, 0,
+-                            super::mtp2::QUANTUM_STEPS, &admission);
++                            super::mtp2::QUANTUM_STEPS, &||admission()
++                                || pending_control.as_ref().is_some_and(|c|c.has_pending_cpu()));
+                     } else { self.step_rows(
+                         &generator,
+                         &mut rows,
+@@ -692,8 +699,10 @@
+     fn next_job(&self, rx: &Receiver<Cmd>, queue: &EngineQueue) -> Option<Job> {
+         loop {
+             match rx.try_recv() {
+-                Ok(Cmd::Job(job)) => {
+-                    queue.left();
++                Ok(Cmd::Job(mut job)) => {
++                    if super::dequeue_job(&mut job,queue,self.control_owner.as_ref()).is_err() {
++                        job.reject(503,"mtp2_control_queue_ownership");continue;
++                    }
+                     if self.shutdown.requested() {
+                         job.reject(503, "the server is shutting down");
+                         continue;
+@@ -728,6 +737,7 @@
+     }
+ 
+     fn fits(&mut self, job: &Job, rows: &[Row<'_, M>]) -> bool {
++        if self.control_before_resources(job).is_err() {return false;}
+         if self.mtp2_residency.is_some() {
+             let Ok(incoming) = self.reservation(&job.prepared) else { return false };
+             let active = Self::in_flight(rows);
+@@ -1180,10 +1190,14 @@
+         fault: Option<&str>,
+         error: &anyhow::Error,
+     ) {
+-        let Row { sink, req, slot, in_flight, .. } = row;
++        let Row { mut sink, req, slot, in_flight, continuation, .. } = row;
+         slots.give(slot);
+         let stream = req.p.stream;
++        drop(continuation);
+         drop(req);
++        // The quantum/prefill returned before fail_row; pass locals are gone.
++        // The row's continuation and Session are now explicitly gone too.
++        if fault.is_none(){let _=self.control_session_disposed(&mut sink);}
+         self.close(sink, in_flight, stream, Ending::FailedUnder(error, fault));
+     }
+ 
+@@ -1201,13 +1215,14 @@
+         rows: &mut Vec<Row<'g, M>>,
+         slots: &mut Slots,
+     ) {
++        if self.control_before_resources(&job).is_err(){job.reject(503,"mtp2_control_epoch_or_state");return;}
+         let reserved_new_bytes = if self.mtp2_residency.is_some() {
+             match self.reservation(&job.prepared) {
+                 Ok(bytes) => bytes,
+                 Err(_) => { job.reject(503, "shared MTP2 reservation is unavailable"); return; }
+             }
+         } else { 0 };
+-        let Opened { p, mut sink, in_flight, queued } = self.open(job);
++        let Opened { p, mut sink, in_flight, queued } = match self.open(job) {Ok(opened)=>opened,Err(_)=>return};
+         let stream = p.stream;
+         if sink.cancelled() {
+             self.close(sink, in_flight, stream, Ending::Answered);
+@@ -1229,16 +1244,22 @@
+             Ok(Some(req)) => req,
+             // Answered: its prefill was stopped (see `Engine::admit`).
+             Ok(None) => {
++                // admit returned without an Admitted: local Session was either
++                // dropped or returned to the inactive resident cache.
++                let _=self.control_session_disposed(&mut sink);
+                 self.close(sink, in_flight, stream, Ending::Answered);
+                 return;
+             }
+             Err(error) => {
++                // All admission locals have unwound before this owner marker.
++                let _=self.control_session_disposed(&mut sink);
+                 self.close(sink, in_flight, stream, Ending::Failed(&error));
+                 return;
+             }
+         };
+         if sink.cancelled() {
+             drop(req);
++            let _=self.control_session_disposed(&mut sink);
+             self.close(sink, in_flight, stream, Ending::Answered);
+             return;
+         }
+@@ -1267,6 +1288,7 @@
+             Ok(drawn) => drawn,
+             Err(error) => {
+                 drop(req);
++                let _=self.control_session_disposed(&mut sink);
+                 self.close(sink, in_flight, stream, Ending::Failed(&error));
+                 return;
+             }
+@@ -1354,8 +1376,10 @@
+         }
+         if let Err(error) = taken {
+             slots.give(slot);
+-            let Row { req, sink, in_flight, .. } = row;
++            let Row { req, mut sink, in_flight, continuation, .. } = row;
++            drop(continuation);
+             drop(req);
++            let _=self.control_session_disposed(&mut sink);
+             self.close(sink, in_flight, stream, Ending::Failed(&error));
+             return;
+         }
+@@ -1390,6 +1414,7 @@
+             accepted,
+             stats,
+             finish,
++            continuation,
+             ..
+         } = row;
+         slots.give(slot);
+@@ -1402,7 +1427,12 @@
+             started: decode_started,
+             batch: Some(&stats),
+         };
++        drop(continuation);
+         let result = self.answer(req, &mut sink, decoded, in_flight_others);
++        // answer consumed Admitted: Session has been dropped or returned to
++        // the inactive cache even if validation unwound with an error.
++        let disposal=self.control_session_disposed(&mut sink);
++        let result=result.and(disposal);
+         let ending = match &result {
+             Ok(()) => Ending::Answered,
+             Err(error) => Ending::Failed(error),
+diff --git a/src/serve/http.rs b/src/serve/http.rs
+--- a/src/serve/http.rs
++++ b/src/serve/http.rs
+@@ -143,6 +143,19 @@
+     stream.flush().ok();
+     stream.shutdown(Shutdown::Both).ok();
+     Ok(())
++}
++
++/// Fixed native-control reply only. Extra values are MAC/epoch/challenge
++/// generated by the authenticated control module, not caller header text.
++pub(super) fn respond_control(mut stream: TcpStream, reply: super::mtp2_control::SignedReply) -> Result<()> {
++    let length=reply.body.len().to_string();
++    let mut extra=vec![("Content-Length",length.as_str())];
++    for (name,value) in &reply.headers {
++        if *name!="Content-Type" {extra.push((*name,value.as_str()));}
++    }
++    stream.write_all(head(reply.status,"application/json",&extra).as_bytes()).context("writing control head")?;
++    stream.write_all(&reply.body).context("writing control body")?;
++    stream.flush().ok();stream.shutdown(Shutdown::Both).ok();Ok(())
+ }
+ 
+ /// How long a probe waits for the peer's reset before it takes the
+diff --git a/src/serve/mtp2_control.rs b/src/serve/mtp2_control.rs
+new file mode 100644
+--- /dev/null
++++ b/src/serve/mtp2_control.rs
+@@ -0,0 +1,716 @@
++// SPDX-License-Identifier: Apache-2.0
++//! Staged, unwired MTP2-only native control v1. No socket, model, GPU or env I/O.
++//! `Control` may be shared with HTTP threads. The separately returned authority
++//! moves to the sole engine thread; it is not Clone/Sync or obtainable from Control.
++//! Callers must retain exact process/port/lease ownership checks. This module does
++//! not prove those facts or infer cleanup from response completion.
++
++use std::cell::Cell;
++use std::collections::{HashMap, HashSet, VecDeque};
++use std::ffi::c_void;
++use std::sync::{Arc, Mutex, MutexGuard};
++use std::sync::atomic::{AtomicBool, Ordering, compiler_fence};
++use serde::Deserialize;
++use serde_json::{Value, json};
++use crate::sha256::{hex, sha256};
++
++const REQUEST_DOMAIN: &[u8] = b"LiliuxFlow/MTP2/native-request/v1\0";
++const RESPONSE_DOMAIN: &[u8] = b"LiliuxFlow/MTP2/native-response/v1\0";
++const MAX_INT: u64 = (1u64 << 53) - 1;
++const MAX_TTL: u64 = 30;
++const MAX_LIVE: usize = 8; // fixed queue4 + active2 + preparation2
++const MAX_RECENT: usize = 128;
++const RECENT_TTL: u64 = 120;
++const MAX_NONCES: usize = 4096;
++const MAX_RESPONSE: usize = 32768;
++const PREFIX: &str = "x-liliuxflow-control-";
++const REQUEST_FIELDS: [&str; 12] = ["version", "operation", "epoch", "nonce", "tenant",
++    "alias", "profile", "challenge", "issued", "expires", "body-sha256", "mac"];
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Error { Key, Header, Frame, Mac, Expiry, Epoch, Body, Schema, Capacity,
++    Replay, Origin, Transition, Unknown, Poisoned, Counter, Platform, Store }
++impl std::fmt::Display for Error {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "mtp2_control_{:?}", self)
++    }
++}
++impl std::error::Error for Error {}
++type Result<T> = std::result::Result<T, Error>;
++
++#[cfg(target_os = "macos")]
++#[link(name = "System")]
++unsafe extern "C" {
++    fn CCHmac(algorithm: u32, key: *const c_void, key_len: usize,
++        data: *const c_void, data_len: usize, out: *mut c_void);
++    fn timingsafe_bcmp(a: *const c_void, b: *const c_void, len: usize) -> i32;
++}
++fn mac(key: &[u8], data: &[u8]) -> Result<[u8; 32]> {
++    #[cfg(target_os = "macos")]
++    { let mut out = [0; 32];
++      // SDK: uint32_t algorithm2/SHA256, size_t lengths, caller-owned32B output.
++      unsafe { CCHmac(2, key.as_ptr().cast(), key.len(), data.as_ptr().cast(), data.len(), out.as_mut_ptr().cast()); }
++      Ok(out) }
++    #[cfg(not(target_os = "macos"))]
++    { let _ = (key, data); Err(Error::Platform) }
++}
++fn equal_mac(a: &[u8; 32], b: &[u8; 32]) -> Result<bool> {
++    #[cfg(target_os = "macos")]
++    { Ok(unsafe { timingsafe_bcmp(a.as_ptr().cast(), b.as_ptr().cast(), 32) == 0 }) }
++    #[cfg(not(target_os = "macos"))]
++    { let _ = (a, b); Err(Error::Platform) }
++}
++fn decode<const N: usize>(text: &str) -> Result<[u8; N]> {
++    if text.len() != 2 * N { return Err(Error::Frame); }
++    let digit = |b| match b { b'0'..=b'9' => Ok(b - b'0'), b'a'..=b'f' => Ok(b - b'a' + 10), _ => Err(Error::Frame) };
++    let mut out = [0; N];
++    for (i, pair) in text.as_bytes().chunks_exact(2).enumerate() { out[i] = digit(pair[0])? * 16 + digit(pair[1])?; }
++    Ok(out)
++}
++pub(super) struct Key([u8; 32]); // No Debug/Clone/Serialize; never retain an env string.
++impl Key {
++    pub(super) fn from_hex(text: &str) -> Result<Self> { decode(text).map(Self).map_err(|_| Error::Key) }
++}
++impl Drop for Key {
++    fn drop(&mut self) {
++        for byte in &mut self.0 { unsafe { std::ptr::write_volatile(byte, 0); } }
++        compiler_fence(Ordering::SeqCst);
++    }
++}
++fn lp(domain: &[u8], values: &[&str]) -> Result<Vec<u8>> {
++    let mut out = domain.to_vec();
++    for value in values {
++        if value.len() > u16::MAX as usize || !value.bytes().all(|b| (0x21..=0x7e).contains(&b)) { return Err(Error::Frame); }
++        out.extend_from_slice(&(value.len() as u16).to_be_bytes()); out.extend_from_slice(value.as_bytes());
++    }
++    Ok(out)
++}
++fn decimal(text: &str) -> Result<u64> {
++    if text.is_empty() || text.len() > 16 || (text.len() > 1 && text.starts_with('0')) || !text.bytes().all(|b| b.is_ascii_digit()) { return Err(Error::Frame); }
++    let value = text.parse::<u64>().map_err(|_| Error::Frame)?;
++    if value > MAX_INT { return Err(Error::Frame); } Ok(value)
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(super) struct TenantScope([u8; 32]); // No diagnostic/JSON representation.
++impl TenantScope { pub(super) fn parse(text: &str) -> Result<Self> { decode(text).map(Self) } }
++#[derive(Clone, Copy, PartialEq, Eq, Hash)]
++struct Epoch([u8; 32]);
++impl Epoch { fn parse(text: &str) -> Result<Self> { decode(text).map(Self) } fn text(self) -> String { hex(&self.0) } }
++#[derive(Clone, Copy, PartialEq, Eq, Hash)]
++struct Nonce([u8; 16]);
++impl Nonce { fn parse(text: &str) -> Result<Self> { decode(text).map(Self) } fn text(self) -> String { hex(&self.0) } }
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Profile { C64, C128, C262 }
++impl Profile {
++    fn parse(id: &str, alias: &str) -> Result<Self> {
++        for p in [Self::C64, Self::C128, Self::C262] { if p.id() == id && p.alias() == alias { return Ok(p); } }
++        Err(Error::Frame)
++    }
++    fn id(self) -> &'static str { match self { Self::C64 => "ctx64k-mtp2", Self::C128 => "ctx128k-mtp2", Self::C262 => "ctx262k-mtp2" } }
++    fn alias(self) -> &'static str { match self { Self::C64 => "qwen3.8-flash-next-lily-q4-mtp2-64k", Self::C128 => "qwen3.8-flash-next-lily-q4-mtp2-128k", Self::C262 => "qwen3.8-flash-next-lily-q4-mtp2-262k" } }
++}
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(super) enum Operation { Infer, State, Status, Cancel }
++impl Operation {
++    fn parse(op: &str, target: &str) -> Result<Self> {
++        match (op, target) {
++            ("infer", "/v1/chat/completions" | "/v1/completions") => Ok(Self::Infer),
++            ("state", "/_liliuxflow/mtp2/state") => Ok(Self::State),
++            ("status", "/_liliuxflow/mtp2/status") => Ok(Self::Status),
++            ("cancel", "/_liliuxflow/mtp2/cancel") => Ok(Self::Cancel), _ => Err(Error::Frame),
++        }
++    }
++    fn text(self) -> &'static str { match self { Self::Infer => "infer", Self::State => "state", Self::Status => "status", Self::Cancel => "cancel" } }
++}
++struct Identity { epoch: Epoch, nonce: Nonce, tenant: TenantScope, profile: Profile }
++pub(super) struct Envelope { origin: Arc<()>, operation: Operation, target: String,
++    epoch: Option<Epoch>, identity: Option<Identity>, challenge: String, issued: u64, expires: u64,
++    body_sha: Option<[u8; 32]>, frame_sha: [u8; 32] }
++impl Envelope {
++    pub(super) fn operation(&self) -> Operation { self.operation }
++    pub(super) fn tenant_scope(&self) -> Result<TenantScope> { self.identity.as_ref().map(|i| i.tenant).ok_or(Error::Origin) }
++    pub(super) fn profile_id(&self) -> Result<&'static str> { self.identity.as_ref().map(|i| i.profile.id()).ok_or(Error::Origin) }
++}
++pub(super) struct EngineAuthority { origin: Arc<()>, _not_sync: Cell<()> } // Not Clone/Sync.
++#[derive(Clone)]
++pub(super) struct RequestToken { origin: Arc<()>, epoch: Epoch, nonce: Nonce }
++impl RequestToken { pub(super) fn nonce_hex(&self) -> String { self.nonce.text() } }
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Phase { Preparing, Queued, Acquired, Cleanup, Released, Zero, Faulted }
++impl Phase {
++    fn text(self) -> &'static str { match self { Self::Preparing => "preparing", Self::Queued => "queued", Self::Acquired => "acquired", Self::Cleanup => "cleanup", Self::Released => "released", Self::Zero => "rejected_without_native_state", Self::Faulted => "faulted" } }
++    fn terminal(self) -> bool { matches!(self, Self::Released | Self::Zero) }
++}
++struct Row { epoch: Epoch, nonce: Nonce, tenant: TenantScope, profile: Profile, phase: Phase,
++    revision: u64, acquired: u8, released: u8, cancel: Arc<AtomicBool>,
++    reserved: bool, queue_returned: bool, job_disposed: bool,
++    pin_ever: bool, pin_live: bool, session_ever: bool, session_live: bool,
++    gpu_ever: bool, gpu_unsettled: bool, faulted: bool,
++    pending_cpu_disposal: Option<CpuDisposal> }
++impl Row {
++    fn snapshot(&self) -> Value {
++        let mut out = json!({"nonce":self.nonce.text(),"alias":self.profile.alias(),"profile":self.profile.id(),
++            "phase":self.phase.text(),"revision":self.revision,"acquired":self.acquired,"released":self.released});
++        if self.phase == Phase::Released {
++            out["proof"] = json!({"registered":true,"queue_reservation_returned":true,"job_disposed":true,
++                "session_disposed":true,"pin_released":true,"gpu_fault":false});
++        } else if self.phase == Phase::Zero {
++            out["proof"] = json!({"registered":true,"engine_acquired":false,"pin_acquired":false,
++                "session_acquired":false,"gpu_work_started":false,"queue_reservation_returned":true,"job_disposed":true});
++        }
++        out
++    }
++}
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum RuntimeState { Loading, Ready, Retiring, Faulted }
++impl RuntimeState { fn text(self) -> &'static str { match self { Self::Loading => "loading", Self::Ready => "ready", Self::Retiring => "retiring", Self::Faulted => "faulted" } } }
++/// Actual engine-side observation, never decoded from a caller or header.
++/// Future integration reads these from options/SessionStore BEFORE publication
++/// and each scoped store operation. Authority is required to accept them.
++#[derive(Clone, Copy)]
++pub(super) struct CacheInvariantObservation {
++    pub(super) disk_bytes: u64, pub(super) disk_attached: bool, pub(super) writing: bool,
++    pub(super) durable_min_tokens: usize, pub(super) write_ahead_enabled: bool,
++}
++impl CacheInvariantObservation {
++    fn check(self) -> Result<Self> {
++        if self.disk_bytes != 0 || self.disk_attached || self.writing
++            || self.durable_min_tokens != 0 || self.write_ahead_enabled { return Err(Error::Store); }
++        Ok(self)
++    }
++    fn snapshot(self) -> Value {
++        json!({"disk_bytes":self.disk_bytes,"disk_attached":self.disk_attached,"writing":self.writing,
++            "durable_min_tokens":self.durable_min_tokens,"write_ahead_enabled":self.write_ahead_enabled})
++    }
++}
++struct Ledger { epoch: Option<Epoch>, state: RuntimeState, revision: u64, cache: Option<CacheInvariantObservation>,
++    live: HashMap<(Epoch, Nonce), Row>, recent: VecDeque<(u64, Row)>, seen: HashMap<Nonce, u64> }
++impl Ledger {
++    fn bump(&mut self) -> Result<u64> { self.revision = self.revision.checked_add(1).filter(|n| *n <= MAX_INT).ok_or(Error::Counter)?; Ok(self.revision) }
++    fn prune(&mut self, now: u64) {
++        self.seen.retain(|_, until| *until > now);
++        while self.recent.front().is_some_and(|(until, _)| *until <= now) { self.recent.pop_front(); }
++    }
++    fn finish(&mut self, key: (Epoch, Nonce), now: u64) -> Result<()> {
++        let row = self.live.remove(&key).ok_or(Error::Unknown)?;
++        if !row.phase.terminal() { self.live.insert(key, row); return Err(Error::Transition); }
++        if self.recent.len() == MAX_RECENT { self.recent.pop_front(); }
++        self.recent.push_back((now.saturating_add(RECENT_TTL), row)); Ok(())
++    }
++}
++pub(super) struct Control { key: Key, origin: Arc<()>, ledger: Mutex<Ledger>, pending_cpu: AtomicBool }
++pub(super) struct SignedReply { pub(super) status: u16, pub(super) headers: Vec<(&'static str, String)>, pub(super) body: Vec<u8> } // No Debug.
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct EmptyBody {}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct StatusBody { v: u64, epoch: String, requests: Vec<String> }
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct CancelBody { v: u64, epoch: String, nonce: String }
++
++impl Control {
++    pub(super) fn new(key: Key) -> (Self, EngineAuthority) {
++        let origin = Arc::new(());
++        let owner = EngineAuthority { origin: origin.clone(), _not_sync: Cell::new(()) };
++        (Self { key, origin, pending_cpu: AtomicBool::new(false), ledger: Mutex::new(Ledger { epoch: None, state: RuntimeState::Loading,
++            revision: 0, cache: None, live: HashMap::new(), recent: VecDeque::new(), seen: HashMap::new() }) }, owner)
++    }
++    fn lock(&self) -> Result<MutexGuard<'_, Ledger>> { self.ledger.lock().map_err(|_| Error::Poisoned) }
++    fn owner(&self, owner: &mut EngineAuthority) -> Result<()> { if Arc::ptr_eq(&self.origin, &owner.origin) { Ok(()) } else { Err(Error::Origin) } }
++    fn envelope(&self, envelope: &Envelope) -> Result<()> { if Arc::ptr_eq(&self.origin, &envelope.origin) { Ok(()) } else { Err(Error::Origin) } }
++    fn token(&self, token: &RequestToken) -> Result<(Epoch, Nonce)> { if Arc::ptr_eq(&self.origin, &token.origin) { Ok((token.epoch, token.nonce)) } else { Err(Error::Origin) } }
++
++    /// Header authentication only. Register inference immediately, before body
++    /// parsing/tokenization/wake. Register consumes once; later gates do NOT
++    /// recheck this authorization expiry or conflate it with generation time.
++    pub(super) fn authenticate(&self, method: &str, target: &str, headers: &[(String, String)], now: u64) -> Result<Envelope> {
++        if method != "POST" || now > MAX_INT { return Err(Error::Frame); }
++        let mut reserved = HashMap::new();
++        for (name, value) in headers {
++            let name = name.to_ascii_lowercase();
++            if !name.starts_with("x-liliuxflow-") { continue; }
++            let field = name.strip_prefix(PREFIX).ok_or(Error::Header)?;
++            if !REQUEST_FIELDS.contains(&field) || reserved.insert(field.to_owned(), value.as_str()).is_some()
++                || value.len() > 65535 || !value.bytes().all(|b| (0x21..=0x7e).contains(&b)) { return Err(Error::Header); }
++        }
++        if reserved.len() != REQUEST_FIELDS.len() || reserved.get("version") != Some(&"1") { return Err(Error::Header); }
++        let get = |field: &str| reserved.get(field).copied().ok_or(Error::Header);
++        let operation = Operation::parse(get("operation")?, target)?;
++        let epoch = if operation == Operation::State && get("epoch")? == "" { None } else { Some(Epoch::parse(get("epoch")?)?) };
++        let identity = if matches!(operation, Operation::Infer | Operation::Cancel) {
++            Some(Identity { epoch: epoch.ok_or(Error::Epoch)?, nonce: Nonce::parse(get("nonce")?)?,
++                tenant: TenantScope::parse(get("tenant")?)?, profile: Profile::parse(get("profile")?, get("alias")?)? })
++        } else {
++            if ["nonce", "tenant", "alias", "profile"].iter().any(|f| get(f).is_ok_and(|v| !v.is_empty())) { return Err(Error::Frame); } None
++        };
++        let challenge = get("challenge")?; decode::<16>(challenge)?;
++        let issued = decimal(get("issued")?)?; let expires = decimal(get("expires")?)?;
++        if issued > now || now - issued > MAX_TTL || issued >= expires || expires - issued > MAX_TTL || now >= expires { return Err(Error::Expiry); }
++        let body_sha = if operation == Operation::Infer { if get("body-sha256")? != "-" { return Err(Error::Frame); } None }
++            else { Some(decode(get("body-sha256")?)?) };
++        let frame = lp(REQUEST_DOMAIN, &[get("operation")?, method, target, get("epoch")?, get("nonce")?,
++            get("tenant")?, get("alias")?, get("profile")?, challenge, get("issued")?, get("expires")?, get("body-sha256")?])?;
++        let supplied = decode(get("mac")?)?;
++        if !equal_mac(&supplied, &mac(&self.key.0, &frame)?)? { return Err(Error::Mac); }
++        Ok(Envelope { origin: self.origin.clone(), operation, target: target.to_owned(), epoch, identity,
++            challenge: challenge.to_owned(), issued, expires, body_sha, frame_sha: sha256(&frame) })
++    }
++
++    pub(super) fn publish_epoch(&self, owner: &mut EngineAuthority, allocation_id: &str,
++        observation: CacheInvariantObservation) -> Result<()> {
++        self.owner(owner)?; let observation = observation.check()?;
++        let epoch = Epoch::parse(allocation_id)?; let mut l = self.lock()?;
++        if l.state == RuntimeState::Ready || l.epoch == Some(epoch) { return Err(Error::Transition); }
++        l.bump()?; l.epoch = Some(epoch); l.cache = Some(observation); l.state = RuntimeState::Ready; Ok(())
++    }
++    /// Called from the engine's concrete store invariant check. Failure removes
++    /// cache evidence and faults ownership; no false disk0 state is published.
++    pub(super) fn observe_cache(&self, owner: &mut EngineAuthority, observation: CacheInvariantObservation) -> Result<()> {
++        self.owner(owner)?;
++        match observation.check() {
++            Ok(valid) => { let mut l=self.lock()?; l.cache=Some(valid); Ok(()) }
++            Err(error) => { self.retire_epoch(owner)?; let mut l=self.lock()?;
++                l.cache=None; l.state=RuntimeState::Faulted; Err(error) }
++        }
++    }
++    /// Same lock as registration. Revoke every old nonterminal row BEFORE
++    /// unloading the engine. Never claim those requests released.
++    pub(super) fn retire_epoch(&self, owner: &mut EngineAuthority) -> Result<()> {
++        self.owner(owner)?; let mut l = self.lock()?; let revision = l.bump()?;
++        l.state = RuntimeState::Retiring; l.cache=None;
++        for row in l.live.values_mut() { row.phase = Phase::Faulted; row.faulted = true; row.revision = revision; row.cancel.store(true, Ordering::Release); }
++        Ok(())
++    }
++    pub(super) fn register(&self, e: &Envelope, now: u64) -> Result<(RequestToken, Arc<AtomicBool>)> {
++        self.envelope(e)?; if e.operation != Operation::Infer || now > MAX_INT || now < e.issued || now >= e.expires { return Err(Error::Expiry); }
++        let i = e.identity.as_ref().ok_or(Error::Origin)?; let mut l = self.lock()?; l.prune(now);
++        if l.state != RuntimeState::Ready || l.epoch != Some(i.epoch) { return Err(Error::Epoch); }
++        if l.cache.is_none() { return Err(Error::Store); }
++        if l.seen.contains_key(&i.nonce) || l.live.keys().any(|(_, n)| *n == i.nonce) { return Err(Error::Replay); }
++        if l.live.len() >= MAX_LIVE || l.seen.len() >= MAX_NONCES { return Err(Error::Capacity); }
++        let revision = l.bump()?; let cancel = Arc::new(AtomicBool::new(false));
++        l.seen.insert(i.nonce, e.expires);
++        l.live.insert((i.epoch, i.nonce), Row { epoch: i.epoch, nonce: i.nonce, tenant: i.tenant,
++            profile: i.profile, phase: Phase::Preparing, revision, acquired: 0, released: 0,
++            cancel: cancel.clone(), reserved: false, queue_returned: true, job_disposed: false,
++            pin_ever: false, pin_live: false, session_ever: false, session_live: false,
++            gpu_ever: false, gpu_unsettled: false, faulted: false,
++            pending_cpu_disposal: None });
++        Ok((RequestToken { origin: self.origin.clone(), epoch: i.epoch, nonce: i.nonce }, cancel))
++    }
++    /// Recheck and reserve immediately before publication. `reserve` is the
++    /// existing queue's bounded atomic admit operation, called under this lock
++    /// so retirement cannot land between the check and reservation accounting.
++    /// No socket/GPU/tokenization work is allowed in this callback. A failed
++    /// send retains this token until owner records reservation return/Job drop.
++    pub(super) fn before_publish(&self, token: &RequestToken, reserve: impl FnOnce() -> bool) -> Result<()> {
++        let key = self.token(token)?; let mut l = self.lock()?;
++        if l.state != RuntimeState::Ready || l.epoch != Some(key.0) { return Err(Error::Epoch); }
++        if l.cache.is_none() { return Err(Error::Store); }
++        let row = l.live.get(&key).ok_or(Error::Unknown)?;
++        if row.phase != Phase::Preparing || row.reserved || row.job_disposed || row.faulted
++            || row.cancel.load(Ordering::Acquire) { return Err(Error::Transition); }
++        if l.live.values().filter(|r| r.epoch == key.0 && r.phase == Phase::Queued).count() >= 4 { return Err(Error::Capacity); }
++        let revision = l.revision.checked_add(1).filter(|n| *n <= MAX_INT).ok_or(Error::Counter)?;
++        if !reserve() { return Err(Error::Capacity); }
++        l.revision = revision; let row = l.live.get_mut(&key).ok_or(Error::Unknown)?;
++        row.reserved = true; row.queue_returned = false; row.phase = Phase::Queued; row.revision = revision; Ok(())
++    }
++    pub(super) fn queue_returned(&self, owner: &mut EngineAuthority, token: &RequestToken) -> Result<()> {
++        self.owner(owner)?; let key = self.token(token)?; let mut l = self.lock()?;
++        let row = l.live.get(&key).ok_or(Error::Unknown)?;
++        if !row.reserved || row.queue_returned { return Err(Error::Transition); }
++        let revision = l.bump()?; let row = l.live.get_mut(&key).ok_or(Error::Unknown)?;
++        row.queue_returned = true; row.revision = revision; Ok(())
++    }
++    /// Engine owner calls BEFORE RequestMeta.acquire, pin, reservation, cache or
++    /// GPU work. Same owner cannot retire concurrently: authority is !Sync and
++    /// mutably borrowed. actual_epoch must come from its WeightResidency.
++    pub(super) fn before_acquire(&self, owner: &mut EngineAuthority, token: &RequestToken, actual_epoch: &str) -> Result<TenantScope> {
++        self.owner(owner)?; let key = self.token(token)?; let actual = Epoch::parse(actual_epoch)?; let mut l = self.lock()?;
++        if l.state != RuntimeState::Ready || l.epoch != Some(actual) || actual != key.0 { return Err(Error::Epoch); }
++        if l.cache.is_none() { return Err(Error::Store); }
++        let row = l.live.get(&key).ok_or(Error::Unknown)?;
++        if row.phase != Phase::Queued || !row.queue_returned || row.acquired != 0 || row.job_disposed
++            || row.faulted || row.cancel.load(Ordering::Acquire) { return Err(Error::Transition); }
++        if l.live.values().filter(|r| r.epoch == key.0 && r.acquired == 1 && !r.phase.terminal()).count() >= 2 { return Err(Error::Capacity); }
++        let revision = l.bump()?; let row = l.live.get_mut(&key).ok_or(Error::Unknown)?;
++        row.acquired = 1; row.phase = Phase::Acquired; row.revision = revision; Ok(row.tenant)
++    }
++    /// Non-mutating owner gate before capacity/reservation/trim. It does not
++    /// fabricate lane acquisition for a held job that cannot yet be admitted.
++    pub(super) fn before_native_resources(&self, owner: &mut EngineAuthority, token: &RequestToken, actual_epoch: &str) -> Result<()> {
++        self.owner(owner)?;let key=self.token(token)?;let actual=Epoch::parse(actual_epoch)?;let l=self.lock()?;
++        if l.state!=RuntimeState::Ready || l.epoch!=Some(actual) || actual!=key.0 {return Err(Error::Epoch);}
++        if l.cache.is_none() {return Err(Error::Store);}
++        let row=l.live.get(&key).ok_or(Error::Unknown)?;
++        if row.phase!=Phase::Queued || row.acquired!=0 || row.faulted || row.job_disposed
++            || row.cancel.load(Ordering::Acquire) {return Err(Error::Transition);} Ok(())
++    }
++    /// HTTP-owned RAII cleanup can only mark a pending fact. It cannot emit a
++    /// proof, change acquired/released, or own EngineAuthority. Caller supplies
++    /// the enum determined by its actual owned queue guard/drop, never JSON.
++    pub(super) fn note_cpu_disposed(&self, token: &RequestToken, fact: CpuDisposal) -> Result<()> {
++        let key=self.token(token)?;let mut l=self.lock()?;let row=l.live.get_mut(&key).ok_or(Error::Unknown)?;
++        if row.pending_cpu_disposal.is_some() || row.phase.terminal() {return Err(Error::Transition);}
++        row.pending_cpu_disposal=Some(fact);self.pending_cpu.store(true,Ordering::Release);Ok(())
++    }
++    pub(super) fn has_pending_cpu(&self) -> bool {self.pending_cpu.load(Ordering::Acquire)}
++    /// Sole engine owner pumps only at a settled full-step/chunk boundary.
++    /// Faulted/retired/ambiguous rows keep unknown ownership and no proof.
++    pub(super) fn pump_cpu_disposals(&self, owner: &mut EngineAuthority, now:u64) -> Result<()> {
++        self.owner(owner)?;if now>MAX_INT {return Err(Error::Expiry);}
++        let mut l=self.lock()?;
++        let keys:Vec<_>=l.live.iter().filter_map(|(k,r)|r.pending_cpu_disposal.map(|_|*k)).collect();
++        for key in keys {
++            let current=l.state==RuntimeState::Ready && l.epoch==Some(key.0) && l.cache.is_some();
++            let row=l.live.get_mut(&key).ok_or(Error::Unknown)?;let fact=row.pending_cpu_disposal.take().ok_or(Error::Unknown)?;
++            if !current || row.faulted || !matches!(row.phase,Phase::Preparing|Phase::Queued) || row.acquired!=0
++                || row.pin_ever || row.session_ever || row.gpu_ever {continue;}
++            let consistent=matches!(fact,CpuDisposal::NeverReserved) && !row.reserved
++                || matches!(fact,CpuDisposal::ReservationReturned) && row.reserved;
++            if !consistent {row.faulted=true;row.phase=Phase::Faulted;continue;}
++            row.queue_returned=true;row.job_disposed=true;
++            let revision=l.bump()?;let row=l.live.get_mut(&key).ok_or(Error::Unknown)?;
++            row.phase=Phase::Zero;row.revision=revision;l.finish(key,now)?;
++        }
++        self.pending_cpu.store(l.live.values().any(|r|r.pending_cpu_disposal.is_some()),Ordering::Release);Ok(())
++    }
++    fn owner_row(&self, owner: &mut EngineAuthority, token: &RequestToken, action: OwnerTransition) -> Result<()> {
++        self.owner(owner)?; let key = self.token(token)?; let mut l = self.lock()?;
++        let row = l.live.get(&key).ok_or(Error::Unknown)?;
++        if row.phase.terminal() { return Err(Error::Transition); }
++        match action {
++            OwnerTransition::PinStarted | OwnerTransition::SessionStarted | OwnerTransition::GpuStarted => {
++                if row.acquired != 1 || row.phase != Phase::Acquired || row.faulted { return Err(Error::Transition); }
++                if matches!(action,OwnerTransition::PinStarted) && row.pin_ever
++                    || matches!(action,OwnerTransition::SessionStarted) && row.session_ever { return Err(Error::Transition); }
++            }
++            OwnerTransition::Cleanup => {
++                if row.acquired != 1 || row.phase != Phase::Acquired || row.faulted { return Err(Error::Transition); }
++            }
++            OwnerTransition::PinDisposed if !row.pin_live => return Err(Error::Transition),
++            OwnerTransition::SessionDisposed if !row.session_live => return Err(Error::Transition),
++            OwnerTransition::GpuSettled => {
++                if row.acquired != 1 || !row.gpu_ever || !row.gpu_unsettled || row.faulted
++                    || !matches!(row.phase, Phase::Acquired | Phase::Cleanup) { return Err(Error::Transition); }
++            }
++            OwnerTransition::JobDisposed if row.job_disposed => return Err(Error::Transition), _ => {}
++        }
++        let revision = l.bump()?; let row = l.live.get_mut(&key).ok_or(Error::Unknown)?;
++        match action {
++            OwnerTransition::PinStarted => { row.pin_ever = true; row.pin_live = true; }
++            OwnerTransition::SessionStarted => { row.session_ever = true; row.session_live = true; }
++            OwnerTransition::GpuStarted => { row.gpu_ever = true; row.gpu_unsettled = true; }
++            OwnerTransition::GpuSettled => row.gpu_unsettled = false,
++            OwnerTransition::PinDisposed => row.pin_live = false,
++            OwnerTransition::SessionDisposed => row.session_live = false,
++            OwnerTransition::JobDisposed => row.job_disposed = true,
++            OwnerTransition::Cleanup => row.phase = Phase::Cleanup,
++        }
++        row.revision = revision; Ok(())
++    }
++    pub(super) fn owner_transition(&self, owner: &mut EngineAuthority, token: &RequestToken, action: OwnerTransition) -> Result<()> { self.owner_row(owner, token, action) }
++    pub(super) fn finish_release(&self, owner: &mut EngineAuthority, token: &RequestToken, now: u64) -> Result<()> {
++        self.owner(owner)?; if now > MAX_INT { return Err(Error::Expiry); }
++        let key = self.token(token)?; let mut l = self.lock()?;
++        if l.state!=RuntimeState::Ready || l.epoch!=Some(key.0) || l.cache.is_none() {return Err(Error::Epoch);}
++        let row = l.live.get(&key).ok_or(Error::Unknown)?;
++        if row.phase != Phase::Cleanup || row.acquired != 1 || row.released != 0 || row.faulted
++            || row.pin_live || row.session_live || row.gpu_unsettled
++            || !row.job_disposed || !row.queue_returned { return Err(Error::Transition); }
++        let revision = l.bump()?; let row = l.live.get_mut(&key).ok_or(Error::Unknown)?;
++        row.released = 1; row.phase = Phase::Released; row.revision = revision; l.finish(key, now)
++    }
++    /// Engine owner only, after actual no-Job/body-refusal or queued-Job cleanup.
++    /// No caller proof booleans are accepted. Unknown/faulted acquisition cannot
++    /// become zero-state; all tracked resource-start facts are sticky.
++    pub(super) fn finish_zero_state(&self, owner: &mut EngineAuthority, token: &RequestToken, now: u64) -> Result<()> {
++        self.owner(owner)?; if now > MAX_INT { return Err(Error::Expiry); }
++        let key = self.token(token)?; let mut l = self.lock()?;
++        if l.state!=RuntimeState::Ready || l.epoch!=Some(key.0) || l.cache.is_none() {return Err(Error::Epoch);}
++        let row = l.live.get(&key).ok_or(Error::Unknown)?;
++        if row.faulted || !matches!(row.phase,Phase::Preparing|Phase::Queued)
++            || row.acquired != 0 || row.released != 0 || row.pin_ever || row.session_ever || row.gpu_ever
++            || !row.job_disposed || !row.queue_returned { return Err(Error::Transition); }
++        let revision = l.bump()?; let row = l.live.get_mut(&key).ok_or(Error::Unknown)?;
++        row.phase = Phase::Zero; row.revision = revision; l.finish(key, now)
++    }
++    /// Only these three exact control routes are served here. No engine wake,
++    /// queue admission, lease release or tokenization occurs in this method.
++    pub(super) fn private_reply(&self, e: &Envelope, body: &[u8], now: u64) -> Result<SignedReply> {
++        self.envelope(e)?;
++        if now > MAX_INT || now < e.issued || now >= e.expires { return Err(Error::Expiry); }
++        let limit = match e.operation { Operation::State => 256, Operation::Status => 8192, Operation::Cancel => 512, Operation::Infer => return Err(Error::Frame) };
++        if body.len() > limit || body.starts_with(&[0xef, 0xbb, 0xbf]) || Some(sha256(body)) != e.body_sha { return Err(Error::Body); }
++        let (document, epoch) = {
++            let mut l = self.lock()?; l.prune(now);
++            if e.epoch.is_some() && e.epoch != l.epoch { return Err(Error::Epoch); }
++            match e.operation {
++                Operation::State => {
++                    serde_json::from_slice::<EmptyBody>(body).map_err(|_| Error::Schema)?;
++                    let cache=l.cache.ok_or(Error::Store)?.check()?;
++                    let active = l.live.values().filter(|r| Some(r.epoch) == l.epoch && r.acquired == 1).count();
++                    let pending = l.live.values().filter(|r| Some(r.epoch) == l.epoch && r.phase == Phase::Queued).count();
++                    if active > 2 || pending > 4 { return Err(Error::Transition); }
++                    (json!({"v":1,"epoch":l.epoch.map_or(String::new(), Epoch::text),"state":l.state.text(),"revision":l.revision,
++                        "active":active,"pending":pending,"cache":cache.snapshot()}), l.epoch)
++                }
++                Operation::Status => {
++                    let q: StatusBody = serde_json::from_slice(body).map_err(|_| Error::Schema)?;
++                    if q.v != 1 || Some(Epoch::parse(&q.epoch)?) != e.epoch || q.requests.is_empty() || q.requests.len() > 8 { return Err(Error::Schema); }
++                    let ids = q.requests.iter().map(|s| Nonce::parse(s)).collect::<Result<Vec<_>>>()?;
++                    if ids.iter().copied().collect::<HashSet<_>>().len() != ids.len() { return Err(Error::Schema); }
++                    let epoch = e.epoch.ok_or(Error::Epoch)?;
++                    let records: Vec<_> = ids.into_iter().map(|n| {
++                        l.live.get(&(epoch,n)).or_else(|| l.recent.iter().find(|(_,r)| r.epoch == epoch && r.nonce == n).map(|(_,r)|r))
++                            .map_or_else(|| json!({"nonce":n.text(),"phase":"unknown"}), Row::snapshot)
++                    }).collect();
++                    (json!({"v":1,"epoch":epoch.text(),"records":records}), Some(epoch))
++                }
++                Operation::Cancel => {
++                    let q: CancelBody = serde_json::from_slice(body).map_err(|_| Error::Schema)?;
++                    let i = e.identity.as_ref().ok_or(Error::Origin)?;
++                    if q.v != 1 || Epoch::parse(&q.epoch)? != i.epoch || Nonce::parse(&q.nonce)? != i.nonce { return Err(Error::Schema); }
++                    let key = (i.epoch,i.nonce);
++                    let found = l.live.get(&key).or_else(|| l.recent.iter().find(|(_,r)| (r.epoch,r.nonce)==key).map(|(_,r)|r));
++                    let (result, revision) = match found {
++                        Some(r) if r.tenant == i.tenant && r.profile == i.profile => {
++                            if r.phase.terminal() { ("already_terminal",r.revision) }
++                            else { r.cancel.store(true, Ordering::Release); ("cancel_requested",r.revision) }
++                        }, _ => ("unknown",0),
++                    };
++                    (json!({"v":1,"epoch":i.epoch.text(),"nonce":i.nonce.text(),"result":result,"revision":revision}), Some(i.epoch))
++                }
++                Operation::Infer => return Err(Error::Frame),
++            }
++        }; // Never hold ledger lock during serialization, MAC or future socket I/O.
++        let raw = serde_json::to_vec(&document).map_err(|_| Error::Schema)?;
++        self.sign_reply(e, epoch, 200, raw)
++    }
++    fn sign_reply(&self, e: &Envelope, epoch: Option<Epoch>, status: u16, body: Vec<u8>) -> Result<SignedReply> {
++        if body.len() > MAX_RESPONSE || !(100..=599).contains(&status) { return Err(Error::Body); }
++        let epoch = epoch.map_or(String::new(), Epoch::text);
++        if epoch.is_empty() && e.operation != Operation::State { return Err(Error::Epoch); }
++        let frame = lp(RESPONSE_DOMAIN, &[e.operation.text(),"POST",&e.target,&e.challenge,&hex(&e.frame_sha),
++            &epoch,&status.to_string(),&hex(&sha256(&body))])?;
++        Ok(SignedReply { status, headers: vec![("Content-Type","application/json".into()),("Cache-Control","no-store".into()),
++            ("x-liliuxflow-control-version","1".into()),("x-liliuxflow-control-challenge",e.challenge.clone()),
++            ("x-liliuxflow-control-epoch",epoch),("x-liliuxflow-control-mac",hex(&mac(&self.key.0,&frame)?))], body })
++    }
++}
++#[derive(Clone, Copy)]
++pub(super) enum OwnerTransition { PinStarted, SessionStarted, GpuStarted, Cleanup,
++    PinDisposed, SessionDisposed, GpuSettled, JobDisposed }
++#[derive(Clone, Copy)]
++pub(super) enum CpuDisposal { NeverReserved, ReservationReturned }
++
++#[cfg(test)]
++pub(in crate::serve) mod tests {
++    use super::*;
++    const KEY: &str = "2810ae8e536e31a20d90125913b66b3c89569b9dd6fcce9bbf8c0b763c03fe84";
++    const E: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
++    fn setup() -> (Control, EngineAuthority) { Control::new(Key::from_hex(KEY).unwrap()) }
++    fn store() -> CacheInvariantObservation { CacheInvariantObservation {disk_bytes:0,disk_attached:false,writing:false,durable_min_tokens:0,write_ahead_enabled:false} }
++    pub(in crate::serve) fn headers(c:&Control, op:&str, epoch:&str, nonce:&str, body:&[u8],now:u64) -> Vec<(String,String)> {
++        let target = match op { "infer"=>"/v1/chat/completions","state"=>"/_liliuxflow/mtp2/state","status"=>"/_liliuxflow/mtp2/status",_=>"/_liliuxflow/mtp2/cancel" };
++        let identity = op == "infer" || op == "cancel";
++        let values = ["1".to_owned(),op.into(),epoch.into(),if identity { nonce.into() } else { String::new() },
++            if identity { E.into() } else { String::new() },if identity { Profile::C64.alias().into() } else { String::new() },
++            if identity { Profile::C64.id().into() } else { String::new() },"c".repeat(32),now.to_string(),(now+10).to_string(),
++            if op == "infer" { "-".into() } else { hex(&sha256(body)) },String::new()];
++        let frame = lp(REQUEST_DOMAIN,&[op,"POST",target,&values[2],&values[3],&values[4],&values[5],&values[6],&values[7],&values[8],&values[9],&values[10]]).unwrap();
++        let mut h:Vec<_> = REQUEST_FIELDS.iter().zip(values).map(|(k,v)|(format!("{PREFIX}{k}"),v)).collect();
++        h[11].1=hex(&mac(&c.key.0,&frame).unwrap()); h
++    }
++    fn envelope(c:&Control, op:&str, epoch:&str, nonce:&str, body:&[u8]) -> Envelope {
++        let target = match op { "infer"=>"/v1/chat/completions","state"=>"/_liliuxflow/mtp2/state","status"=>"/_liliuxflow/mtp2/status",_=>"/_liliuxflow/mtp2/cancel" };
++        c.authenticate("POST",target,&headers(c,op,epoch,nonce,body,1000),1000).unwrap()
++    }
++    fn request(c:&Control,o:&mut EngineAuthority,n:u8)->RequestToken {
++        if c.lock().unwrap().state != RuntimeState::Ready { c.publish_epoch(o,E,store()).unwrap(); }
++        let e=envelope(c,"infer",E,&format!("{n:032x}"),b"{}"); c.register(&e,1000).unwrap().0
++    }
++    #[test] fn SDK_RFC4231_and_full_MAC_comparison() {
++        assert_eq!(hex(&mac(&[0x0b;20],b"Hi There").unwrap()),"b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
++        let a=[1;32];let mut b=a;b[31]=2;assert!(equal_mac(&a,&a).unwrap());assert!(!equal_mac(&a,&b).unwrap());
++    }
++    #[test] fn frozen_python_state_request_MAC_and_frame_sha() {
++        let (c,_)=setup();let e=envelope(&c,"state","","",b"{}");
++        assert_eq!(hex(&e.frame_sha),"8d2a22d0701b3c2c7fa46ceab385d286884944ffc5500681dfcc494ab52efafd");
++        let frame=lp(REQUEST_DOMAIN,&["state","POST","/_liliuxflow/mtp2/state","","","","","",&"c".repeat(32),"1000","1010",&hex(&sha256(b"{}"))]).unwrap();
++        assert_eq!(hex(&mac(&c.key.0,&frame).unwrap()),"c2ab2aff395460a941aa85bdd5ebf4db648f2b3ef9126ed37e8c04cbdf6e3115");
++    }
++    #[test] fn key_and_tenant_are_exact_lowercase_fixed_hex() {
++        assert!(Key::from_hex(&"A".repeat(64)).is_err());assert!(Key::from_hex(&"a".repeat(63)).is_err());
++        assert!(TenantScope::parse(E).is_ok());assert!(TenantScope::parse(&format!("{E}\n")).is_err());
++    }
++    #[test] fn different_control_origin_cannot_register_or_transition() {
++        let (a,mut ao)=setup();let (b,mut bo)=setup();a.publish_epoch(&mut ao,E,store()).unwrap();b.publish_epoch(&mut bo,E,store()).unwrap();
++        let e=envelope(&a,"infer",E,&"1".repeat(32),b"{}");assert!(matches!(b.register(&e,1000),Err(Error::Origin)));
++        assert!(matches!(a.retire_epoch(&mut bo),Err(Error::Origin)));
++    }
++    #[test] fn retirement_during_preparation_and_after_publish_blocks_acquire() {
++        for published in [false,true] { let (c,mut o)=setup();let t=request(&c,&mut o,1);
++            if published { c.before_publish(&t,||true).unwrap();c.queue_returned(&mut o,&t).unwrap(); }
++            c.retire_epoch(&mut o).unwrap();assert!(matches!(c.before_publish(&t,||true),Err(Error::Epoch)));
++            c.publish_epoch(&mut o,&"b".repeat(64),store()).unwrap();assert!(matches!(c.before_acquire(&mut o,&t,&"b".repeat(64)),Err(Error::Epoch)));
++            let l=c.lock().unwrap();assert_eq!(l.live.get(&(t.epoch,t.nonce)).unwrap().acquired,0);
++        }
++    }
++    #[test] fn replay_marker_survives_recent_eviction_until_expiry() {
++        let (c,mut o)=setup();let t=request(&c,&mut o,1);c.owner_transition(&mut o,&t,OwnerTransition::JobDisposed).unwrap();c.finish_zero_state(&mut o,&t,1000).unwrap();
++        c.lock().unwrap().recent.clear();let e=envelope(&c,"infer",E,&format!("{:032x}",1),b"{}");
++        assert!(matches!(c.register(&e,1001),Err(Error::Replay)));
++    }
++    #[test] fn expiry_does_not_end_registered_or_acquired_request() {
++        let (c,mut o)=setup();let t=request(&c,&mut o,1);c.before_publish(&t,||true).unwrap();c.queue_returned(&mut o,&t).unwrap();
++        c.before_acquire(&mut o,&t,E).unwrap();c.lock().unwrap().prune(5000);
++        let l=c.lock().unwrap();assert_eq!(l.live.get(&(t.epoch,t.nonce)).unwrap().phase,Phase::Acquired);
++    }
++    #[test] fn release_requires_disposal_and_zero_never_waives_acquire() {
++        let (c,mut o)=setup();let t=request(&c,&mut o,1);c.before_publish(&t,||true).unwrap();c.queue_returned(&mut o,&t).unwrap();c.before_acquire(&mut o,&t,E).unwrap();
++        c.owner_transition(&mut o,&t,OwnerTransition::PinStarted).unwrap();c.owner_transition(&mut o,&t,OwnerTransition::SessionStarted).unwrap();
++        c.owner_transition(&mut o,&t,OwnerTransition::GpuStarted).unwrap();c.owner_transition(&mut o,&t,OwnerTransition::Cleanup).unwrap();
++        c.owner_transition(&mut o,&t,OwnerTransition::JobDisposed).unwrap();assert!(c.finish_release(&mut o,&t,1000).is_err());
++        assert!(c.finish_zero_state(&mut o,&t,1000).is_err());c.owner_transition(&mut o,&t,OwnerTransition::SessionDisposed).unwrap();
++        c.owner_transition(&mut o,&t,OwnerTransition::PinDisposed).unwrap();
++        assert!(c.finish_release(&mut o,&t,1000).is_err());
++        c.owner_transition(&mut o,&t,OwnerTransition::GpuSettled).unwrap();c.finish_release(&mut o,&t,1000).unwrap();
++        let l=c.lock().unwrap();let r=&l.recent.back().unwrap().1;assert_eq!(r.released,1);assert_eq!(r.snapshot()["proof"]["gpu_fault"],false);
++    }
++    #[test] fn fault_unknown_and_cancel_ack_never_release_peers() {
++        let (c,mut o)=setup();let a=request(&c,&mut o,1);let b=request(&c,&mut o,2);
++        let body=serde_json::to_vec(&json!({"v":1,"epoch":E,"nonce":a.nonce.text()})).unwrap();
++        let e=envelope(&c,"cancel",E,&a.nonce.text(),&body);let r=c.private_reply(&e,&body,1000).unwrap();
++        assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap()["result"],"cancel_requested");
++        let l=c.lock().unwrap();assert!(l.live.get(&(a.epoch,a.nonce)).unwrap().cancel.load(Ordering::Acquire));
++        assert!(!l.live.get(&(b.epoch,b.nonce)).unwrap().cancel.load(Ordering::Acquire));drop(l);
++        c.retire_epoch(&mut o).unwrap();assert!(c.finish_release(&mut o,&a,1000).is_err());
++    }
++    #[test] fn malformed_control_body_and_unknown_are_not_zero_state() {
++        let (c,mut o)=setup();c.publish_epoch(&mut o,E,store()).unwrap();
++        let body=format!("{{\"v\":1,\"epoch\":\"{E}\",\"requests\":[\"{}\"]}}","d".repeat(32)).into_bytes();
++        let e=envelope(&c,"status",E,"",&body);let r=c.private_reply(&e,&body,1000).unwrap();
++        let v:Value=serde_json::from_slice(&r.body).unwrap();assert_eq!(v["records"][0]["phase"],"unknown");assert!(v["records"][0].get("proof").is_none());
++        let bad=b"{\"v\":true,\"v\":1}";let e=envelope(&c,"status",E,"",bad);assert!(c.private_reply(&e,bad,1000).is_err());
++    }
++    #[test] fn live_and_tombstone_capacity_do_not_age_evict_busy_rows() {
++        let (c,mut o)=setup();for n in 0..MAX_LIVE {request(&c,&mut o,n as u8);}
++        let e=envelope(&c,"infer",E,&format!("{:032x}",99),b"{}");assert!(matches!(c.register(&e,1000),Err(Error::Capacity)));
++        c.lock().unwrap().prune(5000);assert_eq!(c.lock().unwrap().live.len(),MAX_LIVE);
++    }
++    #[test] fn retired_preparing_or_queued_disposal_never_becomes_zero_state() {
++        for queued in [false,true] { let (c,mut o)=setup();let t=request(&c,&mut o,1);
++            if queued {c.before_publish(&t,||true).unwrap();c.queue_returned(&mut o,&t).unwrap();}
++            c.retire_epoch(&mut o).unwrap();c.owner_transition(&mut o,&t,OwnerTransition::JobDisposed).unwrap();
++            assert!(matches!(c.finish_zero_state(&mut o,&t,1001),Err(Error::Epoch)));
++            let l=c.lock().unwrap();let r=l.live.get(&(t.epoch,t.nonce)).unwrap();
++            assert_eq!(r.phase,Phase::Faulted);assert_eq!((r.acquired,r.released),(0,0));assert!(r.snapshot().get("proof").is_none());
++        }
++    }
++    #[test] fn unknown_cache_cannot_publish_ready_or_claim_default_false_facts() {
++        let (c,mut o)=setup();let e=envelope(&c,"state","","",b"{}");
++        assert!(matches!(c.private_reply(&e,b"{}",1000),Err(Error::Store)));
++        for bad in [CacheInvariantObservation{disk_bytes:1,..store()},CacheInvariantObservation{disk_attached:true,..store()},
++            CacheInvariantObservation{writing:true,..store()},CacheInvariantObservation{durable_min_tokens:1,..store()},
++            CacheInvariantObservation{write_ahead_enabled:true,..store()}] {
++            assert!(matches!(c.publish_epoch(&mut o,E,bad),Err(Error::Store)));
++            assert!(c.lock().unwrap().cache.is_none());assert!(c.lock().unwrap().state!=RuntimeState::Ready);
++        }
++        c.observe_cache(&mut o,store()).unwrap();let r=c.private_reply(&e,b"{}",1000).unwrap();
++        let body:Value=serde_json::from_slice(&r.body).unwrap();assert_eq!(body["state"],"loading");assert_eq!(body["epoch"],"");
++        c.publish_epoch(&mut o,E,store()).unwrap();
++    }
++    #[test] fn bad_actual_cache_observation_removes_evidence_and_faults_rows() {
++        let (c,mut o)=setup();let t=request(&c,&mut o,1);
++        assert!(matches!(c.observe_cache(&mut o,CacheInvariantObservation{writing:true,..store()}),Err(Error::Store)));
++        assert!(c.lock().unwrap().cache.is_none());assert!(c.lock().unwrap().state==RuntimeState::Faulted);
++        assert!(c.before_publish(&t,||true).is_err());
++        let e=envelope(&c,"state",E,"",b"{}");assert!(matches!(c.private_reply(&e,b"{}",1000),Err(Error::Store)));
++    }
++    #[test] fn controls_recheck_expiry_and_do_not_set_cancel_after31seconds() {
++        let (c,mut o)=setup();let t=request(&c,&mut o,1);
++        let status=serde_json::to_vec(&json!({"v":1,"epoch":E,"requests":[t.nonce.text()]})).unwrap();
++        let cancel=serde_json::to_vec(&json!({"v":1,"epoch":E,"nonce":t.nonce.text()})).unwrap();
++        for (op,nonce,body) in [("state",String::new(),b"{}".to_vec()),("status",String::new(),status),("cancel",t.nonce.text(),cancel)] {
++            let e=envelope(&c,op,E,&nonce,&body);
++            assert!(matches!(c.private_reply(&e,&body,1031),Err(Error::Expiry)));
++            assert!(matches!(c.private_reply(&e,&body,999),Err(Error::Expiry)));
++            assert!(matches!(c.private_reply(&e,&body,MAX_INT+1),Err(Error::Expiry)));
++        }
++        assert!(!c.lock().unwrap().live.get(&(t.epoch,t.nonce)).unwrap().cancel.load(Ordering::Acquire));
++    }
++    #[test] fn resource_start_and_cleanup_transitions_reject_wrong_order_and_fault() {
++        let (c,mut o)=setup();let t=request(&c,&mut o,1);
++        for a in [OwnerTransition::PinStarted,OwnerTransition::SessionStarted,OwnerTransition::GpuStarted,OwnerTransition::Cleanup] {
++            assert!(matches!(c.owner_transition(&mut o,&t,a),Err(Error::Transition)));
++        }
++        c.before_publish(&t,||true).unwrap();c.queue_returned(&mut o,&t).unwrap();c.before_acquire(&mut o,&t,E).unwrap();
++        c.owner_transition(&mut o,&t,OwnerTransition::PinStarted).unwrap();
++        assert!(c.owner_transition(&mut o,&t,OwnerTransition::PinStarted).is_err());
++        c.retire_epoch(&mut o).unwrap();assert!(c.owner_transition(&mut o,&t,OwnerTransition::Cleanup).is_err());
++        c.owner_transition(&mut o,&t,OwnerTransition::PinDisposed).unwrap();
++        c.owner_transition(&mut o,&t,OwnerTransition::JobDisposed).unwrap();
++        assert!(c.finish_release(&mut o,&t,1001).is_err());assert!(c.finish_zero_state(&mut o,&t,1001).is_err());
++    }
++    #[test] fn publication_checks_before_reserving_and_cannot_publish_disposed_job() {
++        let (c,mut o)=setup();let t=request(&c,&mut o,1);
++        assert!(matches!(c.before_publish(&t,||false),Err(Error::Capacity)));
++        {let l=c.lock().unwrap();let r=l.live.get(&(t.epoch,t.nonce)).unwrap();assert_eq!(r.phase,Phase::Preparing);assert!(!r.reserved);}
++        c.owner_transition(&mut o,&t,OwnerTransition::JobDisposed).unwrap();
++        assert!(matches!(c.before_publish(&t,||panic!("reserve must not be called")),Err(Error::Transition)));
++    }
++    #[test] fn frozen_python_response_frame_and_mac_match_exact_raw_body() {
++        let (c,_)=setup();let e=envelope(&c,"state","","",b"{}");
++        let body=format!("{{\"v\":1,\"epoch\":\"{E}\",\"state\":\"loading\",\"revision\":1,\"active\":0,\"pending\":0,\"cache\":{{\"disk_bytes\":0,\"disk_attached\":false,\"writing\":false,\"durable_min_tokens\":0,\"write_ahead_enabled\":false}}}}").into_bytes();
++        let frame=lp(RESPONSE_DOMAIN,&["state","POST","/_liliuxflow/mtp2/state",&"c".repeat(32),&hex(&e.frame_sha),E,"200",&hex(&sha256(&body))]).unwrap();
++        assert_eq!(hex(&sha256(&frame)),"331a09cec2ea2d2f4654f596d31f7f3aeac9cebf904f5ece75dd4955d2fdc8c9");
++        assert_eq!(hex(&mac(&c.key.0,&frame).unwrap()),"a6e0c79b25fb3d9139ca96d8ffab6c2d8dcc5111679d8d3772380c8f87a38d51");
++    }
++    #[test] fn http_disposal_fact_is_pending_until_sole_owner_pump() {
++        let (c,mut o)=setup();let t=request(&c,&mut o,1);
++        c.note_cpu_disposed(&t,CpuDisposal::NeverReserved).unwrap();assert!(c.has_pending_cpu());
++        {let l=c.lock().unwrap();let r=l.live.get(&(t.epoch,t.nonce)).unwrap();assert_eq!(r.phase,Phase::Preparing);assert!(r.snapshot().get("proof").is_none());}
++        c.pump_cpu_disposals(&mut o,1001).unwrap();assert!(!c.has_pending_cpu());
++        let l=c.lock().unwrap();assert_eq!(l.recent.back().unwrap().1.phase,Phase::Zero);
++    }
++    #[test] fn pending_cpu_receipt_never_zeroes_acquired_faulted_or_wrong_queue_facts() {
++        for kind in 0..3 {let (c,mut o)=setup();let t=request(&c,&mut o,1);
++            if kind==0 {c.before_publish(&t,||true).unwrap();c.queue_returned(&mut o,&t).unwrap();c.before_acquire(&mut o,&t,E).unwrap();}
++            if kind==1 {c.retire_epoch(&mut o).unwrap();}
++            c.note_cpu_disposed(&t,CpuDisposal::ReservationReturned).unwrap();c.pump_cpu_disposals(&mut o,1001).unwrap();
++            let l=c.lock().unwrap();assert!(l.recent.is_empty());assert!(l.live.get(&(t.epoch,t.nonce)).unwrap().snapshot().get("proof").is_none());
++        }
++    }
++    #[test] fn resource_probe_epoch_gate_does_not_fabricate_acquire() {
++        let (c,mut o)=setup();let t=request(&c,&mut o,1);c.before_publish(&t,||true).unwrap();c.queue_returned(&mut o,&t).unwrap();
++        c.before_native_resources(&mut o,&t,E).unwrap();assert_eq!(c.lock().unwrap().live.get(&(t.epoch,t.nonce)).unwrap().acquired,0);
++        c.retire_epoch(&mut o).unwrap();assert!(c.before_native_resources(&mut o,&t,E).is_err());
++    }
++    #[test] fn delayed_cpu_drop_after_retirement_or_republication_never_proves_zero() {
++        for republish in [false,true] {let (c,mut o)=setup();let t=request(&c,&mut o,1);
++            c.retire_epoch(&mut o).unwrap();
++            if republish {c.publish_epoch(&mut o,&"b".repeat(64),store()).unwrap();}
++            c.note_cpu_disposed(&t,CpuDisposal::NeverReserved).unwrap();
++            c.pump_cpu_disposals(&mut o,1001).unwrap();assert!(!c.has_pending_cpu());
++            assert!(c.finish_zero_state(&mut o,&t,1001).is_err());
++            let l=c.lock().unwrap();let r=l.live.get(&(t.epoch,t.nonce)).unwrap();
++            assert!(l.recent.is_empty());assert_eq!(r.phase,Phase::Faulted);assert!(r.snapshot().get("proof").is_none());
++        }
++    }
++    #[test] fn gpu_settled_requires_a_started_acquired_healthy_owner_row() {
++        let (c,mut o)=setup();let t=request(&c,&mut o,1);
++        assert!(c.owner_transition(&mut o,&t,OwnerTransition::GpuSettled).is_err());
++        c.before_publish(&t,||true).unwrap();c.queue_returned(&mut o,&t).unwrap();c.before_acquire(&mut o,&t,E).unwrap();
++        assert!(c.owner_transition(&mut o,&t,OwnerTransition::GpuSettled).is_err());
++        c.owner_transition(&mut o,&t,OwnerTransition::GpuStarted).unwrap();
++        c.retire_epoch(&mut o).unwrap();assert!(c.owner_transition(&mut o,&t,OwnerTransition::GpuSettled).is_err());
++        assert!(c.lock().unwrap().live.get(&(t.epoch,t.nonce)).unwrap().gpu_unsettled);
++    }
++}
+diff --git a/src/serve/request.rs b/src/serve/request.rs
+--- a/src/serve/request.rs
++++ b/src/serve/request.rs
+@@ -611,13 +611,18 @@
+         // Sessions other requests hold are checked out: the store makes room
+         // among the others.
+         self.sessions.set_in_flight_bytes(prefill.in_flight_bytes());
+-        let acquired = self.sessions.acquire(
+-            &self.ctx,
+-            &self.model,
+-            &p.prompt,
+-            &images,
+-            p.cache_key.as_deref(),
+-        )?;
++        let acquired = if let Some(guard)=sink.control_admission.as_mut() {
++            self.control_observe()?;
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            let control=self.control.as_ref().context("mtp2_control_missing")?;
++            control.owner_transition(&mut authority,&guard.token,super::mtp2_control::OwnerTransition::SessionStarted)?;
++            control.owner_transition(&mut authority,&guard.token,super::mtp2_control::OwnerTransition::GpuStarted)?;
++            guard.session_started=true;
++            guard.session_disposed=false;
++            self.sessions.acquire_scoped(&self.ctx,&self.model,&p.prompt,&images,p.cache_key.as_deref(),
++                guard.scope.context("mtp2_control_scope_missing")?)?
++        } else {self.sessions.acquire(&self.ctx,&self.model,&p.prompt,&images,p.cache_key.as_deref())?};
+         let session_secs = started.elapsed().as_secs_f64();
+         let mut session = acquired.session;
+         let reused = acquired.reused;
+@@ -802,9 +807,12 @@
+                 session.stop_at(&p.prompt, reused, at)?;
+             }
+             self.sessions.set_in_flight_bytes(prefill.in_flight_bytes());
+-            let released = release_or_drop_cancelled_session(session, client_cancelled, |session| {
+-                self.sessions.release(&self.ctx, session, &images, p.cache_key.as_deref())
+-            });
++            let released = if sink.control_admission.is_some() {
++                if client_cancelled {drop(session);Evictions::default()}
++                else {self.release_session_controlled(session,&images,p.cache_key.as_deref(),sink)?}
++            } else {release_or_drop_cancelled_session(session,client_cancelled,|session|{
++                self.sessions.release(&self.ctx,session,&images,p.cache_key.as_deref())
++            })};
+             if client_cancelled {
+                 eprintln!("[lily-meta] request_id={request_id} phase=prefill_cancelled stage=prefill_chunk completed_chunks={} prefilled_tokens={} session_disposition=dropped", progress.borrow().completed_chunks, at - reused);
+             }
+@@ -1229,14 +1237,31 @@
+     /// flight for the pin until the returned guard drops: a memory pressure
+     /// warning meanwhile releases the pin then, not under the prefill or the
+     /// decode.
+-    pub(super) fn open(&mut self, job: Job) -> Opened {
++    pub(super) fn open(&mut self,mut job: Job) -> Result<Opened> {
++        if self.control_before_resources(&job).is_err() {job.reject(503,"mtp2_control_epoch_or_state");return Err(anyhow::anyhow!("mtp2_control_epoch_or_state"));}
++        let entered=(|| -> Result<()> {if let Some(control)=&self.control {
++            let guard=job.sink.control_admission.as_mut().context("mtp2_control_admission_missing")?;
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let residency=self.mtp2_residency.as_ref().context("mtp2_control_residency_missing")?;
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            guard.scope=Some(control.before_acquire(&mut authority,&guard.token,&residency.allocation_id)?);
++            guard.acquired=true;
++            control.owner_transition(&mut authority,&guard.token,super::mtp2_control::OwnerTransition::PinStarted)?;
++        } Ok(())})();
++        if entered.is_err() {
++            // Acquisition may have committed before a later transition failed.
++            // An acquired guard never emits CPU no-state; retire it conservatively.
++            if job.sink.control_admission.as_ref().is_some_and(|g|g.acquired){let _=self.control_retire();}
++            job.reject(503,"mtp2_control_acquisition_rejected");
++            return Err(anyhow::anyhow!("mtp2_control_acquisition_rejected"));
++        }
+         let Job { prepared, mut sink, queued_at } = job;
+         if let Some(line) = sink.metadata.acquire(Instant::now(), queued_at.elapsed()) {
+             eprintln!("{line}");
+         }
+         let in_flight = self.pin.before_request(Instant::now());
+         let queued = queued_at.elapsed();
+-        Opened { p: prepared, sink, in_flight, queued }
++        Ok(Opened { p: prepared, sink, in_flight, queued })
+     }
+ 
+     /// Ends a request [`Self::open`] took on: the pin's hold counts from
+@@ -1254,6 +1279,12 @@
+         self.pin.after_request(Instant::now());
+         let fault = self.ctx.fault();
+         let faulted = fault.is_some() || matches!(&ending, Ending::FailedUnder(_, Some(_)));
++        if self.control.is_some() {
++            if faulted {let _=self.control_retire();}
++            else {
++                let _=self.control_transition(&sink,super::mtp2_control::OwnerTransition::Cleanup);
++            }
++        }
+         match ending {
+             Ending::Answered => sink.end(),
+             Ending::Failed(error) => {
+@@ -1267,9 +1298,21 @@
+         // Session disposal returned before close; deferred pin cleanup is now
+         // complete. A fault never fabricates a successful release event.
+         let fault = fault.or_else(|| self.ctx.fault());
++        if self.control.is_some() && fault.is_some() {let _=self.control_retire();}
+         if !faulted && fault.is_none() {
++            let mut released=self.control.is_none();
++            if let (Some(control),Some(guard),Some(owner))=(&self.control,&sink.control_admission,&self.control_owner) {
++                if let Ok(mut authority)=owner.try_borrow_mut() {
++                    let disposed=control.owner_transition(&mut authority,&guard.token,super::mtp2_control::OwnerTransition::PinDisposed)
++                        .and_then(|_|control.owner_transition(&mut authority,&guard.token,super::mtp2_control::OwnerTransition::JobDisposed));
++                    if disposed.is_ok() && (!guard.session_started || guard.session_disposed) {
++                        released=control.finish_release(&mut authority,&guard.token,super::now()).is_ok();
++                    }
++                }
++            }
++            if !released {let _=self.control_retire();}
+             let cancelled = sink.cancelled();
+-            if let Some(line) = sink.metadata.release(Instant::now(), cancelled) {
++            if let Some(line) = released.then(||sink.metadata.release(Instant::now(), cancelled)).flatten() {
+                 eprintln!("{line}");
+                 if let Some(resident) = &self.mtp2_residency {
+                     eprintln!("[lily-meta] request_id={} phase=mtp2_released clock={} released_ns={} resident_epoch={} cancelled={cancelled}",
+@@ -1338,9 +1381,12 @@
+         // room among the others.
+         self.sessions.set_in_flight_bytes(in_flight_others);
+         let client_cancelled = sink.cancelled();
+-        let released = release_or_drop_cancelled_session(session, client_cancelled, |session| {
+-            self.sessions.release(&self.ctx, session, &images, p.cache_key.as_deref())
+-        });
++        let released = if sink.control_admission.is_some() {
++            if client_cancelled {drop(session);Evictions::default()}
++            else {self.release_session_controlled(session,&images,p.cache_key.as_deref(),sink)?}
++        } else {release_or_drop_cancelled_session(session,client_cancelled,|session|{
++            self.sessions.release(&self.ctx,session,&images,p.cache_key.as_deref())
++        })};
+         if client_cancelled {
+             eprintln!("[lily-meta] request_id={} phase=decode_session_cancelled session_disposition=dropped", sink.metadata.request_id);
+         }
+diff --git a/src/serve/session.rs b/src/serve/session.rs
+--- a/src/serve/session.rs
++++ b/src/serve/session.rs
+@@ -469,12 +469,20 @@
+     /// re-tokenized; a prompt that resumes at or after it cuts back.
+     answer_start: usize,
+     cache_key: Option<String>,
++    tenant_scope: Option<super::mtp2_control::TenantScope>,
+     last_used: u64,
+     /// What the disk tier holds of this session as it is now.
+     disk: DiskCopy,
+     /// Created by the request that holds it (not an extension of a resident
+     /// session), so its size at release counts toward the headroom.
+     born: bool,
++}
++
++/// A None request retains the original cache API. Shared requests require an
++/// exact resident owner before agreement, resume selection or fork can inspect it.
++fn resident_scope_matches(stored:Option<super::mtp2_control::TenantScope>,
++    requested:Option<super::mtp2_control::TenantScope>)->bool {
++    requested.is_none_or(|need|stored==Some(need))
+ }
+ 
+ /// Whether a resident session's current contents are on disk already.
+@@ -500,6 +508,7 @@
+             request_start: 0,
+             answer_start: 0,
+             cache_key: None,
++            tenant_scope: None,
+             last_used: 0,
+             disk: DiskCopy::None,
+             born: true,
+@@ -837,6 +846,15 @@
+ }
+ 
+ impl<M: LanguageModel> SessionStore<M> {
++    pub(super) fn control_observation(&self,disk_bytes:u64) -> super::mtp2_control::CacheInvariantObservation {
++        super::mtp2_control::CacheInvariantObservation{disk_bytes,disk_attached:self.disk.is_some(),
++            writing:self.writing.is_some(),durable_min_tokens:self.durable_min_tokens,
++            write_ahead_enabled:self.write_ahead_floor.is_some()}
++    }
++    fn require_scoped_resident(&self) -> Result<()> {
++        ensure!(self.disk.is_none() && self.writing.is_none() && self.durable_min_tokens==0
++            && self.write_ahead_floor.is_none(),"mtp2_control_store_invariant");Ok(())
++    }
+     pub fn new(
+         budget_bytes: usize,
+         max_sessions: usize,
+@@ -992,6 +1010,15 @@
+         images: &[CachedImage],
+         cache_key: Option<&str>,
+     ) -> Result<Acquired<M>> {
++        self.acquire_for_scope(ctx,model,prompt,images,cache_key,None)
++    }
++    pub(super) fn acquire_scoped(&mut self,ctx:&MetalContext,model:&M,prompt:&[u32],images:&[CachedImage],
++        cache_key:Option<&str>,scope:super::mtp2_control::TenantScope)->Result<Acquired<M>> {
++        self.require_scoped_resident()?;
++        self.acquire_for_scope(ctx,model,prompt,images,cache_key,Some(scope))
++    }
++    fn acquire_for_scope(&mut self,ctx:&MetalContext,model:&M,prompt:&[u32],images:&[CachedImage],
++        cache_key:Option<&str>,scope:Option<super::mtp2_control::TenantScope>)->Result<Acquired<M>> {
+         ensure!(!prompt.is_empty(), "empty prompt");
+         self.evictions = Evictions::default();
+         self.collect_finished();
+@@ -1005,6 +1032,7 @@
+             self.entries
+                 .iter()
+                 .chain(self.parked())
++                .filter(|s|resident_scope_matches(s.tenant_scope,scope))
+                 .map(|s| (s.tokens.as_slice(), s.images.as_slice()))
+                 .chain(self.disk.iter().flat_map(|d| {
+                     d.entries()
+@@ -1013,7 +1041,7 @@
+                 })),
+         );
+         let mut acquired =
+-            self.acquire_resumable(ctx, model, prompt, images, cache_key)?;
++            self.acquire_resumable_for_scope(ctx, model, prompt, images, cache_key,scope)?;
+         debug_assert!(acquired.reused <= agreement, "resumed past the agreement");
+         // Whatever the request appends lies past where it resumed.
+         acquired.session.request_start = acquired.reused;
+@@ -1035,10 +1063,16 @@
+         images: &[CachedImage],
+         cache_key: Option<&str>,
+     ) -> Result<Acquired<M>> {
++        self.acquire_resumable_for_scope(ctx,model,prompt,images,cache_key,None)
++    }
++    fn acquire_resumable_for_scope(&mut self,ctx:&MetalContext,model:&M,prompt:&[u32],images:&[CachedImage],
++        cache_key:Option<&str>,scope:Option<super::mtp2_control::TenantScope>)->Result<Acquired<M>> {
++        if scope.is_some(){self.require_scoped_resident()?;}
+         let best = self
+             .entries
+             .iter()
+             .enumerate()
++            .filter(|(_,s)|resident_scope_matches(s.tenant_scope,scope))
+             .filter_map(|(i, s)| s.resume_position(prompt, images).map(|p| (i, p)))
+             .max_by_key(|&(i, p)| {
+                 let entry = &self.entries[i];
+@@ -1079,7 +1113,8 @@
+ 
+         let Some((index, resume_at)) = best else {
+             let state = model.new_state(ctx, prompt.len())?;
+-            let session = Session::new(state);
++            let mut session = Session::new(state);
++            session.tenant_scope=scope;
+             self.trim(ctx, session.bytes());
+             return Ok(Acquired::fresh(session));
+         };
+@@ -1125,6 +1160,7 @@
+         state.copy_prefix_from(ctx, &source.state, resume_at)?;
+         state.restore(ctx, &checkpoint.snapshot)?;
+         let mut session = Session::new(state);
++        session.tenant_scope=scope;
+         session.tokens = source.tokens[..resume_at].to_vec();
+         session.images = images_within(&source.images, resume_at);
+         session.checkpoints.push(checkpoint);
+@@ -1694,6 +1730,12 @@
+         }
+         std::mem::take(&mut self.evictions)
+     }
++    pub(super) fn release_scoped(&mut self,ctx:&MetalContext,session:Session<M>,images:&[CachedImage],
++        cache_key:Option<&str>,scope:super::mtp2_control::TenantScope)->Result<Evictions> {
++        self.require_scoped_resident()?;
++        ensure!(session.tenant_scope==Some(scope),"mtp2_control_session_scope");
++        Ok(self.release(ctx,session,images,cache_key))
++    }
+ }
+ 
+ pub fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+diff --git a/tests/unit/serve.rs b/tests/unit/serve.rs
+--- a/tests/unit/serve.rs
++++ b/tests/unit/serve.rs
+@@ -4,6 +4,7 @@
+ fn shared_candidate_options() -> ServeOptions {
+     ServeOptions {
+         bind: "127.0.0.1:0".into(), max_seq: 262_144, liliuxflow_mtp2_shared_context: true,
++        liliuxflow_mtp2_control: false, liliuxflow_mtp2_control_key_fd: None,
+         cache_bytes: Some(8 << 30), kv_format: Some(KvFormat::Bf16), max_sessions: 1,
+         ngram_storage: NgramStorage::Paged, ngram_preload: true, ngram_lock: false,
+         mtp_drafts: 2, memory_limit: None, vision: VisionMode::Auto,
+@@ -549,7 +550,7 @@
+     assert!(tx.try_send(Cmd::Wake).is_ok(), "the stop wake fits next to one arrival");
+     assert!(!queue.admit());
+     // Draining skips the control messages and refuses no job here (none sent).
+-    assert_eq!(refuse_queued(&rx, &queue, 503, "stopping"), 0);
++    assert_eq!(refuse_queued(&rx, &queue, 503, "stopping", None), 0);
+     assert!(queue.claim_arrival(), "the drained arrival was released");
+ }
+ 
+@@ -738,3 +739,52 @@
+     assert_eq!(describe_reuse(None, true), ", forked");
+     assert_eq!(describe_reuse(None, false), "");
+ }
++
++
++#[test]
++fn mtp2_control_flags_are_opt_in_paired_and_shared_only() {
++    let mut options=shared_candidate_options();
++    assert!(check_shared_mtp2_options(&options).is_ok());
++    options.liliuxflow_mtp2_control=true;
++    assert!(check_shared_mtp2_options(&options).is_err());
++    options.liliuxflow_mtp2_control_key_fd=Some(7);
++    assert!(check_shared_mtp2_options(&options).is_ok());
++    options.liliuxflow_mtp2_shared_context=false;
++    assert!(check_shared_mtp2_options(&options).is_err());
++    options.liliuxflow_mtp2_control=false;
++    assert!(check_shared_mtp2_options(&options).is_err());
++    options.liliuxflow_mtp2_control_key_fd=None;
++    assert!(check_shared_mtp2_options(&options).is_ok());
++}
++
++#[test]
++fn mtp2_control_key_fd_requires_owned_private_readonly_exact_hex_and_accepts_unlinked_fd() {
++    use std::os::fd::IntoRawFd;
++    use std::os::unix::fs::PermissionsExt;
++    static NEXT:AtomicU64=AtomicU64::new(0);
++    let root=std::env::temp_dir().join(format!("lily-control-fd-cpu-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
++    std::fs::create_dir(&root).unwrap();
++    std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
++    for (i,bytes,mode,writable,valid) in [
++        (0,"1".repeat(64).into_bytes(),0o600,false,true),
++        (1,"1".repeat(63).into_bytes(),0o600,false,false),
++        (2,"1".repeat(65).into_bytes(),0o600,false,false),
++        (3,"1".repeat(64).into_bytes(),0o644,false,false),
++        (4,"1".repeat(64).into_bytes(),0o600,true,false),
++        (5,"A".repeat(64).into_bytes(),0o600,false,false),
++        (6,vec![0xff;64],0o600,false,false),
++    ] {
++        let path=root.join(i.to_string());std::fs::write(&path,&bytes).unwrap();
++        std::fs::set_permissions(&path,std::fs::Permissions::from_mode(mode)).unwrap();
++        let file=std::fs::OpenOptions::new().read(true).write(writable).open(&path).unwrap();
++        std::fs::remove_file(&path).unwrap(); // Runner passes an already-unlinked file.
++        let fd=file.into_raw_fd();let result=read_control_key(fd);
++        assert_eq!(result.is_ok(),valid);
++        assert_eq!(unsafe{libc::fcntl(fd,libc::F_GETFD)},-1,"native consumes and closes its inherited descriptor");
++        if let Err(error)=result {assert!(!error.to_string().contains('A'));}
++    }
++    let directory=std::fs::File::open(&root).unwrap().into_raw_fd();
++    assert!(read_control_key(directory).is_err());
++    assert!(read_control_key(-1).is_err());assert!(read_control_key(0).is_err());
++    std::fs::remove_dir(&root).unwrap();
++}
+diff --git a/tests/unit/serve/api.rs b/tests/unit/serve/api.rs
+--- a/tests/unit/serve/api.rs
++++ b/tests/unit/serve/api.rs
+@@ -422,3 +422,114 @@
+     assert!(ThinkingBudgets::parse("low=0,medium=8000").is_err());
+     assert!(ThinkingBudgets::parse("low=1").is_ok());
+ }
++
++
++const CONTROL_CPU_EPOCH:&str="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
++fn control_cpu_setup() -> (Arc<crate::serve::mtp2_control::Control>,crate::serve::mtp2_control::EngineAuthority) {
++    use crate::serve::{mtp2_control,session::SessionStore};
++    let (control,mut owner)=mtp2_control::Control::new(mtp2_control::Key::from_hex(
++        "2810ae8e536e31a20d90125913b66b3c89569b9dd6fcce9bbf8c0b763c03fe84").unwrap());
++    let empty:SessionStore<crate::qwen4exp::Qwen4ExpModel>=SessionStore::new(24<<30,2,3);
++    control.publish_epoch(&mut owner,CONTROL_CPU_EPOCH,empty.control_observation(0)).unwrap();
++    (Arc::new(control),owner)
++}
++fn control_cpu_front(fixture:&CpuPolicyFixture,control:Arc<crate::serve::mtp2_control::Control>)
++    -> (Arc<crate::serve::Front>,std::sync::mpsc::Receiver<crate::serve::Cmd>) {
++    use crate::serve::*;
++    let queue=Arc::new(EngineQueue::new(4));let (jobs,rx)=mpsc::sync_channel(queue.capacity());
++    let front=Front{shared:Shared{generator:Arc::new(Generator::from_model_dir(&fixture.path).unwrap()),
++        shutdown:Arc::new(Shutdown::default()),timings:Arc::new(TimingsLog::new(32)),queue,
++        thinking_tokens:None,weight_loads:None,control:Some(control)},
++        defaults:cpu_policy_defaults(),images:ImagePolicy{limits:ImageLimits::default(),available:Ok(()),memo:Arc::default()},
++        max_seq:mtp2::RESIDENT_CONTEXT_TOKENS,policy_mode:mtp2::PolicyMode::SharedMtp2,jobs,
++        lifecycle:Arc::new(Lifecycle::new(State::Ready)),connections:Arc::new(AtomicUsize::new(0)),
++        request_sequence:AtomicU64::new(1),model_id:"synthetic-cpu-model",idle_unload_secs:0};
++    (Arc::new(front),rx)
++}
++fn control_cpu_exchange(front:Arc<crate::serve::Front>,target:&str,headers:&[(String,String)],body:&[u8])->Vec<u8> {
++    use std::io::{Read,Write};use std::net::{TcpListener,TcpStream};use std::time::Duration;
++    // One ephemeral loopback test connection only; no production listener/model.
++    let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
++    let server=std::thread::spawn(move||{let (stream,_)=listener.accept().unwrap();
++        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
++        stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();crate::serve::handle(&front,stream);});
++    let mut client=TcpStream::connect(address).unwrap();client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
++    client.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
++    let mut request=format!("POST {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",body.len()).into_bytes();
++    for (name,value) in headers {request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());}
++    request.extend_from_slice(b"\r\n");request.extend_from_slice(body);client.write_all(&request).unwrap();
++    let mut reply=Vec::new();client.read_to_end(&mut reply).unwrap();server.join().unwrap();reply
++}
++fn control_cpu_record(control:&crate::serve::mtp2_control::Control,nonce:&str)->Value {
++    use crate::serve::{mtp2_control,now};
++    let body=serde_json::to_vec(&json!({"v":1,"epoch":CONTROL_CPU_EPOCH,"requests":[nonce]})).unwrap();
++    let target="/_liliuxflow/mtp2/status";
++    let headers=mtp2_control::tests::headers(control,"status",CONTROL_CPU_EPOCH,"",&body,now());
++    let envelope=control.authenticate("POST",target,&headers,now()).unwrap();
++    let reply=control.private_reply(&envelope,&body,now()).unwrap();
++    serde_json::from_slice::<Value>(&reply.body).unwrap()["records"][0].clone()
++}
++#[test]
++fn mtp2_control_cpu_http_rejection_registers_then_only_owner_proves_no_state() {
++    use crate::serve::{mtp2_control,Cmd,now};use std::sync::atomic::Ordering;
++    let fixture=CpuPolicyFixture::new();let (control,mut owner)=control_cpu_setup();
++    let (front,rx)=control_cpu_front(&fixture,control.clone());
++    for (index,body) in [b"{".to_vec(),serde_json::to_vec(&json!({"model":"physical", "liliuxflow_profile":"ctx128k-mtp2", "messages":[{"role":"user","content":"synthetic"}],"max_tokens":1})).unwrap()].into_iter().enumerate(){
++        let nonce=format!("{:032x}",index+1);
++        let headers=mtp2_control::tests::headers(&control,"infer",CONTROL_CPU_EPOCH,&nonce,&body,now());
++        let reply=control_cpu_exchange(front.clone(),"/v1/chat/completions",&headers,&body);
++        assert!(reply.starts_with(b"HTTP/1.1 400"));
++        assert_eq!(front.shared.queue.waiting.load(Ordering::Acquire),0);
++        assert!(!front.shared.queue.arrival_pending.load(Ordering::Acquire));
++        assert!(matches!(rx.try_recv(),Ok(Cmd::Wake)));assert!(rx.try_recv().is_err());
++        let before=control_cpu_record(&control,&nonce);assert_eq!(before["phase"],"preparing");assert!(before.get("proof").is_none());
++        control.pump_cpu_disposals(&mut owner,now()).unwrap();
++        let after=control_cpu_record(&control,&nonce);assert_eq!(after["phase"],"rejected_without_native_state");
++        assert_eq!((after["acquired"].as_u64(),after["released"].as_u64()),(Some(0),Some(0)));
++        assert_eq!(after["proof"]["gpu_work_started"],false);assert_eq!(after["proof"]["job_disposed"],true);
++    }
++}
++#[test]
++fn mtp2_control_cpu_http_invalid_header_never_registers_wakes_or_admits() {
++    use crate::serve::{mtp2_control,now};use std::sync::atomic::Ordering;
++    let fixture=CpuPolicyFixture::new();let (control,_owner)=control_cpu_setup();let (front,rx)=control_cpu_front(&fixture,control.clone());
++    let nonce="e".repeat(32);let body=b"{}";
++    let mut headers=mtp2_control::tests::headers(&control,"infer",CONTROL_CPU_EPOCH,&nonce,body,now());
++    headers.iter_mut().find(|(name,_)|name.ends_with("-mac")).unwrap().1="0".repeat(64);
++    let reply=control_cpu_exchange(front.clone(),"/v1/chat/completions",&headers,body);assert!(reply.starts_with(b"HTTP/1.1 400"));
++    assert_eq!(front.shared.queue.waiting.load(Ordering::Acquire),0);assert!(rx.try_recv().is_err());assert!(!control.has_pending_cpu());
++    let record=control_cpu_record(&control,&nonce);assert_eq!(record["phase"],"unknown");assert!(record.get("proof").is_none());
++}
++#[test]
++fn mtp2_control_cpu_http_cancel_binds_one_registered_nonce_and_has_no_release_effect() {
++    use crate::serve::{mtp2_control,now};use std::sync::atomic::Ordering;
++    let fixture=CpuPolicyFixture::new();let (control,_owner)=control_cpu_setup();let (front,rx)=control_cpu_front(&fixture,control.clone());
++    let register=|nonce:&str| {let headers=mtp2_control::tests::headers(&control,"infer",CONTROL_CPU_EPOCH,nonce,b"{}",now());
++        let e=control.authenticate("POST","/v1/chat/completions",&headers,now()).unwrap();control.register(&e,now()).unwrap()};
++    let a_nonce="1".repeat(32);let b_nonce="2".repeat(32);let (_,a)=register(&a_nonce);let (_,b)=register(&b_nonce);
++    let body=serde_json::to_vec(&json!({"v":1,"epoch":CONTROL_CPU_EPOCH,"nonce":a_nonce})).unwrap();
++    let headers=mtp2_control::tests::headers(&control,"cancel",CONTROL_CPU_EPOCH,&a_nonce,&body,now());
++    let reply=control_cpu_exchange(front,"/_liliuxflow/mtp2/cancel",&headers,&body);assert!(reply.starts_with(b"HTTP/1.1 200"));
++    assert!(a.load(Ordering::Acquire));assert!(!b.load(Ordering::Acquire));assert!(rx.try_recv().is_err());
++    for nonce in [&a_nonce,&b_nonce] {let row=control_cpu_record(&control,nonce);assert_eq!(row["phase"],"preparing");assert_eq!(row["released"],0);assert!(row.get("proof").is_none());}
++}
++#[test]
++fn mtp2_control_cpu_full_inbox_drop_uses_pending_bit_and_does_not_release_peer() {
++    use crate::serve::{mtp2_control,CpuAdmissionGuard,Cmd,now};use std::sync::atomic::Ordering;
++    let fixture=CpuPolicyFixture::new();let (control,mut owner)=control_cpu_setup();let (front,rx)=control_cpu_front(&fixture,control.clone());
++    let register=|nonce:&str| {let h=mtp2_control::tests::headers(&control,"infer",CONTROL_CPU_EPOCH,nonce,b"{}",now());
++        let e=control.authenticate("POST","/v1/chat/completions",&h,now()).unwrap();control.register(&e,now()).unwrap()};
++    let (peer,peer_cancel)=register(&"1".repeat(32));control.before_publish(&peer,||front.shared.queue.admit()).unwrap();
++    front.shared.queue.left();control.queue_returned(&mut owner,&peer).unwrap();control.before_acquire(&mut owner,&peer,CONTROL_CPU_EPOCH).unwrap();
++    let nonce="2".repeat(32);let (token,cancelled)=register(&nonce);
++    for _ in 0..front.shared.queue.capacity(){assert!(front.jobs.try_send(Cmd::Wake).is_ok());}
++    let mut guard=CpuAdmissionGuard{control:control.clone(),token,queue:front.shared.queue.clone(),jobs:front.jobs.clone(),cancelled,
++        expected_profile:"ctx64k-mtp2",reserved:false,ever_reserved:false,acquired:false,scope:None,session_started:false,session_disposed:true};
++    guard.publish().unwrap();drop(guard); // try_send cannot block when inbox is full.
++    assert!(control.has_pending_cpu());assert_eq!(front.shared.queue.waiting.load(Ordering::Acquire),0);
++    assert_eq!(rx.try_iter().count(),front.shared.queue.capacity());
++    control.pump_cpu_disposals(&mut owner,now()).unwrap();assert!(!control.has_pending_cpu());
++    assert_eq!(control_cpu_record(&control,&nonce)["phase"],"rejected_without_native_state");
++    let peer_row=control_cpu_record(&control,&"1".repeat(32));assert_eq!(peer_row["phase"],"acquired");assert_eq!(peer_row["released"],0);
++    assert!(!peer_cancel.load(Ordering::Acquire));assert!(peer_row.get("proof").is_none());
++}
+diff --git a/tests/unit/serve/request.rs b/tests/unit/serve/request.rs
+--- a/tests/unit/serve/request.rs
++++ b/tests/unit/serve/request.rs
+@@ -764,7 +764,7 @@
+ fn sink() -> (Sink, std::sync::mpsc::Receiver<crate::serve::Out>) {
+     let (tx, rx) = std::sync::mpsc::channel();
+     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+-    (Sink { tx, cancelled, started: false, metadata: RequestMeta::new("req-100-1".into()) }, rx)
++    (Sink { tx, cancelled, started: false, metadata: RequestMeta::new("req-100-1".into()), control_admission: None }, rx)
+ }
+ 
+ /// What the responder thread would get, one line per message.
+diff --git a/tests/unit/serve/session.rs b/tests/unit/serve/session.rs
+--- a/tests/unit/serve/session.rs
++++ b/tests/unit/serve/session.rs
+@@ -1294,4 +1294,42 @@
+         assert_holds(&cut.expect("cut back").state, &next);
+         gate.store(false, Ordering::Release);
+     }
+-}
++
++
++    #[test]
++    fn mtp2_control_cpu_resident_tenant_filter_applies_before_agreement_and_legacy_none_is_unchanged() {
++        use super::super::{Session,resident_scope_matches,agreement};
++        use crate::serve::mtp2_control::TenantScope;
++        let a=TenantScope::parse(&"a".repeat(64)).unwrap();let b=TenantScope::parse(&"b".repeat(64)).unwrap();
++        let prompt=vec![1,2,3,4,5,6,7,8,9,10];
++        let make=|tokens:Vec<u32>,scope| {let mut state=State{data:Vec::new(),recurrent:0,capacity:tokens.len()};
++            state.feed(&tokens);let mut session:Session<Model>=Session::new(state);session.tokens=tokens;session.tenant_scope=scope;session};
++        let entries=[make(vec![1,2,99],Some(a)),make(prompt[..9].to_vec(),Some(b)),make(prompt[..8].to_vec(),None)];
++        let scoped=agreement(&prompt,&[],entries.iter().filter(|s|resident_scope_matches(s.tenant_scope,Some(a)))
++            .map(|s|(s.tokens.as_slice(),s.images.as_slice())));
++        assert_eq!(scoped.0,2,"a foreign resident must not improve even the agreement diagnostic");
++        let legacy=agreement(&prompt,&[],entries.iter().filter(|s|resident_scope_matches(s.tenant_scope,None))
++            .map(|s|(s.tokens.as_slice(),s.images.as_slice())));
++        assert_eq!(legacy.0,9);assert!(!resident_scope_matches(None,Some(a)));
++        assert!(!resident_scope_matches(Some(b),Some(a)));assert!(resident_scope_matches(Some(a),Some(a)));
++    }
++    #[test]
++    fn mtp2_control_cpu_scoped_store_fails_before_parked_reclaim_or_disk_work() {
++        use std::os::unix::fs::PermissionsExt;
++        static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
++        let root=std::env::temp_dir().join(format!("lily-control-disk-cpu-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
++        std::fs::create_dir(&root).unwrap();std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
++        let plain:SessionStore<Model>=SessionStore::new(100_000,2,3);assert!(plain.require_scoped_resident().is_ok());
++        let mut durable:SessionStore<Model>=SessionStore::new(100_000,2,3).with_durable_min_tokens(1);
++        let ahead:SessionStore<Model>=SessionStore::new(100_000,2,3).with_write_ahead(1);
++        assert!(durable.require_scoped_resident().is_err());assert!(ahead.require_scoped_resident().is_err());
++        let disk=DiskStore::open(&root,"synthetic-control-cpu",100_000,0).unwrap();
++        let attached:SessionStore<Model>=SessionStore::new(100_000,2,3).with_disk(disk);
++        assert!(attached.require_scoped_resident().is_err());assert!(attached.control_observation(0).disk_attached);
++        assert_eq!(attached.disk().unwrap().len(),0);assert!(!attached.writing());
++        // None path keeps its public options: attaching/durable is legal for
++        // existing unshared callers; only the scoped guard rejects them.
++        durable.durable_min_tokens=0;assert!(durable.require_scoped_resident().is_ok());
++        drop(attached);std::fs::remove_dir_all(&root).unwrap();
++    }
++}

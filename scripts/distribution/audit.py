@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 from common import DistributionError, no_symlinks, private_directory, read_object, write_json_new
@@ -80,12 +81,16 @@ def scanner(tools, target, task, *, history=False, history_ref=None, private_fin
             'archive_depth': 3, 'decode_depth': 5, 'credential_validation': False}
 
 
-def syft(tools, source, task, commit):
+def syft(tools, source, task, commit, *, source_version=None):
     report = task / 'sbom-private.json'
     config = task / 'syft.yaml'
-    config.write_text('check-for-app-update: false\nparallelism: 2\n')
+    config.write_text('check-for-app-update: false\nparallelism: 2\nenrich: []\n'
+                      'javascript:\n  include-dev-dependencies: true\n  search-remote-licenses: false\n'
+                      'python:\n  search-remote-licenses: false\n'
+                      'golang:\n  search-local-mod-cache-licenses: false\n'
+                      '  search-local-vendor-licenses: false\n  search-remote-licenses: false\n')
     command = [str(tools / 'syft'), 'scan', 'dir:.', '--config', str(config), '--quiet',
-               '--base-path', '.', '--source-name', 'LiliuxFlow', '--source-version', commit,
+               '--base-path', '.', '--source-name', 'LiliuxFlow', '--source-version', source_version or commit,
                '--parallelism', '2', '--output', 'cyclonedx-json=' + str(report)]
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'TMPDIR': str(task), 'SYFT_CHECK_FOR_APP_UPDATE': 'false'}
     result = subprocess.run(command, capture_output=True, env=env, cwd=source, timeout=180)
@@ -102,9 +107,12 @@ def syft(tools, source, task, commit):
                 raise DistributionError('SBOM file component escapes source root')
     sbom.setdefault('metadata', {}).setdefault('properties', []).append({
         'name': 'liliuxflow:normalization', 'value': 'Syft file component names made source-relative'})
+    sbom['metadata']['properties'].append({
+        'name': 'liliuxflow:source_commit' if re.fullmatch(r'[0-9a-f]{40}', commit) else 'liliuxflow:source_identity',
+        'value': commit})
     # CycloneDX reports must use source-relative paths, never machine-specific task roots.
     encoded = json.dumps(sbom, ensure_ascii=False)
-    if str(task) in encoded or '/Users/' in encoded:
+    if str(task) in encoded or str(source) in encoded or '/Users/' in encoded or '/home/' in encoded:
         raise DistributionError('SBOM contains machine-specific paths')
     return sbom
 
@@ -158,7 +166,7 @@ def audit(args):
             receipt['scope'] = 'safe-extracted archive' if args.archive else 'exact commit source allowlist'
             receipt['commit'] = commit
             receipt['tree'] = scanner(tools, source, task,private_findings=getattr(args,'private_findings',None))
-            sbom = syft(tools, source, task, commit)
+            sbom = syft(tools, source, task, commit, source_version=getattr(args, 'source_version', None))
             receipt['sbom_components'] = len(sbom.get('components', []))
             write_json_new(output / 'sbom.cdx.json', sbom)
         write_json_new(output / 'audit.json', receipt)
@@ -172,6 +180,7 @@ if __name__ == '__main__':
     parser.add_argument('--tools', type=Path, default=ROOT / 'var/build/liliuxflow-security-tools')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--private-findings',type=Path,help='new file in owned0700 private directory; retains redacted end-line/fingerprint/Match details, never printed')
+    parser.add_argument('--source-version', help='SBOM product version; exact source commit remains in metadata')
     parser.add_argument('--history-ref', help='with --history, scan only this exact ref and ancestors')
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--commit')

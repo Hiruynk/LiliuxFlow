@@ -1,0 +1,1581 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -41,6 +41,11 @@
+     /// taken from the expert slots. 131072 is the sensible choice on 64 GB.
+     #[arg(long, default_value_t = 131072)]
+     max_seq: usize,
++
++    /// Candidate only: one MTP2 resident with finite per-request context profiles.
++    /// Requires the fixed BF16/two-draft configuration; P1 serves one at a time.
++    #[arg(long, default_value_t = false)]
++    liliuxflow_mtp2_shared_context: bool,
+ 
+     /// GPU memory for cached sessions (KV caches and recurrent checkpoints),
+     /// e.g. `24G`. Default: what the device's recommended working set leaves
+@@ -315,6 +320,7 @@
+     let options = ServeOptions {
+         bind: cli.bind,
+         max_seq: cli.max_seq,
++        liliuxflow_mtp2_shared_context: cli.liliuxflow_mtp2_shared_context,
+         cache_bytes: cli.cache_bytes.as_deref().map(parse_bytes).transpose()?,
+         max_sessions: cli.max_sessions,
+         disk_cache_dir: Some(cli.disk_cache_dir.unwrap_or_else(default_disk_cache_dir)),
+@@ -375,6 +381,14 @@
+     use super::*;
+     use lily::kernels::attention::KvFormat;
+ 
++    #[test]
++    fn shared_mtp2_candidate_is_explicit_and_defaults_off() {
++        let old = Cli::try_parse_from(["lily", "--model", "m"]).unwrap();
++        assert!(!old.liliuxflow_mtp2_shared_context);
++        let candidate = Cli::try_parse_from(["lily", "--model", "m", "--liliuxflow-mtp2-shared-context"]).unwrap();
++        assert!(candidate.liliuxflow_mtp2_shared_context);
++    }
++
+     /// `--kv-cache` and `--max-batch` stay unset unless given, so the server
+     /// tells an explicit value (which may refuse to start) from the default.
+     #[test]
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -29,6 +29,7 @@
+ pub mod data_uri;
+ pub mod disk;
+ pub mod http;
++pub mod mtp2;
+ pub mod pin;
+ pub mod request;
+ pub mod session;
+@@ -48,6 +49,7 @@
+ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
+ use anyhow::{Context as _, Result, ensure};
++use objc2_metal::MTLBuffer as _;
+ use serde::Serialize;
+ use serde_json::{Value, json};
+ 
+@@ -231,6 +233,8 @@
+ pub struct ServeOptions {
+     pub bind: String,
+     pub max_seq: usize,
++    /// Explicit candidate capability; legacy serving remains the default.
++    pub liliuxflow_mtp2_shared_context: bool,
+     pub cache_bytes: Option<usize>,
+     /// The attention K/V caches' element format (`None`: the default, q8).
+     pub kv_format: Option<KvFormat>,
+@@ -291,6 +295,34 @@
+     pub inject_metal_fault: Option<u64>,
+ }
+ 
++fn check_shared_mtp2_options(options: &ServeOptions) -> Result<()> {
++    if !options.liliuxflow_mtp2_shared_context { return Ok(()); }
++    ensure!(options.max_seq == mtp2::RESIDENT_CONTEXT_TOKENS,
++        "shared MTP2 requires --max-seq 262144");
++    ensure!(options.mtp_drafts == mtp2::DRAFTS,
++        "shared MTP2 requires --mtp-drafts 2");
++    ensure!(options.kv_format == Some(KvFormat::Bf16),
++        "shared MTP2 requires explicit --kv-cache bf16");
++    ensure!(options.max_batch == Some(1),
++        "shared MTP2 P1 requires --max-batch 1; peer scheduling is unavailable");
++    ensure!(options.pin_weights == pin::PinMode::Off && options.ngram_preload
++        && !options.ngram_lock, "shared MTP2 requires pin off and unlocked n-gram preload");
++    ensure!(options.thinking
++        && options.reasoning_effort.as_deref().is_none_or(|e| matches!(e, "high" | "xhigh" | "max"))
++        && options.thinking_controls.budgets == api::ThinkingBudgets::default()
++        && !options.thinking_controls.nudges && !options.thinking_controls.tool_call_ends_thinking,
++        "shared MTP2 requires checkpoint high thinking with default thinking controls off");
++    ensure!(options.disk_cache_bytes == 0,
++        "shared MTP2 P1 requires the existing disabled disk cache");
++    Ok(())
++}
++
++fn check_shared_mtp2_route(route: Option<&str>, scores: Option<&str>) -> Result<()> {
++    ensure!(route == Some("split") && scores == Some("scalar"),
++        "shared MTP2 requires LILY_QSA_ROUTE=split and LILY_QSA_SCORES=scalar");
++    Ok(())
++}
++
+ // --- lifecycle ---------------------------------------------------------------
+ 
+ /// Where the engine is in its life, as `/health` reports it.
+@@ -869,6 +901,7 @@
+     /// The thinking controls' markers and texts; `None` when the vocabulary
+     /// lacks them (the controls are then ignored).
+     thinking_tokens: Option<Arc<ThinkingTokens>>,
++    mtp2_residency: Option<mtp2::WeightResidency>,
+ }
+ 
+ /// Where a request's text ends up when not streaming.
+@@ -886,7 +919,7 @@
+         shared: &Shared,
+         next_id: u64,
+     ) -> Result<Self> {
+-        let Shared { generator, shutdown, timings, queue: _, thinking_tokens } =
++        let Shared { generator, shutdown, timings, queue: _, thinking_tokens, weight_loads } =
+             shared.clone();
+         // `LILY_KERNEL_PROFILE=1`: per-kernel GPU times per pass, printed
+         // after every answered request (diagnostic; the profile transport
+@@ -899,6 +932,7 @@
+             MetalContext::new()?
+         };
+         let started = Instant::now();
++        let load_generation = weight_loads.as_ref().map(|loads| loads.begin()).transpose()?;
+         let model = M::load(
+             &ctx,
+             model_dir,
+@@ -924,6 +958,21 @@
+                 kv_format: options.kv_format.unwrap_or_default(),
+             },
+         )?;
++        // These are the actual loader's live allocations, before any session or
++        // scratch exists. Hash handles privately; never print or persist addresses.
++        let weight_buffers = model.weight_buffers();
++        let mtp2_residency = match (&weight_loads, load_generation) {
++            (Some(loads), Some(generation)) => Some(loads.loaded(generation,
++                weight_buffers.iter().map(|buffer|
++                    (std::rc::Rc::as_ptr(buffer) as usize, buffer.length())),
++                model.paged_storage_bytes() as u64)?),
++            _ => None,
++        };
++        if options.liliuxflow_mtp2_shared_context {
++            ensure!(model.kv_format() == KvFormat::Bf16 && model.max_drafts() >= mtp2::DRAFTS
++                && model.expert_cache_stats().is_none(),
++                "shared MTP2 unavailable: requires actual bf16 and two drafts without an expert cache");
++        }
+         check_memory_options(
+             model.kv_format(),
+             model.expert_cache_stats().is_some(),
+@@ -987,7 +1036,6 @@
+         }
+         // The weights' pin acts only on the buffers the load allocated, so
+         // it changes nothing in the plan; it pins at the first request.
+-        let weight_buffers = model.weight_buffers();
+         let (_, pin_bytes) = pin::page_ranges(&weight_buffers);
+         let decision = pin::decide(&pin::PinInputs {
+             mode: options.pin_weights,
+@@ -1026,6 +1074,10 @@
+         let max_seq =
+             effective_max_seq(options.max_seq, model.max_position_embeddings());
+         ensure!(max_seq > 1, "max_seq must be at least 2");
++        if options.liliuxflow_mtp2_shared_context {
++            ensure!(max_seq == mtp2::RESIDENT_CONTEXT_TOKENS,
++                "shared MTP2 checkpoint cannot provide the resident context");
++        }
+         let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
+         warm_up(&ctx, &model, &mut scratch)?;
+ 
+@@ -1228,6 +1280,9 @@
+             "{}",
+             engine_effective_metadata(max_seq, model.kv_format(), drafts, max_batch)
+         );
++        if let Some(residency) = &mtp2_residency {
++            eprintln!("{}", residency.resident_line());
++        }
+         Ok(Self {
+             ctx,
+             model,
+@@ -1243,6 +1298,7 @@
+             preload,
+             pin,
+             thinking_tokens,
++            mtp2_residency,
+         })
+     }
+ 
+@@ -1376,20 +1432,25 @@
+         };
+         let checkpointer: &mut dyn DecodeCheckpointer<M::State> = decode_checkpoints;
+         let decode_started = Instant::now();
+-        let generation = generator.generate_checkpointed(
+-            ctx,
+-            model,
+-            &mut session.state,
+-            scratch,
+-            &p.prompt[n - 1..],
+-            &options,
+-            Some(checkpointer),
+-            &mut |token| {
+-                let events = parser.push(token)?;
+-                out.deliver(events, sink);
+-                Ok(!sink.cancelled() && !parser.stopped && !shutdown.cancel())
+-            },
+-        )?;
++        let sink_read = &*sink;
++        let mut on_token = |token| {
++            let events = parser.push(token)?;
++            out.deliver(events, sink_read);
++            Ok(!sink_read.cancelled() && !parser.stopped && !shutdown.cancel())
++        };
++        let generation = if p.mtp2_policy.is_some() {
++            let (generation, tail) = mtp2::generate_bounded(&generator, ctx, model,
++                &mut session.state, scratch, &p.prompt[n - 1..], n, &options,
++                Some(checkpointer), &mut on_token,
++                &|| !sink_read.cancelled() && !shutdown.cancel())?;
++            if let Some(tail) = tail {
++                eprintln!("{}", tail.line(&sink_read.metadata.request_id));
++            }
++            generation
++        } else {
++            generator.generate_checkpointed(ctx, model, &mut session.state, scratch,
++                &p.prompt[n - 1..], &options, Some(checkpointer), &mut on_token)?
++        };
+         self.answer(
+             admitted,
+             sink,
+@@ -1753,6 +1814,11 @@
+ 
+ /// Serves the checkpoint at `model_dir` with the engine its `model_type` names.
+ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
++    check_shared_mtp2_options(&options)?;
++    if options.liliuxflow_mtp2_shared_context {
++        check_shared_mtp2_route(std::env::var("LILY_QSA_ROUTE").ok().as_deref(),
++            std::env::var("LILY_QSA_SCORES").ok().as_deref())?;
++    }
+     // One lily per machine, taken before the port is bound so a second
+     // server is refused with the holder's pid rather than "address in use",
+     // and held for the process's life: the idle unload and the reloads keep
+@@ -1780,6 +1846,8 @@
+     queue: Arc<EngineQueue>,
+     /// See [`Engine::thinking_tokens`].
+     thinking_tokens: Option<Arc<ThinkingTokens>>,
++    /// Persisted across Engine::load/unload, including device-fault recovery.
++    weight_loads: Option<Arc<mtp2::WeightLoads>>,
+ }
+ 
+ /// Everything the HTTP thread needs without the engine.
+@@ -1789,6 +1857,7 @@
+     /// What chat requests may carry as images.
+     images: ImagePolicy,
+     max_seq: usize,
++    policy_mode: mtp2::PolicyMode,
+     jobs: SyncSender<Cmd>,
+     lifecycle: Arc<Lifecycle>,
+     /// Connection threads still running (the listener waits for them a
+@@ -2204,6 +2273,10 @@
+         options.max_seq,
+         checkpoint_max_position_embeddings(model_dir)?,
+     );
++    if options.liliuxflow_mtp2_shared_context {
++        ensure!(max_seq == mtp2::RESIDENT_CONTEXT_TOKENS,
++            "shared MTP2 checkpoint cannot provide the resident context");
++    }
+     if max_seq < options.max_seq {
+         eprintln!(
+             "context: --max-seq {} capped to {max_seq} (the checkpoint's window or the kernel limit)",
+@@ -2223,6 +2296,9 @@
+         timings: Arc::new(TimingsLog::new(TIMINGS_LOG_CAPACITY)),
+         queue,
+         thinking_tokens,
++        weight_loads: if options.liliuxflow_mtp2_shared_context {
++            Some(Arc::new(mtp2::WeightLoads::new()?))
++        } else { None },
+     };
+     let engine_thread = {
+         let model_dir = model_dir.to_path_buf();
+@@ -2268,6 +2344,9 @@
+         defaults,
+         images,
+         max_seq,
++        policy_mode: if options.liliuxflow_mtp2_shared_context {
++            mtp2::PolicyMode::SharedMtp2
++        } else { mtp2::PolicyMode::Disabled },
+         jobs,
+         lifecycle,
+         connections: connections.clone(),
+@@ -2382,23 +2461,25 @@
+                 serde_json::from_slice::<api::ChatRequest>(&request.body)
+                     .context("parsing the chat request")
+                     .and_then(|r| {
+-                        api::prepare_chat(
++                        api::prepare_chat_with_policy(
+                             r,
+                             front.shared.generator.tokenizer(),
+                             &front.defaults,
+                             front.max_seq,
+                             &front.images,
++                            front.policy_mode,
+                         )
+                     })
+             } else {
+                 serde_json::from_slice::<api::CompletionRequest>(&request.body)
+                     .context("parsing the completion request")
+                     .and_then(|r| {
+-                        api::prepare_completion(
++                        api::prepare_completion_with_policy(
+                             r,
+                             front.shared.generator.tokenizer(),
+                             &front.defaults,
+                             front.max_seq,
++                            front.policy_mode,
+                         )
+                     })
+             };
+@@ -2422,7 +2503,7 @@
+                      is {}); the response ends with finish_reason \"length\" if it uses them all",
+                     prepared.max_tokens,
+                     prepared.prompt.len(),
+-                    front.max_seq
++                    prepared.context_tokens(front.max_seq)
+                 );
+             }
+             match state {
+--- a/src/serve/api.rs
++++ b/src/serve/api.rs
+@@ -26,6 +26,7 @@
+ use serde_json::Value;
+ 
+ use super::data_uri::parse_image_data_uri;
++use super::mtp2::{self, PolicyMode, Profile, RequestPolicy};
+ use super::timings::Speculation;
+ use super::tools::{ToolSchema, template_tool_calls};
+ use crate::kernels::sample::SamplingParams;
+@@ -460,6 +461,8 @@
+ pub struct ChatRequest {
+     #[serde(default)]
+     pub model: Option<String>,
++    #[serde(default, deserialize_with = "mtp2::deserialize_profile")]
++    pub liliuxflow_profile: Option<Profile>,
+     pub messages: Vec<InMessage>,
+     #[serde(default)]
+     pub tools: Option<Vec<Value>>,
+@@ -688,6 +691,8 @@
+ pub struct CompletionRequest {
+     #[serde(default)]
+     pub model: Option<String>,
++    #[serde(default, deserialize_with = "mtp2::deserialize_profile")]
++    pub liliuxflow_profile: Option<Profile>,
+     pub prompt: StringOrVec,
+     #[serde(default)]
+     pub max_tokens: Option<usize>,
+@@ -732,6 +737,7 @@
+ #[derive(Debug, Clone)]
+ pub struct Prepared {
+     pub kind: Kind,
++    pub(super) mtp2_policy: Option<RequestPolicy>,
+     pub prompt: Vec<u32>,
+     pub max_tokens: usize,
+     pub sampling: SamplingParams,
+@@ -762,6 +768,33 @@
+     pub prepare_secs: f64,
+ }
+ 
++impl Prepared {
++    pub(super) fn context_tokens(&self, resident_context: usize) -> usize {
++        self.mtp2_policy.map_or(resident_context, RequestPolicy::context_tokens)
++    }
++
++    pub(super) fn response_model(&self, original: &'static str) -> &'static str {
++        self.mtp2_policy.map_or(original, RequestPolicy::alias)
++    }
++
++    pub(super) fn validate_context(&self, resident_context: usize, mode: PolicyMode) -> Result<()> {
++        match (mode, self.mtp2_policy) {
++            (PolicyMode::SharedMtp2, Some(policy)) => {
++                ensure!(resident_context == mtp2::RESIDENT_CONTEXT_TOKENS,
++                    "shared MTP2 resident context changed");
++                policy.validate_tokens(self.prompt.len(), self.max_tokens, resident_context)
++            }
++            (PolicyMode::Disabled, None) => {
++                ensure!(self.prompt.len() < resident_context,
++                    "prompt exceeds the engine context: {} prompt tokens, {resident_context} tokens of context",
++                    self.prompt.len());
++                Ok(())
++            }
++            _ => bail!("request policy does not match the native candidate"),
++        }
++    }
++}
++
+ /// The completion budget a request gets.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct Budget {
+@@ -832,6 +865,24 @@
+     }
+ }
+ 
++/// Runs only after the complete prompt was tokenized and image pads expanded.
++fn resolve_request_budget(
++    prompt_tokens: usize,
++    requested: Option<usize>,
++    resident_context: usize,
++    policy: Option<RequestPolicy>,
++) -> Result<Budget> {
++    let Some(policy) = policy else {
++        return resolve_budget(prompt_tokens, requested, resident_context);
++    };
++    let asked = requested.unwrap_or(mtp2::OUTPUT_TOKENS);
++    let mut budget = resolve_budget(prompt_tokens, Some(asked.min(mtp2::OUTPUT_TOKENS)),
++        policy.context_tokens())?;
++    budget.clamped_from = requested.filter(|&n| n > budget.max_tokens);
++    policy.validate_tokens(prompt_tokens, budget.max_tokens, resident_context)?;
++    Ok(budget)
++}
++
+ fn map_reasoning_effort(value: &str) -> Result<Option<Option<String>>> {
+     // Outer None: no opinion. Some(None): thinking off. Some(Some(e)): effort.
+     Ok(match value {
+@@ -854,6 +905,19 @@
+     max_seq: usize,
+     images: &ImagePolicy,
+ ) -> Result<Prepared> {
++    prepare_chat_with_policy(request, tokenizer, defaults, max_seq, images, PolicyMode::Disabled)
++}
++
++pub fn prepare_chat_with_policy(
++    request: ChatRequest,
++    tokenizer: &Tokenizer,
++    defaults: &Defaults,
++    max_seq: usize,
++    images: &ImagePolicy,
++    policy_mode: PolicyMode,
++) -> Result<Prepared> {
++    let mtp2_policy = mtp2::resolve_policy(policy_mode, request.liliuxflow_profile,
++        max_seq, request.chat_template_kwargs.as_ref())?;
+     ensure!(request.n.is_none_or(|n| n == 1), "n must be 1");
+     ensure!(!request.logprobs.unwrap_or(false), "logprobs are not supported");
+     if let Some(format) = &request.response_format {
+@@ -1019,10 +1083,11 @@
+             "this checkpoint's tokenizer has no image placeholder token"
+         ),
+     }
+-    let budget = resolve_budget(
++    let budget = resolve_request_budget(
+         prompt.len(),
+         request.max_completion_tokens.or(request.max_tokens),
+         max_seq,
++        mtp2_policy,
+     )?;
+     let sampling = resolve_sampling(&request.sampling, &defaults.sampling)?;
+     let mut thinking = thinking_fields.resolve(
+@@ -1036,6 +1101,7 @@
+     thinking.tool_call_ends_thinking &= tools.is_some();
+     Ok(Prepared {
+         kind: Kind::Chat,
++        mtp2_policy,
+         prompt,
+         max_tokens: budget.max_tokens,
+         sampling,
+@@ -1066,6 +1132,17 @@
+     defaults: &Defaults,
+     max_seq: usize,
+ ) -> Result<Prepared> {
++    prepare_completion_with_policy(request, tokenizer, defaults, max_seq, PolicyMode::Disabled)
++}
++
++pub fn prepare_completion_with_policy(
++    request: CompletionRequest,
++    tokenizer: &Tokenizer,
++    defaults: &Defaults,
++    max_seq: usize,
++    policy_mode: PolicyMode,
++) -> Result<Prepared> {
++    let mtp2_policy = mtp2::resolve_policy(policy_mode, request.liliuxflow_profile, max_seq, None)?;
+     ensure!(request.n.is_none_or(|n| n == 1), "n must be 1");
+     ensure!(
+         request.logprobs.as_ref().is_none_or(Value::is_null),
+@@ -1079,9 +1156,10 @@
+     let prompts = request.prompt.into_vec();
+     ensure!(prompts.len() == 1, "exactly one prompt string is supported");
+     let prompt = tokenizer.encode(&prompts[0])?;
+-    // OpenAI's completions default is 16 tokens.
+-    let budget =
+-        resolve_budget(prompt.len(), Some(request.max_tokens.unwrap_or(16)), max_seq)?;
++    // Preserve OpenAI's legacy 16-token completion default without the candidate.
++    let requested = if mtp2_policy.is_some() { request.max_tokens }
++        else { Some(request.max_tokens.unwrap_or(16)) };
++    let budget = resolve_request_budget(prompt.len(), requested, max_seq, mtp2_policy)?;
+     let sampling = resolve_sampling(&request.sampling, &defaults.sampling)?;
+     // A raw prompt gets exactly the controls it asks for: the server's
+     // defaults are for chat, and the engine applies them only when the
+@@ -1097,6 +1175,7 @@
+     );
+     Ok(Prepared {
+         kind: Kind::Completion,
++        mtp2_policy,
+         prompt,
+         max_tokens: budget.max_tokens,
+         sampling,
+--- a/src/serve/batch.rs
++++ b/src/serve/batch.rs
+@@ -692,7 +692,8 @@
+     /// with theirs ([`Engine::in_flight`]).
+     fn fits(&self, job: &Job, rows: &[Row<'_, M>]) -> bool {
+         let growth = job.prepared.max_tokens.min(ADMIT_GROWTH_TOKENS);
+-        let tokens = (job.prepared.prompt.len() + growth).min(self.max_seq);
++        let tokens = (job.prepared.prompt.len() + growth)
++            .min(job.prepared.context_tokens(self.max_seq));
+         let checkpoints = 1 + self.sessions.decode_checkpoints_within(growth);
+         let estimate =
+             self.model.session_bytes(tokens, checkpoints).unwrap_or(0) as usize;
+--- /dev/null
++++ b/src/serve/mtp2.rs
+@@ -0,0 +1,500 @@
++//! Opt-in shared MTP2 context policies. This module does not schedule peers.
++//! A profile limits one request; the engine's context and draft count stay fixed.
++
++use std::collections::HashSet;
++use std::io::Read;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++use anyhow::{Context as _, Result, ensure};
++use serde::Deserialize;
++use serde::de::{Deserializer, Visitor};
++use serde_json::Value;
++
++use crate::engine::{DecodeStateApi, LanguageModel};
++use crate::generate::{
++    DecodeCheckpointer, FinishReason, GenerateOptions, Generation, Generator,
++};
++use crate::metal::MetalContext;
++use crate::sha256::Sha256;
++
++pub const RESIDENT_CONTEXT_TOKENS: usize = 262_144;
++pub const OUTPUT_TOKENS: usize = 65_536;
++pub const DRAFTS: usize = 2;
++// Pinned verify: m=(1+k), ahead_rows=2*(1+chain), ensure_room adds MAX_DRAFTS.
++// The candidate fixes k=chain=2; changing that contract needs a new audit.
++pub const PHYSICAL_TAIL_RESERVE: usize =
++    (1 + DRAFTS) + 2 * (1 + DRAFTS) + crate::qwen4exp::MAX_DRAFTS;
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub enum PolicyMode {
++    #[default]
++    Disabled,
++    SharedMtp2,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Profile {
++    Ctx64k,
++    Ctx128k,
++    Ctx262k,
++}
++
++impl Profile {
++    pub const ALL: [Self; 3] = [Self::Ctx64k, Self::Ctx128k, Self::Ctx262k];
++
++    pub fn id(self) -> &'static str {
++        match self {
++            Self::Ctx64k => "ctx64k-mtp2",
++            Self::Ctx128k => "ctx128k-mtp2",
++            Self::Ctx262k => "ctx262k-mtp2",
++        }
++    }
++
++    pub fn alias(self) -> &'static str {
++        match self {
++            Self::Ctx64k => "qwen3.8-flash-next-lily-q4-mtp2-64k",
++            Self::Ctx128k => "qwen3.8-flash-next-lily-q4-mtp2-128k",
++            Self::Ctx262k => "qwen3.8-flash-next-lily-q4-mtp2-262k",
++        }
++    }
++
++    pub fn context_tokens(self) -> usize {
++        match self {
++            Self::Ctx64k => 65_536,
++            Self::Ctx128k => 131_072,
++            Self::Ctx262k => RESIDENT_CONTEXT_TOKENS,
++        }
++    }
++}
++
++impl<'de> Deserialize<'de> for Profile {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        struct ProfileVisitor;
++        impl Visitor<'_> for ProfileVisitor {
++            type Value = Profile;
++            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++                f.write_str("a supported liliuxflow_profile string")
++            }
++            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Profile, E> {
++                match value {
++                    "ctx64k-mtp2" => Ok(Profile::Ctx64k),
++                    "ctx128k-mtp2" => Ok(Profile::Ctx128k),
++                    "ctx262k-mtp2" => Ok(Profile::Ctx262k),
++                    _ => Err(E::custom("unsupported liliuxflow_profile")),
++                }
++            }
++        }
++        deserializer.deserialize_str(ProfileVisitor)
++    }
++}
++
++/// Missing is allowed by serde's field default; an explicit null is not a policy.
++pub fn deserialize_profile<'de, D: Deserializer<'de>>(
++    deserializer: D,
++) -> Result<Option<Profile>, D::Error> {
++    Profile::deserialize(deserializer).map(Some)
++}
++
++/// Only the finite profile is stored. The ceiling cannot drift from its mapping.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct RequestPolicy {
++    profile: Profile,
++}
++
++impl RequestPolicy {
++    pub fn profile(self) -> Profile {
++        self.profile
++    }
++    pub fn context_tokens(self) -> usize {
++        self.profile.context_tokens()
++    }
++    pub fn alias(self) -> &'static str {
++        self.profile.alias()
++    }
++
++    pub(super) fn validate_tokens(
++        self,
++        prompt_tokens: usize,
++        output_tokens: usize,
++        resident_context: usize,
++    ) -> Result<()> {
++        ensure!(
++            self.context_tokens() <= resident_context,
++            "request context exceeds resident context"
++        );
++        ensure!(
++            prompt_tokens > 0 && prompt_tokens < self.context_tokens(),
++            "prompt exceeds the request context: {prompt_tokens} prompt tokens, {} tokens of context (at least one completion token must fit)",
++            self.context_tokens()
++        );
++        ensure!(
++            output_tokens > 0 && output_tokens <= OUTPUT_TOKENS,
++            "output exceeds the shared MTP2 output budget"
++        );
++        ensure!(
++            output_tokens <= self.context_tokens() - prompt_tokens,
++            "prompt plus output exceeds the request context"
++        );
++        Ok(())
++    }
++}
++
++pub(super) fn resolve_policy(
++    mode: PolicyMode,
++    profile: Option<Profile>,
++    resident_context: usize,
++    kwargs: Option<&Value>,
++) -> Result<Option<RequestPolicy>> {
++    match mode {
++        PolicyMode::Disabled => {
++            ensure!(
++                profile.is_none(),
++                "liliuxflow_profile requires the shared MTP2 candidate"
++            );
++            Ok(None)
++        }
++        PolicyMode::SharedMtp2 => {
++            ensure!(
++                resident_context == RESIDENT_CONTEXT_TOKENS,
++                "shared MTP2 requires its fixed resident context"
++            );
++            ensure!(
++                !kwargs.and_then(Value::as_object).is_some_and(|object| object
++                    .keys()
++                    .any(|key| key.starts_with("liliuxflow_"))),
++                "reserved shared MTP2 policy fields are not allowed in chat_template_kwargs"
++            );
++            let profile = profile.context(
++                "liliuxflow_profile is required by the shared MTP2 candidate",
++            )?;
++            Ok(Some(RequestPolicy { profile }))
++        }
++    }
++}
++
++/// Counts the real model loader's calls across idle unload and fault recovery.
++/// A successful load fingerprints its recorded weight buffers before scratch exists.
++pub(super) struct WeightLoads {
++    salt: [u8; 32],
++    started: AtomicU64,
++    completed: AtomicU64,
++    recorded_generation: AtomicU64,
++}
++
++#[derive(Debug, Clone)]
++pub(super) struct WeightResidency {
++    pub generation: u64,
++    pub load_count: u64,
++    pub allocation_id: String,
++    pub buffer_count: usize,
++    pub allocation_bytes: u64,
++    pub paged_weight_bytes: u64,
++}
++
++// `fetch_update` is kept for the crate's Rust 1.92 MSRV.
++#[allow(deprecated)]
++impl WeightLoads {
++    pub(super) fn new() -> Result<Self> {
++        let mut salt = [0; 32];
++        std::fs::File::open("/dev/urandom")?.read_exact(&mut salt)?;
++        Ok(Self {
++            salt,
++            started: AtomicU64::new(0),
++            completed: AtomicU64::new(0),
++            recorded_generation: AtomicU64::new(0),
++        })
++    }
++
++    pub(super) fn begin(&self) -> Result<u64> {
++        let previous = self
++            .started
++            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
++            .map_err(|_| anyhow::anyhow!("weight load counter exhausted"))?;
++        Ok(previous + 1)
++    }
++
++    /// Handles are hashed with a private random salt; no address is retained or
++    /// formatted. The generation also distinguishes reuse of an allocation address.
++    pub(super) fn loaded(
++        &self,
++        generation: u64,
++        buffers: impl IntoIterator<Item = (usize, usize)>,
++        paged_weight_bytes: u64,
++    ) -> Result<WeightResidency> {
++        ensure!(
++            generation > 0 && generation <= self.started.load(Ordering::Relaxed),
++            "weight allocation has no actual load generation"
++        );
++        let mut seen = HashSet::new();
++        let mut bytes = 0u64;
++        let mut digest = Sha256::new();
++        digest.update(b"liliuxflow-mtp2-weight-allocation-v1");
++        digest.update(&self.salt);
++        digest.update(&generation.to_le_bytes());
++        for (handle, size) in buffers {
++            if seen.insert(handle) {
++                bytes = bytes
++                    .checked_add(size as u64)
++                    .context("weight allocation bytes overflow")?;
++                digest.update(&handle.to_le_bytes());
++                digest.update(&size.to_le_bytes());
++            }
++        }
++        ensure!(
++            !seen.is_empty() && bytes > 0,
++            "shared MTP2 has no recorded weight allocations"
++        );
++        self.recorded_generation
++            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
++                (generation > previous).then_some(generation)
++            })
++            .map_err(|_| {
++                anyhow::anyhow!("weight load generation was already recorded")
++            })?;
++        let allocation_id =
++            digest.finish().iter().map(|b| format!("{b:02x}")).collect();
++        let load_count = self
++            .completed
++            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
++            .map_err(|_| anyhow::anyhow!("weight load counter exhausted"))?
++            + 1;
++        Ok(WeightResidency {
++            generation,
++            load_count,
++            allocation_id,
++            buffer_count: seen.len(),
++            allocation_bytes: bytes,
++            paged_weight_bytes,
++        })
++    }
++}
++
++impl WeightResidency {
++    pub(super) fn resident_line(&self) -> String {
++        format!(
++            "LILY_MTP2_RESIDENT protocol=1 resident_context_tokens={RESIDENT_CONTEXT_TOKENS} kv_cache=bf16 mtp_drafts={DRAFTS} max_batch=1 weight_load_generation={} weight_load_count={} weight_allocation_id={} weight_buffer_count={} weight_allocation_bytes={} paged_weight_bytes={}",
++            self.generation,
++            self.load_count,
++            self.allocation_id,
++            self.buffer_count,
++            self.allocation_bytes,
++            self.paged_weight_bytes
++        )
++    }
++
++    pub(super) fn policy_line(
++        &self,
++        request_id: &str,
++        policy: RequestPolicy,
++        prompt_tokens: usize,
++        output_tokens: usize,
++    ) -> String {
++        format!(
++            "[lily-meta] request_id={request_id} phase=mtp2_policy protocol=1 profile_id={} context_tokens={} prompt_tokens={prompt_tokens} output_tokens={output_tokens} resident_context_tokens={RESIDENT_CONTEXT_TOKENS} weight_load_generation={} weight_load_count={} weight_allocation_id={} mtp_drafts={DRAFTS}",
++            policy.profile().id(),
++            policy.context_tokens(),
++            self.generation,
++            self.load_count,
++            self.allocation_id
++        )
++    }
++}
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++enum BoundaryStop {
++    #[default]
++    None,
++    TailYield,
++    Terminal,
++}
++
++/// Distinguishes an internal boundary yield from a real callback stop. Thinking
++/// insertions may call back again after a yield, so a later terminal always wins.
++#[derive(Debug)]
++pub(super) struct ContextTail {
++    prompt_tokens: usize,
++    output_tokens: usize,
++    emitted: usize,
++    stop: BoundaryStop,
++}
++
++impl ContextTail {
++    pub(super) fn new(prompt_tokens: usize, output_tokens: usize) -> Result<Self> {
++        Self::resuming(prompt_tokens, output_tokens, 0)
++    }
++
++    /// A future row resume starts with its already-delivered draw count. It must
++    /// use the same boundary policy; it cannot reset its output or seed index.
++    pub(super) fn resuming(
++        prompt_tokens: usize,
++        output_tokens: usize,
++        emitted: usize,
++    ) -> Result<Self> {
++        ensure!(
++            prompt_tokens > 0
++                && output_tokens > 0
++                && output_tokens <= OUTPUT_TOKENS
++                && emitted <= output_tokens
++                && output_tokens
++                    <= RESIDENT_CONTEXT_TOKENS.saturating_sub(prompt_tokens),
++            "invalid shared MTP2 physical token budget"
++        );
++        Ok(Self { prompt_tokens, output_tokens, emitted, stop: BoundaryStop::None })
++    }
++
++    pub(super) fn observe(&mut self, keep: bool) -> Result<bool> {
++        self.emitted += 1;
++        ensure!(
++            self.emitted <= self.output_tokens,
++            "MTP2 emitted beyond the output budget"
++        );
++        if !keep {
++            self.stop = BoundaryStop::Terminal;
++            return Ok(false);
++        }
++        let rest = self.prompt_tokens + self.emitted - 1;
++        if self.emitted < self.output_tokens
++            && RESIDENT_CONTEXT_TOKENS - rest < PHYSICAL_TAIL_RESERVE
++            && self.stop != BoundaryStop::Terminal
++        {
++            self.stop = BoundaryStop::TailYield;
++            return Ok(false);
++        }
++        Ok(self.stop == BoundaryStop::None)
++    }
++
++    pub(super) fn should_resume(&self, finish: FinishReason) -> bool {
++        self.stop == BoundaryStop::TailYield
++            && finish == FinishReason::Callback
++            && self.emitted < self.output_tokens
++    }
++
++    /// An insertion can finish its group after the internal yield callback.
++    /// Reaching the real budget is Length; a true stop or cancellation wins.
++    pub(super) fn finish_reason(
++        &self,
++        finish: FinishReason,
++        active: bool,
++    ) -> FinishReason {
++        if active
++            && self.stop == BoundaryStop::TailYield
++            && finish == FinishReason::Callback
++            && self.emitted == self.output_tokens
++        {
++            FinishReason::Length
++        } else {
++            finish
++        }
++    }
++}
++
++pub(super) struct TailEvidence {
++    pub tokens: usize,
++    pub start_position: usize,
++    pub end_position: usize,
++    pub generated_tokens: usize,
++}
++
++impl TailEvidence {
++    pub(super) fn line(&self, request_id: &str) -> String {
++        format!(
++            "[lily-meta] request_id={request_id} phase=mtp2_context_tail reason=physical_context_scratch_reserve reserve_tokens={PHYSICAL_TAIL_RESERVE} context_tail_tokens={} start_position={} end_position={} generated_tokens={} resident_context_tokens={RESIDENT_CONTEXT_TOKENS} mtp_drafts={DRAFTS}",
++            self.tokens, self.start_position, self.end_position, self.generated_tokens
++        )
++    }
++}
++
++/// The original speculative loop settles with finish_speculation(None) before
++/// returning Callback. Resume only its bounded physical tail on the same state,
++/// parser, sampler indices and checkpoints. The normal loop and engine stay MTP2.
++#[allow(clippy::too_many_arguments)]
++pub(super) fn generate_bounded<M: LanguageModel>(
++    generator: &Generator,
++    ctx: &MetalContext,
++    model: &M,
++    state: &mut M::State,
++    scratch: &mut M::Scratch,
++    prompt: &[u32],
++    prompt_tokens: usize,
++    options: &GenerateOptions<'_>,
++    mut checkpoints: Option<&mut dyn DecodeCheckpointer<M::State>>,
++    on_token: &mut dyn FnMut(u32) -> Result<bool>,
++    is_active: &dyn Fn() -> bool,
++) -> Result<(Generation, Option<TailEvidence>)> {
++    ensure!(
++        options.drafts == DRAFTS && model.max_drafts() >= DRAFTS,
++        "shared MTP2 requires two available drafts"
++    );
++    ensure!(
++        state.pos().checked_add(prompt.len()) == Some(prompt_tokens),
++        "shared MTP2 prompt/state position mismatch"
++    );
++    let before = state.pos();
++    let mut boundary = ContextTail::new(prompt_tokens, options.max_tokens)?;
++    let mut generation = generator.generate_checkpointed(
++        ctx,
++        model,
++        state,
++        scratch,
++        prompt,
++        options,
++        checkpoints.as_mut().map(|c| &mut **c as &mut dyn DecodeCheckpointer<M::State>),
++        &mut |token| boundary.observe(on_token(token)?),
++    )?;
++    let active = is_active();
++    generation.finish = boundary.finish_reason(generation.finish, active);
++    if !boundary.should_resume(generation.finish) || !active {
++        return Ok((generation, None));
++    }
++    ensure!(
++        state.pos() == prompt_tokens + generation.tokens.len() - 1,
++        "MTP2 tail did not settle with its last draw unfed"
++    );
++    let remaining = options.max_tokens - generation.tokens.len();
++    let start_position = state.pos();
++    ensure!(
++        RESIDENT_CONTEXT_TOKENS - state.pos() < PHYSICAL_TAIL_RESERVE
++            && remaining < PHYSICAL_TAIL_RESERVE,
++        "MTP2 ordinary tail escaped the physical boundary"
++    );
++    let tail_options = GenerateOptions {
++        max_tokens: options.max_tokens,
++        sampling: options.sampling,
++        stop_tokens: options.stop_tokens,
++        drafts: 0,
++        thinking: options.thinking,
++    };
++    let drawn = generation.tokens.len();
++    let resumed = generator.resume(
++        ctx,
++        model,
++        state,
++        scratch,
++        &mut generation.tokens,
++        &tail_options,
++        checkpoints,
++        on_token,
++    )?;
++    let tail_tokens = generation.tokens.len() - drawn;
++    let rest = prompt_tokens + generation.tokens.len() - 1;
++    ensure!(
++        state.pos() == rest + usize::from(resumed.parked_draw.is_some()),
++        "MTP2 tail state/draw position mismatch"
++    );
++    generation.finish = resumed.finish;
++    generation.drafted += resumed.drafted;
++    generation.accepted += resumed.accepted;
++    generation.fed =
++        state.pos().checked_sub(before).context("MTP2 tail moved backwards")?;
++    let evidence = TailEvidence {
++        tokens: tail_tokens,
++        start_position,
++        end_position: state.pos(),
++        generated_tokens: generation.tokens.len(),
++    };
++    Ok((generation, Some(evidence)))
++}
++
++#[cfg(test)]
++#[path = "../../tests/unit/serve/mtp2.rs"]
++mod tests;
+--- a/src/serve/request.rs
++++ b/src/serve/request.rs
+@@ -590,14 +590,14 @@
+         prefill: &mut impl PrefillChunks<M>,
+     ) -> Result<Option<Admitted<'g, M>>> {
+         let request_id = sink.metadata.request_id.clone();
+-        // The HTTP thread validated against the same limit; this only guards
+-        // the engine's buffers if the two ever disagree.
+-        ensure!(
+-            p.prompt.len() < self.max_seq,
+-            "prompt exceeds the engine context: {} prompt tokens, {} tokens of context",
+-            p.prompt.len(),
+-            self.max_seq
+-        );
++        // Recheck the immutable policy at admission, including output room.
++        let mode = if self.mtp2_residency.is_some() {
++            super::mtp2::PolicyMode::SharedMtp2
++        } else { super::mtp2::PolicyMode::Disabled };
++        p.validate_context(self.max_seq, mode)?;
++        if let (Some(residency), Some(policy)) = (&self.mtp2_residency, p.mtp2_policy) {
++            eprintln!("{}", residency.policy_line(&request_id, policy, p.prompt.len(), p.max_tokens));
++        }
+         let n = p.prompt.len();
+         let images: Vec<CachedImage> =
+             p.images.iter().map(|i| CachedImage::new(i.span, i.digest)).collect();
+@@ -867,7 +867,7 @@
+             );
+             self.timings.record(TimingsEntry {
+                 id,
+-                model: M::MODEL_ID,
++                model: p.response_model(M::MODEL_ID),
+                 created,
+                 timings: measured,
+             });
+@@ -962,7 +962,7 @@
+         let out = Output {
+             id,
+             created,
+-            model: M::MODEL_ID,
++            model: p.response_model(M::MODEL_ID),
+             kind: p.kind,
+             stream: p.stream,
+             collected: Collected::default(),
+@@ -974,7 +974,7 @@
+                 sink.sse(&chunk(
+                     &out.id,
+                     created,
+-                    M::MODEL_ID,
++                    out.model,
+                     json!({"role": "assistant", "content": ""}),
+                     None,
+                 ));
+@@ -1404,7 +1404,7 @@
+         );
+         self.timings.record(TimingsEntry {
+             id: out.id.clone(),
+-            model: M::MODEL_ID,
++            model: p.response_model(M::MODEL_ID),
+             created: out.created,
+             timings: measured,
+         });
+@@ -1428,7 +1428,7 @@
+             kind: p.kind,
+             id: &out.id,
+             created: out.created,
+-            model: M::MODEL_ID,
++            model: p.response_model(M::MODEL_ID),
+             finish_reason,
+             usage,
+             timings: serde_json::to_value(measured)?,
+--- a/tests/unit/serve.rs
++++ b/tests/unit/serve.rs
+@@ -1,5 +1,56 @@
+ use super::*;
+ use crate::qwen4exp::ImageSpan;
++
++fn shared_candidate_options() -> ServeOptions {
++    ServeOptions {
++        bind: "127.0.0.1:0".into(), max_seq: 262_144, liliuxflow_mtp2_shared_context: true,
++        cache_bytes: Some(8 << 30), kv_format: Some(KvFormat::Bf16), max_sessions: 1,
++        ngram_storage: NgramStorage::Paged, ngram_preload: true, ngram_lock: false,
++        mtp_drafts: 2, memory_limit: None, vision: VisionMode::Auto,
++        image_max_pixels: crate::qwen4exp::image::DEFAULT_MAX_PIXELS,
++        image_min_pixels: crate::qwen4exp::image::DEFAULT_MIN_PIXELS,
++        disk_cache_dir: None, disk_cache_bytes: 0, disk_cache_ttl_secs: 0,
++        durable_min_tokens: 0, decode_checkpoint_tokens: 0, thinking: true,
++        reasoning_effort: None, thinking_controls: api::ThinkingDefaults::default(),
++        thinking_texts: None, queue: 2, max_batch: Some(1), sampling: SamplingOverrides::default(),
++        idle_unload_secs: 0, pin_weights: pin::PinMode::Off, pin_hold_secs: 0, inject_metal_fault: None,
++    }
++}
++
++#[test]
++fn shared_candidate_fails_closed_without_its_fixed_p1_configuration() {
++    assert!(check_shared_mtp2_options(&shared_candidate_options()).is_ok());
++    let mutations: &[fn(&mut ServeOptions)] = &[
++        |o| o.max_seq = 131_072, |o| o.mtp_drafts = 0,
++        |o| o.kv_format = None, |o| o.kv_format = Some(KvFormat::Q8),
++        |o| o.max_batch = Some(2), |o| o.max_batch = None,
++        |o| o.pin_weights = pin::PinMode::Auto, |o| o.ngram_preload = false,
++        |o| o.ngram_lock = true, |o| o.thinking = false,
++        |o| o.reasoning_effort = Some("low".into()),
++        |o| o.thinking_controls.budgets = api::ThinkingBudgets::parse("8000").unwrap(),
++        |o| o.thinking_controls.nudges = true,
++        |o| o.thinking_controls.tool_call_ends_thinking = true,
++        |o| o.disk_cache_bytes = 1 << 30,
++    ];
++    for mutate in mutations {
++        let mut options = shared_candidate_options();
++        mutate(&mut options);
++        assert!(check_shared_mtp2_options(&options).is_err());
++        options.liliuxflow_mtp2_shared_context = false;
++        assert!(check_shared_mtp2_options(&options).is_ok(), "legacy options have no new constraints");
++    }
++}
++
++#[test]
++fn shared_candidate_route_validation_is_exact_and_does_not_echo_invalid_values() {
++    assert!(check_shared_mtp2_route(Some("split"), Some("scalar")).is_ok());
++    for (route, scores) in [(None, Some("scalar")), (Some("split"), None),
++        (Some("query"), Some("scalar")), (Some("split"), Some("tensor")),
++        (Some("private-route-marker"), Some("scalar"))] {
++        let error = check_shared_mtp2_route(route, scores).unwrap_err().to_string();
++        assert!(!error.contains("private-route-marker"));
++    }
++}
+ 
+ #[test]
+ fn effective_engine_metadata_uses_bounded_enum_and_exact_numeric_values() {
+--- a/tests/unit/serve/api.rs
++++ b/tests/unit/serve/api.rs
+@@ -1,4 +1,180 @@
+ use super::*;
++use serde_json::json;
++
++#[test]
++fn shared_profile_fields_reject_null_unknown_duplicate_and_kwargs_overrides() {
++    for payload in [
++        r#"{"messages":[],"liliuxflow_profile":null}"#,
++        r#"{"messages":[],"liliuxflow_profile":7}"#,
++        r#"{"messages":[],"liliuxflow_profile":"unknown-private-marker"}"#,
++        r#"{"messages":[],"liliuxflow_profile":"ctx64k-mtp2","liliuxflow_profile":"ctx262k-mtp2"}"#,
++    ] {
++        let err = serde_json::from_str::<ChatRequest>(payload).unwrap_err();
++        assert!(!err.to_string().contains("unknown-private-marker"));
++    }
++    let raw = r#"{"prompt":"a","liliuxflow_profile":"ctx64k-mtp2","liliuxflow_profile":"ctx262k-mtp2"}"#;
++    assert!(serde_json::from_str::<CompletionRequest>(raw).is_err());
++}
++
++#[test]
++fn shared_output_budget_caps_defaults_requests_and_every_context_tail() {
++    for profile in Profile::ALL {
++        let policy = mtp2::resolve_policy(PolicyMode::SharedMtp2, Some(profile),
++            mtp2::RESIDENT_CONTEXT_TOKENS, None).unwrap();
++        let limit = profile.context_tokens();
++        for prompt in [1, limit - 2, limit - 1] {
++            for requested in [None, Some(1), Some(2), Some(65_536), Some(65_537), Some(usize::MAX)] {
++                let budget = resolve_request_budget(prompt, requested,
++                    mtp2::RESIDENT_CONTEXT_TOKENS, policy).unwrap();
++                assert_eq!(budget.max_tokens, requested.unwrap_or(65_536).min(65_536).min(limit - prompt));
++                assert_eq!(budget.clamped_from, requested.filter(|&n| n > budget.max_tokens));
++            }
++        }
++        assert!(resolve_request_budget(limit, None, mtp2::RESIDENT_CONTEXT_TOKENS, policy).is_err());
++        assert!(resolve_request_budget(limit + 1, Some(1), mtp2::RESIDENT_CONTEXT_TOKENS, policy).is_err());
++        assert!(resolve_request_budget(10, Some(0), mtp2::RESIDENT_CONTEXT_TOKENS, policy).is_err());
++    }
++    assert_eq!(resolve_request_budget(10, None, 100, None).unwrap().max_tokens, 90);
++}
++
++/// Tiny synthetic tokenizer assets only. No checkpoint, Metal context, or model
++/// loader participates in these policy tests.
++struct CpuPolicyFixture {
++    path: std::path::PathBuf,
++    tokenizer: Tokenizer,
++}
++
++impl CpuPolicyFixture {
++    fn new() -> Self {
++        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++        let path = std::env::temp_dir().join(format!("lily-mtp2-policy-cpu-{}-{}",
++            std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
++        std::fs::create_dir(&path).unwrap();
++        let mut chars: Vec<char> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
++            .into_iter().collect();
++        chars.sort_unstable();
++        let vocab: serde_json::Map<String, Value> = chars.into_iter().enumerate()
++            .map(|(id, c)| (c.to_string(), id.into())).collect();
++        let specials = ["<|im_start|>", "<|im_end|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"];
++        let added: Vec<Value> = specials.iter().enumerate().map(|(i, text)| json!({
++            "id": 256 + i, "content": text, "single_word": false, "lstrip": false,
++            "rstrip": false, "normalized": false, "special": true
++        })).collect();
++        let byte_level = json!({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false});
++        let data = json!({
++            "version":"1.0","truncation":null,"padding":null,"added_tokens":added,
++            "normalizer":null,"pre_tokenizer":byte_level,"post_processor":byte_level,"decoder":byte_level,
++            "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"",
++                "end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
++                "vocab":vocab,"merges":[]}
++        });
++        std::fs::write(path.join("tokenizer.json"), data.to_string()).unwrap();
++        let template = r#"{% if tools %}{{ tools | tojson }}{% endif %}{% for m in messages %}<|im_start|>{{ m.role }}
++{% if m.content is string %}{{ m.content }}{% else %}{% for c in m.content %}{% if c.type == 'image' %}<|vision_start|><|image_pad|><|vision_end|>{% else %}{{ c.text }}{% endif %}{% endfor %}{% endif %}<|im_end|>
++{% endfor %}<|im_start|>assistant
++{% if enable_thinking %}<think>
++{% endif %}"#;
++        std::fs::write(path.join("chat_template.jinja"), template).unwrap();
++        let tokenizer = Tokenizer::from_model_dir(&path).unwrap();
++        Self { path, tokenizer }
++    }
++}
++
++impl Drop for CpuPolicyFixture {
++    fn drop(&mut self) { std::fs::remove_dir_all(&self.path).unwrap(); }
++}
++
++fn cpu_policy_defaults() -> Defaults {
++    Defaults { sampling: SamplingParams { temperature: 1.0, top_k: 0,
++        ..SamplingParams::greedy() }, thinking: true,
++        reasoning_effort: None, thinking_controls: ThinkingDefaults::default() }
++}
++
++#[test]
++fn full_chat_tool_and_image_tokenization_decides_the_profile_ceiling() {
++    let fixture = CpuPolicyFixture::new();
++    let defaults = cpu_policy_defaults();
++    let images = ImagePolicy { limits: ImageLimits::default(), available: Ok(()), memo: Arc::default() };
++    let body = json!({
++        "model":"rewritten-physical-model",
++        "liliuxflow_profile":"ctx128k-mtp2",
++        "messages":[{"role":"user","content":[
++            {"type":"text","text":"a".repeat(65_500)},
++            {"type":"image_url","image_url":{"url":png_data_uri(7)}}
++        ]}],
++        "tools":[{"type":"function","function":{"name":"inspect","description":"b".repeat(200),
++            "parameters":{"type":"object","properties":{}}}}],
++        "max_tokens":65_537,
++        "chat_template_kwargs":{"enable_thinking":true,"reasoning_effort":"high"}
++    });
++    let request: ChatRequest = serde_json::from_value(body.clone()).unwrap();
++    let prepared = prepare_chat_with_policy(request, &fixture.tokenizer, &defaults,
++        mtp2::RESIDENT_CONTEXT_TOKENS, &images, PolicyMode::SharedMtp2).unwrap();
++    assert!(prepared.prompt.len() > 65_536, "template/tools/images are part of the native prompt count");
++    assert_eq!(prepared.images.len(), 1);
++    assert!(prepared.images[0].span.len > 1, "the actual image grid expanded its placeholder");
++    assert_eq!(prepared.max_tokens, (131_072 - prepared.prompt.len()).min(65_536));
++    assert_eq!(prepared.response_model("base"), Profile::Ctx128k.alias());
++    assert!(prepared.thinking_open);
++    assert_eq!(prepared.thinking, ThinkingSettings { seed: prepared.sampling.seed,
++        grace: defaults.thinking_controls.grace,
++        ..ThinkingSettings::default() });
++    let mut smaller = body;
++    smaller["liliuxflow_profile"] = "ctx64k-mtp2".into();
++    let err = prepare_chat_with_policy(serde_json::from_value(smaller).unwrap(), &fixture.tokenizer,
++        &defaults, mtp2::RESIDENT_CONTEXT_TOKENS, &images, PolicyMode::SharedMtp2).unwrap_err();
++    assert!(err.to_string().contains("prompt exceeds"));
++    assert!(err.to_string().contains(&prepared.prompt.len().to_string()));
++}
++
++#[test]
++fn prepared_policies_and_response_aliases_stay_request_local() {
++    let fixture = CpuPolicyFixture::new();
++    let defaults = cpu_policy_defaults();
++    let make = |profile: Profile, seed: i64, temperature: f32| {
++        prepare_completion_with_policy(serde_json::from_value(json!({
++            "prompt":"abc", "model":"any-external-model-string", "liliuxflow_profile":profile.id(),
++            "seed":seed,"temperature":temperature
++        })).unwrap(), &fixture.tokenizer, &defaults, mtp2::RESIDENT_CONTEXT_TOKENS,
++            PolicyMode::SharedMtp2).unwrap()
++    };
++    let first = make(Profile::Ctx64k, 7, 0.1);
++    let second = make(Profile::Ctx262k, 9, 0.7);
++    assert_eq!(first.context_tokens(mtp2::RESIDENT_CONTEXT_TOKENS), 65_536);
++    assert_eq!(first.max_tokens, 65_533);
++    assert_eq!(second.max_tokens, 65_536);
++    assert_eq!((first.sampling.seed, second.sampling.seed), (7, 9));
++    assert_eq!((first.sampling.temperature, second.sampling.temperature), (0.1, 0.7));
++    assert_eq!(first.response_model("base"), Profile::Ctx64k.alias());
++    assert_eq!(second.response_model("base"), Profile::Ctx262k.alias());
++    assert!(first.validate_context(mtp2::RESIDENT_CONTEXT_TOKENS, PolicyMode::SharedMtp2).is_ok());
++    assert!(first.validate_context(mtp2::RESIDENT_CONTEXT_TOKENS, PolicyMode::Disabled).is_err());
++    let mut broken = first.clone();
++    broken.max_tokens += 1;
++    assert!(broken.validate_context(mtp2::RESIDENT_CONTEXT_TOKENS, PolicyMode::SharedMtp2).is_err());
++    assert_eq!(first.context_tokens(mtp2::RESIDENT_CONTEXT_TOKENS), 65_536);
++    assert_eq!(defaults.sampling.temperature, 1.0);
++}
++
++#[test]
++fn native_raw_tokenizer_preserves_exact_ceiling_minus_one_minus_two_and_rejects_full_prompt() {
++    let fixture = CpuPolicyFixture::new();
++    let defaults = cpu_policy_defaults();
++    for room in [1, 2] {
++        let prompt = "a".repeat(65_536 - room);
++        let request = serde_json::from_value(json!({"prompt":prompt, "liliuxflow_profile":"ctx64k-mtp2"})).unwrap();
++        let prepared = prepare_completion_with_policy(request, &fixture.tokenizer, &defaults,
++            mtp2::RESIDENT_CONTEXT_TOKENS, PolicyMode::SharedMtp2).unwrap();
++        assert_eq!((prepared.prompt.len(), prepared.max_tokens), (65_536 - room, room));
++    }
++    let request = serde_json::from_value(json!({"prompt":"a".repeat(65_536), "liliuxflow_profile":"ctx64k-mtp2"})).unwrap();
++    assert!(prepare_completion_with_policy(request, &fixture.tokenizer, &defaults,
++        mtp2::RESIDENT_CONTEXT_TOKENS, PolicyMode::SharedMtp2).is_err());
++    let old = serde_json::from_value(json!({"prompt":"abc"})).unwrap();
++    let prepared = prepare_completion(old, &fixture.tokenizer, &defaults, 65_536).unwrap();
++    assert_eq!(prepared.max_tokens, 16, "the legacy raw endpoint keeps its original default");
++    assert_eq!(prepared.response_model("legacy-model"), "legacy-model");
++}
+ 
+ #[test]
+ fn usage_reports_reasoning_tokens_for_chat() {
+--- /dev/null
++++ b/tests/unit/serve/mtp2.rs
+@@ -0,0 +1,255 @@
++use super::*;
++
++#[test]
++fn shared_profile_policy_is_finite_required_and_candidate_only() {
++    for profile in Profile::ALL {
++        let parsed: Profile =
++            serde_json::from_value(Value::String(profile.id().into())).unwrap();
++        assert_eq!(parsed, profile);
++        let policy = resolve_policy(
++            PolicyMode::SharedMtp2,
++            Some(profile),
++            RESIDENT_CONTEXT_TOKENS,
++            None,
++        )
++        .unwrap()
++        .unwrap();
++        assert_eq!(policy.context_tokens(), profile.context_tokens());
++        assert_eq!(policy.alias(), profile.alias());
++        assert!(
++            resolve_policy(PolicyMode::Disabled, Some(profile), 65_536, None).is_err()
++        );
++    }
++    assert!(
++        resolve_policy(PolicyMode::SharedMtp2, None, RESIDENT_CONTEXT_TOKENS, None)
++            .is_err()
++    );
++    assert!(
++        resolve_policy(PolicyMode::SharedMtp2, Some(Profile::Ctx64k), 131_072, None)
++            .is_err()
++    );
++    assert_eq!(resolve_policy(PolicyMode::Disabled, None, 65_536, None).unwrap(), None);
++}
++
++#[test]
++fn unknown_profiles_do_not_echo_caller_strings_and_kwargs_cannot_override_policy() {
++    let marker = "private-marker-not-a-profile";
++    let err =
++        serde_json::from_value::<Profile>(Value::String(marker.into())).unwrap_err();
++    assert!(!err.to_string().contains(marker));
++    for key in ["liliuxflow_profile", "liliuxflow_tenant", "liliuxflow_request_id"] {
++        let kwargs = serde_json::json!({key: marker, "enable_thinking": true});
++        let err = resolve_policy(
++            PolicyMode::SharedMtp2,
++            Some(Profile::Ctx64k),
++            RESIDENT_CONTEXT_TOKENS,
++            Some(&kwargs),
++        )
++        .unwrap_err();
++        assert!(!err.to_string().contains(marker));
++    }
++    let valid =
++        serde_json::json!({"enable_thinking": true, "reasoning_effort": "high"});
++    assert!(
++        resolve_policy(
++            PolicyMode::SharedMtp2,
++            Some(Profile::Ctx64k),
++            RESIDENT_CONTEXT_TOKENS,
++            Some(&valid)
++        )
++        .is_ok()
++    );
++}
++
++#[test]
++fn request_policy_rechecks_both_prompt_and_output_without_changing_its_ceiling() {
++    for profile in Profile::ALL {
++        let policy = resolve_policy(
++            PolicyMode::SharedMtp2,
++            Some(profile),
++            RESIDENT_CONTEXT_TOKENS,
++            None,
++        )
++        .unwrap()
++        .unwrap();
++        let limit = profile.context_tokens();
++        assert!(policy.validate_tokens(limit - 1, 1, RESIDENT_CONTEXT_TOKENS).is_ok());
++        assert!(policy.validate_tokens(limit - 2, 2, RESIDENT_CONTEXT_TOKENS).is_ok());
++        assert!(policy.validate_tokens(limit, 1, RESIDENT_CONTEXT_TOKENS).is_err());
++        assert!(policy.validate_tokens(limit - 1, 2, RESIDENT_CONTEXT_TOKENS).is_err());
++        assert!(
++            policy
++                .validate_tokens(1, OUTPUT_TOKENS + 1, RESIDENT_CONTEXT_TOKENS)
++                .is_err()
++        );
++        assert!(policy.validate_tokens(1, 0, RESIDENT_CONTEXT_TOKENS).is_err());
++        assert_eq!(policy.context_tokens(), limit);
++    }
++}
++
++fn fake_loads() -> WeightLoads {
++    WeightLoads {
++        salt: [37; 32],
++        started: AtomicU64::new(0),
++        completed: AtomicU64::new(0),
++        recorded_generation: AtomicU64::new(0),
++    }
++}
++
++#[test]
++fn weight_identity_is_bound_to_real_load_generation_and_recorded_allocations() {
++    let loads = fake_loads();
++    let first_generation = loads.begin().unwrap();
++    // Synthetic handles only. Repeated references do not double-count a buffer.
++    let first =
++        loads.loaded(first_generation, [(10, 40), (11, 60), (10, 40)], 100).unwrap();
++    assert_eq!((first.generation, first.load_count), (1, 1));
++    assert_eq!(
++        (first.buffer_count, first.allocation_bytes, first.paged_weight_bytes),
++        (2, 100, 100)
++    );
++    assert!(loads.loaded(first_generation, [(10, 40), (11, 60)], 100).is_err());
++    assert_eq!(
++        loads.completed.load(Ordering::Relaxed),
++        1,
++        "the same load cannot be counted twice"
++    );
++    assert_eq!(first.allocation_id.len(), 64);
++    assert!(
++        first
++            .allocation_id
++            .bytes()
++            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
++    );
++    let stable = first.clone();
++    for profile in Profile::ALL {
++        let policy = resolve_policy(
++            PolicyMode::SharedMtp2,
++            Some(profile),
++            RESIDENT_CONTEXT_TOKENS,
++            None,
++        )
++        .unwrap()
++        .unwrap();
++        let line = stable.policy_line("req-synthetic-1", policy, 10, 20);
++        assert!(line.contains(&format!("profile_id={}", profile.id())));
++        assert!(
++            line.contains(&format!("weight_allocation_id={}", first.allocation_id))
++        );
++        assert!(line.contains("weight_load_count=1"));
++    }
++    let reloaded =
++        loads.loaded(loads.begin().unwrap(), [(10, 40), (11, 60)], 100).unwrap();
++    assert_eq!((reloaded.generation, reloaded.load_count), (2, 2));
++    assert_ne!(
++        reloaded.allocation_id, first.allocation_id,
++        "address reuse is still a new real load"
++    );
++    let another =
++        loads.loaded(loads.begin().unwrap(), [(12, 40), (13, 60)], 100).unwrap();
++    assert_ne!(another.allocation_id, reloaded.allocation_id);
++    assert!(another.resident_line().contains(
++        "weight_buffer_count=2 weight_allocation_bytes=100 paged_weight_bytes=100"
++    ));
++    let other_loads = fake_loads();
++    let other = other_loads
++        .loaded(other_loads.begin().unwrap(), [(12, 40), (13, 60)], 100)
++        .unwrap();
++    assert_ne!(
++        other.allocation_id, first.allocation_id,
++        "actual allocation handles affect the identity with identical salt/generation"
++    );
++}
++
++#[test]
++fn failed_weight_recording_cannot_claim_a_successful_load() {
++    let loads = fake_loads();
++    assert!(loads.loaded(1, [(10, 40)], 0).is_err());
++    let first = loads.begin().unwrap();
++    assert!(loads.loaded(first, [], 0).is_err());
++    assert_eq!(loads.completed.load(Ordering::Relaxed), 0);
++    let record = loads.loaded(loads.begin().unwrap(), [(11, 40)], 0).unwrap();
++    assert_eq!((record.generation, record.load_count), (2, 1));
++}
++
++#[test]
++fn physical_tail_has_the_exact_pinned_two_draft_scratch_reserve() {
++    assert_eq!(DRAFTS, 2);
++    assert_eq!(PHYSICAL_TAIL_RESERVE, 12);
++    for room in [1, 2, 10, 11, 12, 13, 14, 20] {
++        let prompt = RESIDENT_CONTEXT_TOKENS - room;
++        let mut boundary = ContextTail::new(prompt, room).unwrap();
++        for emitted in 1..=room {
++            let keep = boundary.observe(true).unwrap();
++            let rest = prompt + emitted - 1;
++            if !keep {
++                assert!(RESIDENT_CONTEXT_TOKENS - rest < PHYSICAL_TAIL_RESERVE);
++                assert!(room - emitted < PHYSICAL_TAIL_RESERVE);
++                assert!(boundary.should_resume(FinishReason::Callback));
++                assert!(!boundary.should_resume(FinishReason::Length));
++                assert!(!boundary.should_resume(FinishReason::StopToken));
++                break;
++            }
++            if emitted == room {
++                assert!(!boundary.should_resume(FinishReason::Length));
++            }
++        }
++    }
++    let mut last = ContextTail::new(RESIDENT_CONTEXT_TOKENS - 1, 1).unwrap();
++    assert!(last.observe(true).unwrap(), "the last draw reaches length directly");
++    assert!(!last.should_resume(FinishReason::Length));
++    assert!(last.observe(true).is_err(), "no extra output token is admitted");
++}
++
++#[test]
++fn smaller_logical_contexts_and_real_terminal_reasons_do_not_enter_the_physical_tail() {
++    for profile in [Profile::Ctx64k, Profile::Ctx128k] {
++        let mut boundary = ContextTail::new(profile.context_tokens() - 2, 2).unwrap();
++        assert!(boundary.observe(true).unwrap());
++        assert!(boundary.observe(true).unwrap());
++        assert!(!boundary.should_resume(FinishReason::Length));
++    }
++    let mut boundary = ContextTail::new(RESIDENT_CONTEXT_TOKENS - 10, 10).unwrap();
++    assert!(!boundary.observe(true).unwrap());
++    assert!(boundary.should_resume(FinishReason::Callback));
++    assert!(
++        !boundary.observe(false).unwrap(),
++        "a later real cancel/stop wins over a yield"
++    );
++    assert!(!boundary.should_resume(FinishReason::Callback));
++    assert!(
++        !boundary.observe(true).unwrap(),
++        "a terminal cannot be revived by another callback"
++    );
++    assert!(ContextTail::new(RESIDENT_CONTEXT_TOKENS, 1).is_err());
++    assert!(ContextTail::new(RESIDENT_CONTEXT_TOKENS - 1, 2).is_err());
++    let mut resumed =
++        ContextTail::resuming(RESIDENT_CONTEXT_TOKENS - 13, 13, 2).unwrap();
++    assert!(!resumed.observe(true).unwrap());
++    assert!(resumed.should_resume(FinishReason::Callback));
++}
++
++#[test]
++fn an_inserted_group_that_fills_the_budget_ends_with_length_unless_a_real_terminal_wins()
++ {
++    let mut group = ContextTail::new(RESIDENT_CONTEXT_TOKENS - 2, 2).unwrap();
++    assert!(!group.observe(true).unwrap());
++    assert!(!group.observe(true).unwrap());
++    assert!(!group.should_resume(FinishReason::Callback));
++    assert_eq!(group.finish_reason(FinishReason::Callback, true), FinishReason::Length);
++    assert_eq!(
++        group.finish_reason(FinishReason::Callback, false),
++        FinishReason::Callback
++    );
++    assert_eq!(
++        group.finish_reason(FinishReason::StopToken, true),
++        FinishReason::StopToken
++    );
++    let mut cancelled = ContextTail::new(RESIDENT_CONTEXT_TOKENS - 2, 2).unwrap();
++    assert!(!cancelled.observe(true).unwrap());
++    assert!(!cancelled.observe(false).unwrap());
++    assert_eq!(
++        cancelled.finish_reason(FinishReason::Callback, true),
++        FinishReason::Callback
++    );
++}

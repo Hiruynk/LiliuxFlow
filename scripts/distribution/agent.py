@@ -105,7 +105,9 @@ def preflight_ports(ports):
                 raise DistributionError('configured loopback port is occupied; listener owner left untouched')
 
 
-def safe_environment(trusted):
+def safe_environment(trusted, *, shared_context=False):
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be explicit')
     data=trusted['data_root'];config=trusted['config'];secret=trusted['secrets']
     node_bin=data/'runtime/toolchains/node/bin'
     if not node_bin.is_dir():raise DistributionError('installation-owned Node toolchain is unavailable')
@@ -114,6 +116,14 @@ def safe_environment(trusted):
             'LILIUXFLOW_DATA_ROOT':str(data),'LILIUXFLOW_PRIVATE_LOG':str(data/'logs/database-steps.jsonl'),'PYTHONPATH':str(trusted['source_root']/'services/compat/src')}
     if trusted.get('controlplane_only'):
         common['LILIUXFLOW_CONTROLPLANE_ONLY']='1'
+    if shared_context:
+        from mtp2_shared_gateway import require_shared_installation, FEATURE_ENV
+        require_shared_installation(trusted)
+        common[FEATURE_ENV]='1'
+        if '_mtp2_validation_binding' in trusted:
+            common['LILIUXFLOW_MTP2_SHARED_VALIDATION']='1'
+            common['PYTHONDONTWRITEBYTECODE']='1'
+        common['PYTHONPATH']+=os.pathsep+str(trusted['source_root']/'scripts/distribution')
     litellm={**common,'PATH':str(data/'runtime/litellm/bin')+':'+common['PATH'],**{k:secret[k] for k in ('LITELLM_MASTER_KEY','LITELLM_SALT_KEY','UI_USERNAME','UI_PASSWORD')},
              'DATABASE_URL':'postgresql://litellm_app:'+quote(secret['DB_PASSWORD'],safe='')+'@127.0.0.1:'+str(config['ports']['postgresql'])+'/litellm',
              'MANAGER_BACKEND_TOKEN':secret['MANAGER_BACKEND_TOKEN'],'STORE_MODEL_IN_DB':'True','LITELLM_LOG':'ERROR',
@@ -127,6 +137,8 @@ def safe_environment(trusted):
         private_file(policy)
         litellm['LILIUXFLOW_PROFILE_POLICY_PATH']=str(policy)
         litellm['LILIUXFLOW_PROFILE_POLICY_SHA256']=sha256(policy)
+    if shared_context:
+        litellm['STORE_MODEL_IN_DB']='False'
     return common,litellm
 
 
@@ -153,7 +165,21 @@ def validation_routes(trusted, profile_ids=()):
     return tuple(selected),keys
 
 
-def configs(trusted, *, validation_profile_ids=()):
+def configuration_documents(trusted, *, validation_profile_ids=(), shared_context=False):
+    """Derive the normal config bytes from verified source/installation values.
+
+    This pure plan writes no config or receipt. Shared factories derive their
+    expected LP hash here, independently of the current config file's digest.
+    """
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be explicit')
+    if shared_context:
+        if '_mtp2_config_binding' in trusted:
+            from mtp2_shared_upgrade import configuration_binding
+            configuration_binding(trusted)
+        else:
+            from mtp2_shared_gateway import require_shared_installation
+            require_shared_installation(trusted)
     data=trusted['data_root'];cfg=trusted['config'];secret=trusted['secrets'];source=trusted['source_root'];ports=cfg['ports']
     registry=trusted['registry'];validation,validation_keys=validation_routes(trusted,validation_profile_ids)
     configured = trusted.get('model_configured') is not False
@@ -185,10 +211,42 @@ def configs(trusted, *, validation_profile_ids=()):
            'callbacks':['litellm.proxy._liliuxflow_context_profiles.context_profile_policy']},
         'router_settings':{'num_retries':0,'max_fallbacks':0,'fallbacks':[],'context_window_fallbacks':[],'content_policy_fallbacks':[],
                            'timeout':max((p.total_deadline_seconds for p in profiles),default=30)+30}}
+    if shared_context:
+        from mtp2_shared_config import shared_manager_config, PHYSICAL_MODEL_ID
+        manager=shared_manager_config(manager,registry,runner_python=trusted['binaries']['compat_python'],source_root=source,data_root=data,
+            candidate_validation='_mtp2_validation_binding' in trusted or '_mtp2_config_binding' in trusted)
+        manager['models'][PHYSICAL_MODEL_ID]['concurrencyLimit']=2
+        # fcefa7 ProcessCommand starts its autonomous TTL worker only when
+        # UnloadAfter > 0. The guard owns shared group idle1800 and cleanup.
+        manager['models'][PHYSICAL_MODEL_ID]['ttl']=0
+        lp['litellm_settings']['callbacks'].append('mtp2_shared_gateway.shared_callback')
+        lp['general_settings']['store_model_in_db']=False
+        lp['general_settings']['supported_db_objects']=[]
+    policy={'schema_version':1,
+        'enabled_models':[p.public_alias for p in profiles if p.production_enabled],'validation_keys':validation_keys}
+    return manager,lp,policy
+
+
+def normal_shared_configuration_sha256(trusted):
+    """Expected config derived from installed trust, not a config self-hash."""
+    if '_mtp2_validation_binding' in trusted or '_mtp2_config_binding' in trusted:
+        raise DistributionError('normal shared config cannot use a validation binding')
+    _manager,lp,_policy=configuration_documents(trusted,shared_context=True)
+    import hashlib
+    return hashlib.sha256((json.dumps(lp,indent=2)+'\n').encode()).hexdigest()
+
+
+def configs(trusted, *, validation_profile_ids=(), shared_context=False, return_validation_seal=False):
+    if type(return_validation_seal) is not bool:
+        raise DistributionError('shared generated config seal mode must be explicit')
+    manager,lp,policy=configuration_documents(trusted,validation_profile_ids=validation_profile_ids,shared_context=shared_context)
+    data=trusted['data_root']
     atomic_private_json(data/'run/llama-swap.json',manager)
     atomic_private_json(data/'run/litellm.json',lp)
-    atomic_private_json(data/'run/context-profile-policy.json',{'schema_version':1,
-        'enabled_models':[p.public_alias for p in profiles if p.production_enabled],'validation_keys':validation_keys})
+    atomic_private_json(data/'run/context-profile-policy.json',policy)
+    if return_validation_seal:
+        from mtp2_shared_upgrade import generated_configuration
+        return data/'run/llama-swap.json',data/'run/litellm.json',generated_configuration(trusted,lp)
     return data/'run/llama-swap.json',data/'run/litellm.json'
 
 
@@ -543,13 +601,18 @@ def drain(trusted):
         if not success:http_json(guard+'/__recovery/maintenance/unlock',method='POST',payload={},control=secret['GUARD_CONTROL_TOKEN'])
 
 
-def run(data,*,controlplane_only=False):
+def run(data,*,controlplane_only=False,shared_context=False):
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be explicit')
+    if shared_context and controlplane_only:
+        raise DistributionError('shared MTP2 requires the configured full model installation')
     print('LILIUXFLOW_AGENT_STAGE validate',flush=True)
     def trust_trace(event):
         file=no_symlinks(data/'logs/trust-stage.jsonl')
         descriptor=os.open(file,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
         with os.fdopen(descriptor,'a') as output:output.write(json.dumps(event)+'\n')
-    trusted=validate(data,require_checkpoint='controlplane' if controlplane_only else 'available',trace=trust_trace);trusted['controlplane_only']=controlplane_only or not trusted['model_configured'];cfg=trusted['config'];ports=cfg['ports'];source=trusted['source_root'];children={};postgres=None;requested_stop=False
+    selection={'shared_context':True} if shared_context else {}
+    trusted=validate(data,require_checkpoint='controlplane' if controlplane_only else 'available',trace=trust_trace,**selection);trusted['controlplane_only']=controlplane_only or not trusted['model_configured'];cfg=trusted['config'];ports=cfg['ports'];source=trusted['source_root'];children={};postgres=None;requested_stop=False
     def stop_signal(_signal,_frame):
         nonlocal requested_stop
         requested_stop=True
@@ -561,11 +624,12 @@ def run(data,*,controlplane_only=False):
     preflight_ports(ports)
     with mutation(data):
         print('LILIUXFLOW_AGENT_STAGE configs',flush=True)
-        manager,lp=configs(trusted)
+        manager,lp=configs(trusted,shared_context=shared_context)
         print('LILIUXFLOW_AGENT_STAGE environment',flush=True)
-        common,lp_env=safe_environment(trusted)
+        common,lp_env=safe_environment(trusted,shared_context=shared_context)
         print('LILIUXFLOW_AGENT_STAGE registry',flush=True)
         me=capture(os.getpid());record={'schema_version':1,'installation_id':cfg['installation_id'],'agent':me,'children':{},'postgres':None,'ready':False,'controlplane_only':trusted['controlplane_only'],'model_configured':trusted['model_configured']}
+        if shared_context:record['shared_context']=True
         write_json_new(state,record)
         try:
             postgres=pg_start(trusted);record['postgres']=postgres;atomic_private_json(state,record)
@@ -574,6 +638,8 @@ def run(data,*,controlplane_only=False):
                       'manager':[trusted['binaries']['llama_swap'],'-config',manager,'-listen','127.0.0.1:'+str(ports['manager'])],
                       'guard':[cp,'-m','uvicorn','compat_api.portable:create_guard_app','--factory','--host','127.0.0.1','--port',str(ports['guard']),'--no-access-log','--log-level','warning','--timeout-graceful-shutdown','10'],
                       'compat':[cp,'-m','uvicorn','compat_api.portable:create_compat_app','--factory','--host','127.0.0.1','--port',str(ports['compat']),'--no-access-log','--log-level','warning','--timeout-graceful-shutdown','5']}
+            if shared_context:
+                commands['litellm']=[lp_python,'-m','uvicorn','mtp2_shared_gateway:create_litellm_app','--factory','--host','127.0.0.1','--port',str(ports['litellm']),'--no-access-log','--log-level','warning','--timeout-graceful-shutdown','10']
             urls={'litellm':'/health/readiness','manager':'/health','guard':'/health','compat':'/api/capabilities'}
             for name in ('litellm','manager','guard','compat'):
                 log=data/'logs'/(name+'.log');descriptor=os.open(log,os.O_WRONLY|os.O_APPEND|os.O_CREAT,0o600)
@@ -606,6 +672,16 @@ def run(data,*,controlplane_only=False):
                     if child['pid'] not in {x['pid'] for x in lineage} or runner['pid'] not in {x['pid'] for x in lineage}:
                         raise DistributionError('model lineage differs; cleanup refused')
                     if not terminate(runner,grace=30):raise DistributionError('owned model runner did not stop')
+            shared_model=data/'run/mtp2-shared-model.json'
+            if shared_model.exists():
+                import forced_stop as fs
+                runner,child=fs.shared_model_record(trusted,read_object(private_file(shared_model)))
+                live=[value for value in (runner,child) if fs.exact(value)]
+                lineage={value['pid']:value for value in fs.descendants(me['pid'])}
+                if any(lineage.get(value['pid'])!=value for value in live):
+                    raise DistributionError('shared model lineage differs; cleanup refused')
+                if fs.exact(runner) and not terminate(runner,grace=30):
+                    raise DistributionError('owned shared runner did not stop')
             for name in ('compat','guard','manager','litellm'):
                 if name in children and not terminate(children[name][1],grace=20):raise DistributionError('owned child did not exit; ownership registry retained')
             if postgres:pg_stop(trusted,postgres)
@@ -630,17 +706,70 @@ def user_launchd_log(trusted,*,prepare=False):
     return log
 
 
-def launchd_plist(trusted):
+def launchd_plist(trusted, *, shared_context=False):
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be explicit')
+    if shared_context:
+        from mtp2_shared_gateway import require_shared_installation
+        require_shared_installation(trusted)
     data=trusted['data_root'];source=trusted['source_root'];cfg=trusted['config']
-    return {'Label':cfg['launchd_label'],'ProgramArguments':[str(trusted['binaries']['compat_python']),str(source/'scripts/distribution/agent.py'),'--data-root',str(data)]+(['--controlplane-only'] if trusted.get('controlplane_only') else []),
+    return {'Label':cfg['launchd_label'],'ProgramArguments':[str(trusted['binaries']['compat_python']),str(source/'scripts/distribution/agent.py'),'--data-root',str(data)]+(['--controlplane-only'] if trusted.get('controlplane_only') else [])+(['--mtp2-shared-context'] if shared_context else []),
             'WorkingDirectory':str(source),'RunAtLoad':True,'KeepAlive':{'SuccessfulExit':False},'ThrottleInterval':10,
             'ExitTimeOut':90,'AbandonProcessGroup':False,'Umask':63,'ProcessType':'Interactive',
             'StandardOutPath':str(user_launchd_log(trusted)),'StandardErrorPath':str(user_launchd_log(trusted))}
 
 
-def start(data,*,dry_run=False,controlplane_only=False,readiness_seconds=180):
+def select_stopped_plist(trusted,path,expected):
+    """Regenerate one normal owned stopped plist; never adopt a live label/PID."""
+    raw=private_file(path).read_bytes()
+    if len(raw)>64*1024:raise DistributionError('installation plist exceeds its bound')
+    decoded=plistlib.loads(raw)
+    if decoded==expected:return
+    data=trusted['data_root'];cfg=trusted['config']
+    if cfg['launchd_label']!='com.diurnoctra.liliuxflow.'+str(uuid.UUID(cfg['installation_id'])):
+        raise DistributionError('stopped plist installation label differs')
+    prefix=[str(trusted['binaries']['compat_python']),str(trusted['source_root']/'scripts/distribution/agent.py'),'--data-root',str(data)]
+    arguments=decoded.get('ProgramArguments')
+    if not isinstance(arguments,list) or arguments[:4]!=prefix or arguments[4:] not in ([],['--controlplane-only'],['--mtp2-shared-context']):
+        raise DistributionError('stopped plist source/arguments differ')
+    prior=dict(trusted);prior['controlplane_only']=arguments[4:]==['--controlplane-only']
+    old_shared=arguments[4:]==['--mtp2-shared-context']
+    if old_shared:
+        from mtp2_shared_runtime import normal_shared_view
+        prior=normal_shared_view(prior)
+    if decoded!=launchd_plist(prior,shared_context=old_shared):
+        raise DistributionError('stopped plist fields differ from the normal generator')
+    with mutation(data):
+        if private_file(path).read_bytes()!=raw:
+            raise DistributionError('stopped plist preimage changed')
+        if any((data/value).exists() for value in ('run/agent.json','run/model.json','run/mtp2-shared-model.json','run/services.json')):
+            raise DistributionError('stopped plist selection needs complete owned cleanup')
+        target='gui/'+str(os.getuid())+'/'+cfg['launchd_label']
+        state=subprocess.run(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=5)
+        diagnostic=(state.stderr or '').lower()
+        if state.returncode==0 or not ('could not find service' in diagnostic or 'no such process' in diagnostic):
+            raise DistributionError('stopped plist label is live or removal is unverified')
+        preflight_ports(cfg['ports'])
+        temporary=path.with_name(path.name+'.'+uuid.uuid4().hex+'.selection')
+        try:
+            write_new(temporary,plistlib.dumps(expected))
+            if private_file(path).read_bytes()!=raw:
+                raise DistributionError('stopped plist preimage changed')
+            os.replace(temporary,path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        if plistlib.loads(private_file(path).read_bytes())!=expected:
+            raise DistributionError('stopped plist selection verification failed')
+
+
+def start(data,*,dry_run=False,controlplane_only=False,readiness_seconds=180,shared_context=False):
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be an exact boolean')
+    if shared_context and controlplane_only:
+        raise DistributionError('shared MTP2 requires the configured full model installation')
     if type(readiness_seconds) is not int or not 1<=readiness_seconds<=180:raise DistributionError('startup readiness bound is invalid')
-    trusted=validate(data,require_checkpoint='controlplane' if controlplane_only else 'available')
+    selection={'shared_context':True} if shared_context else {}
+    trusted=validate(data,require_checkpoint='controlplane' if controlplane_only else 'available',**selection)
     trusted['controlplane_only']=controlplane_only or not trusted['model_configured']
     if not trusted['config']['database_initialized']:raise DistributionError('database initialization is required')
     if dry_run:return {'state':'validated_start_plan','launchd_label':trusted['config']['launchd_label'],'loopback_ports':trusted['config']['ports'],'model_load':'lazy' if trusted['model_configured'] else 'not_configured','inference_ready':False,'credentials_printed':False}
@@ -648,8 +777,10 @@ def start(data,*,dry_run=False,controlplane_only=False,readiness_seconds=180):
     log=user_launchd_log(trusted,prepare=True)
     # Stop/uninstall retain user logs; database/credential backups do not export them.
     plist=data/'run/stack.plist'
-    if plist.exists():private_file(plist)
-    else:write_new(plist,plistlib.dumps(launchd_plist(trusted)))
+    expected_plist=launchd_plist(trusted,shared_context=shared_context)
+    if plist.exists():
+        select_stopped_plist(trusted,plist,expected_plist)
+    else:write_new(plist,plistlib.dumps(expected_plist))
     result=subprocess.run(['/bin/launchctl','bootstrap','gui/'+str(os.getuid()),str(plist)],capture_output=True)
     if result.returncode:raise DistributionError('own user LaunchAgent bootstrap failed')
     kick=subprocess.run(['/bin/launchctl','kickstart','gui/'+str(os.getuid())+'/'+trusted['config']['launchd_label']],capture_output=True)
@@ -710,10 +841,15 @@ def _force_stop(trusted,*,dry_run=False):
     if (type(record.get('schema_version')) is not int or record['schema_version']!=1 or record.get('installation_id')!=cfg['installation_id']
             or not isinstance(record.get('children'),dict)
             or decoded.get('Label')!=label or decoded.get('WorkingDirectory')!=str(source)
-            or not isinstance(arguments,list) or arguments[:4]!=prefix or arguments[4:] not in ([],['--controlplane-only'])):
+            or not isinstance(arguments,list) or arguments[:4]!=prefix or arguments[4:] not in ([],['--controlplane-only'],['--mtp2-shared-context'])):
         raise DistributionError('force stop owned registry/plist installation differs')
+    shared_shutdown=record.get('shared_context') is True and arguments[4:]==['--mtp2-shared-context']
+    if shared_shutdown:
+        info=private_file(plist).stat();plist_stamp=(info.st_dev,info.st_ino);plist_raw=private_file(plist).read_bytes()
+        if plistlib.loads(plist_raw)!=decoded:raise DistributionError('shared stop initial plist changed')
     owner=fs.identity(record.get('agent'))
     if not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):raise DistributionError('force stop agent identity/command differs')
+    if shared_shutdown:host_lease=_shared_stop_host_lease_snapshot(data,owner,fs)
     target='gui/'+str(os.getuid())+'/'+label
     printed=subprocess.run(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=5)
     import re
@@ -743,18 +879,56 @@ def _force_stop(trusted,*,dry_run=False):
             for key in ('runner','child'):
                 value=fs.identity(model_record.get(key))
                 if fs.exact(value) and bypid.get(value['pid'])!=value:raise DistributionError('owned model lies outside verified agent tree')
-        bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        fs.terminate_all(captured,resume=True)
+        shared=data/'run/mtp2-shared-model.json'
+        shared_record=None
+        if shared.exists():
+            shared_record=read_object(private_file(shared))
+            for value in fs.shared_model_record(trusted,shared_record):
+                if fs.exact(value) and bypid.get(value['pid'])!=value:
+                    raise DistributionError('owned shared model lies outside verified agent tree')
+        observe=fs.exited
+        if shared_shutdown:
+            ended_records=_shared_stop_ended_record_snapshot(trusted,state,record,shared_record)
+            observe=fs.shared_exit_observer(captured+[owner]+([pg] if pg is not None else []),
+                lambda value:write_json_new(private_directory(data/'run')/('shared-stop-first-identity-'+uuid.uuid4().hex+'.json'),value))
+        # Shared descendants retain their captured parent while they exit.
+        # Remove the launchd job before allowing the frozen owner to exit,
+        # so KeepAlive cannot restart it between teardown and job removal.
+        if not shared_shutdown:
+            bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if shared_shutdown:
+            try:fs.terminate_all(captured,resume=True,observer=observe)
+            except DistributionError as error:
+                if str(error) not in ('live owned process identity changed','shared exit observation deadline expired'):
+                    raise
+                try:
+                    _shared_stop_recheck_ended_descendants(trusted,state,record,plist,decoded,plist_raw,plist_stamp,
+                        owner,arguments,captured,frozen,ended_records,host_lease,pgfamily,fs,target)
+                except DistributionError:raise error
+        else:fs.terminate_all(captured,resume=True)
         if pg is not None:
             if fs.exact(pg):
                 if private_file(data/'postgres/data/postmaster.pid').read_bytes()!=pgcontent:raise DistributionError('owned PGDATA PID file changed before fast stop')
                 private_run([postgres_tools(trusted)/'pg_ctl','-D',data/'postgres/data','-m','fast','-w','-t','30','stop'],env=pg_environment(trusted),timeout=40)
-            if not fs.exited(pg):raise DistributionError('owned PostgreSQL remains after normal fast stop')
-        fs.terminate_all([owner],grace=5,resume=True)
+            if not observe(pg):raise DistributionError('owned PostgreSQL remains after normal fast stop')
+        if shared_shutdown:
+            _shared_stop_bootout_proof(trusted,state,record,plist,decoded,plist_raw,plist_stamp,owner,arguments,observe,fs,target)
+            bootout=subprocess.Popen(['/bin/launchctl','bootout',target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if shared_shutdown:fs.terminate_all([owner],grace=5,resume=True,observer=observe)
+        else:fs.terminate_all([owner],grace=5,resume=True)
         bootout.wait(timeout=15)
-        if bootout.returncode or any(not fs.exited(x) for x in captured+[owner]):raise DistributionError('owned force shutdown incomplete; registry retained')
-        _wait_launchd_removed(target,lambda:all(fs.exited(x) for x in captured+[owner]+([pg] if pg is not None else [])),runner=subprocess.run)
-        _force_clear_model_records(trusted,captured,fs)
+        if bootout.returncode or any(not observe(x) for x in captured+[owner]):raise DistributionError('owned force shutdown incomplete; registry retained')
+        _wait_launchd_removed(target,lambda:all(observe(x) for x in captured+[owner]+([pg] if pg is not None else [])),runner=subprocess.run)
+        if shared_record is None:_force_clear_model_records(trusted,captured,fs)
+        else:_force_clear_model_records(trusted,captured,fs,shared_record=shared_record)
+        if shared_shutdown:
+            if state.exists() and read_object(private_file(state))!=record:
+                raise DistributionError('shared stop agent registry changed before host lease retirement')
+            info=private_file(plist).stat()
+            if (info.st_dev,info.st_ino)!=plist_stamp or private_file(plist).read_bytes()!=plist_raw:
+                raise DistributionError('shared stop plist changed before host lease retirement')
+            _shared_stop_retire_host_lease(data,owner,fs,host_lease,
+                lambda:all(observe(x) for x in captured+[owner]+([pg] if pg is not None else [])),target)
         if state.exists():
             if read_object(private_file(state))!=record:raise DistributionError('force stop agent registry changed; retained for review')
             state.unlink()
@@ -765,10 +939,272 @@ def _force_stop(trusted,*,dry_run=False):
             try:fs.send(value,signal.SIGCONT)
             except (DistributionError,OSError):pass
 
-def _force_clear_model_records(trusted,captured,fs):
+def _shared_stop_ended_record_snapshot(trusted,state,record,shared_record):
+    """Same-operation private preimages only; no persistent capture or adoption."""
+    lease=no_symlinks(Path.home()/'Library/Application Support/LiliuxFlow-runtime-leases/gpu.lease')
+    paths=((state,False,record),(trusted['data_root']/'run/mtp2-shared-model.json',False,shared_record),
+           (lease,True,shared_record));captured=[]
+    for path,directory,expected in paths:
+        path=no_symlinks(path)
+        if not path.exists():captured.append((path,directory,None));continue
+        # An unrelated lease never becomes fallback cleanup authority. Keep
+        # the original successful shutdown path's treatment of foreign leases.
+        if expected is None:captured.append((path,directory,False));continue
+        if directory:private_directory(path)
+        content=private_file(path/'lease.json' if directory else path);info=path.stat();file_info=content.stat();raw=content.read_bytes()
+        if json.loads(raw)!=expected or directory and {x.name for x in path.iterdir()}!={'lease.json'}:
+            captured.append((path,directory,False));continue
+        captured.append((path,directory,((info.st_dev,info.st_ino),(file_info.st_dev,file_info.st_ino),raw)))
+    return captured
+
+def _shared_stop_recheck_ended_descendants(trusted,state,record,plist,decoded,raw,stamp,owner,arguments,captured,frozen,records,host_lease,pgfamily,fs,target):
+    """Reprove ended descendants while retaining this operation's frozen owner.
+
+    The owner must remain exact and kernel-stopped with its same launchd PID,
+    or be absent twice with a no-PID job. No signal or stale tree is adopted.
+    """
+    values=[*captured,owner];known={fs.identity(value)['pid'] for value in values}
+    if len(known)!=len(values) or any(value['uid']!=os.getuid() or value['pid'] in (os.getpid(),os.getppid()) for value in values):
+        raise DistributionError('shared ended completion capture differs')
+    if owner not in frozen:raise DistributionError('shared ended completion owner was not frozen')
+    deadline=time.monotonic()+5;owner_live=None
+    def timeout(cap):
+        remaining=deadline-time.monotonic()
+        if remaining<=0:raise DistributionError('shared ended completion deadline expired')
+        return min(cap,remaining)
+    for attempt in range(2):
+        for value in captured:
+            if fs._probe(value['pid'],timeout=timeout(.1)) is not None:
+                raise DistributionError('shared ended completion captured PID is not absent')
+        packet=fs._probe(owner['pid'],timeout=timeout(.1));live=packet is not None
+        if live and (packet[0]!=owner or packet[1]!=' '.join(arguments)):
+            raise DistributionError('shared ended completion frozen owner identity changed')
+        if owner_live is not None and live!=owner_live:
+            raise DistributionError('shared ended completion owner changed between samples')
+        owner_live=live
+        rows=fs._descendant_rows(timeout=timeout(.1))
+        kernel=next((row for row in rows if row['pid']==owner['pid']),None)
+        if live and (kernel is None or kernel['uid']!=owner['uid'] or kernel['ruid']!=os.getuid()
+                or kernel['started']!=owner['started'] or kernel['ppid']!=owner['ppid'] or not kernel['stat'].startswith('T')):
+            raise DistributionError('shared ended completion frozen owner kernel proof differs')
+        if any((row['pid'] in known and not (live and row['pid']==owner['pid'])
+                or row['ppid'] in known) and row['pid'] not in pgfamily for row in rows):
+            raise DistributionError('shared ended completion captured subtree is not absent')
+        info=private_file(plist).stat()
+        if (info.st_dev,info.st_ino)!=stamp or private_file(plist).read_bytes()!=raw:
+            raise DistributionError('shared ended completion plist changed')
+        for path,directory,preimage in records:
+            if preimage is False:raise DistributionError('shared ended completion lifecycle record was not bound')
+            path=no_symlinks(path)
+            if not path.exists():continue
+            if preimage is None:raise DistributionError('shared ended completion lifecycle record appeared')
+            if directory:private_directory(path)
+            content=private_file(path/'lease.json' if directory else path);info=path.stat();file_info=content.stat()
+            if ((info.st_dev,info.st_ino)!=preimage[0] or (file_info.st_dev,file_info.st_ino)!=preimage[1]
+                    or content.read_bytes()!=preimage[2] or directory and {x.name for x in path.iterdir()}!={'lease.json'}):
+                raise DistributionError('shared ended completion lifecycle preimage changed')
+        current=_shared_stop_host_lease_snapshot(trusted['data_root'],owner,fs)
+        if current is not None and current!=host_lease:raise DistributionError('shared ended completion host lease changed')
+        result=subprocess.run(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=timeout(1))
+        lines=result.stdout.splitlines()
+        if result.returncode or result.stderr.strip() or len(result.stdout.encode())>65536 or not lines or lines[0].strip()!=target+' = {':
+            raise DistributionError('shared ended completion launchd job is unknown')
+        fields,printed_arguments=_shared_launchd_job_fields(lines)
+        job_pid=fields.get('pid')
+        if (live and job_pid!=str(owner['pid']) or not live and ('pid' in fields or fields.get('state') not in ('spawn scheduled','not running'))
+                or printed_arguments!=arguments or fields.get('path')!=str(plist) or fields.get('program')!=arguments[0]
+                or fields.get('working directory')!=decoded['WorkingDirectory']):
+            raise DistributionError('shared ended completion requires exact captured job PID or no-PID')
+        if attempt==0:time.sleep(min(.02,timeout(.02)))
+    write_json_new(private_directory(trusted['data_root']/'run')/('shared-stop-ended-completion-'+uuid.uuid4().hex+'.json'),{
+        'schema_version':1,'enum':'SHARED_STOP_CAPTURED_DESCENDANTS_ENDED_COMPLETION','captured_pid_count':len(values),
+        'descendant_absence_samples':2,'owner_absent':not owner_live,'job_samples':2,
+        'signal_authorized':False,'cause':'UNKNOWN'})
+
+def _shared_stop_host_lease_snapshot(data,owner,fs):
+    """Finite agent lease only; never adopt a different holder or create a path."""
+    lock=no_symlinks(data/'run/host-mutation.lease')
+    if not lock.exists():return None
+    info=lock.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+        raise DistributionError('shared stop host lease directory owner/mode differs')
+    if {path.name for path in lock.iterdir()}!={'lease.json'}:
+        raise DistributionError('shared stop host lease contents differ')
+    path=private_file(lock/'lease.json');file_info=path.stat()
+    if file_info.st_size>4096:raise DistributionError('shared stop host lease exceeds finite holder size')
+    raw=path.read_bytes()
+    try:holder=json.loads(raw)
+    except (ValueError,UnicodeError):raise DistributionError('shared stop host lease holder is malformed') from None
+    if fs.identity(holder)!=owner:raise DistributionError('shared stop host lease holder differs from captured agent')
+    stamp=(info.st_dev,info.st_ino);file_stamp=(file_info.st_dev,file_info.st_ino)
+    now=lock.stat();file_now=private_file(path).stat()
+    if ((now.st_dev,now.st_ino)!=stamp or now.st_uid!=os.getuid() or now.st_mode&0o077
+            or (file_now.st_dev,file_now.st_ino)!=file_stamp
+            or path.read_bytes()!=raw or {path.name for path in lock.iterdir()}!={'lease.json'}):
+        raise DistributionError('shared stop host lease changed during capture')
+    return stamp,file_stamp,raw
+
+def _shared_stop_retire_host_lease(data,owner,fs,captured,released,target):
+    """Quarantine only this operation's captured ended agent lease after shutdown."""
+    lock=no_symlinks(data/'run/host-mutation.lease')
+    current=_shared_stop_host_lease_snapshot(data,owner,fs)
+    if current is None:return
+    if captured is None or current!=captured:
+        raise DistributionError('shared stop host lease was replaced or not captured')
+    _wait_launchd_removed(target,released,runner=subprocess.run)
+    if released() is not True:raise DistributionError('shared stop host lease owner/resources remain')
+    if _shared_stop_host_lease_snapshot(data,owner,fs)!=captured:
+        raise DistributionError('shared stop host lease changed before quarantine')
+    quarantine=lock.with_name(lock.name+'.portable-stopped-'+uuid.uuid4().hex)
+    os.rename(lock,quarantine)
+    try:
+        # Preserve the exact directory/file inodes and bytes for private review.
+        info=quarantine.stat();path=private_file(quarantine/'lease.json');file_info=path.stat()
+        if ((info.st_dev,info.st_ino)!=captured[0] or info.st_uid!=os.getuid() or info.st_mode&0o077
+                or (file_info.st_dev,file_info.st_ino)!=captured[1]
+                or path.read_bytes()!=captured[2] or fs.identity(read_object(path))!=owner
+                or {path.name for path in quarantine.iterdir()}!={'lease.json'}):
+            raise DistributionError('shared stop host lease quarantine identity differs')
+        _wait_launchd_removed(target,released,runner=subprocess.run)
+        if released() is not True or no_symlinks(lock).exists():
+            raise DistributionError('shared stop host lease ownership changed during quarantine')
+    except BaseException:
+        if not lock.exists() and quarantine.exists():
+            info=quarantine.stat()
+            if (info.st_dev,info.st_ino)==captured[0]:os.rename(quarantine,lock)
+        raise
+
+def _shared_launchd_job_fields(lines):
+    """Read only job-level fields/argv; nested launchd metadata is opaque."""
+    import re
+    def indent(line):return line[:len(line)-len(line.lstrip(' \t'))]
+    stack=[(indent(lines[0]),None)];top_indent=None;fields={};arguments=None
+    for line in lines[1:]:
+        text=line.strip();prefix=indent(line)
+        if not text:continue
+        if not stack:raise DistributionError('shared stop launchd trailing job data')
+        if text=='}':
+            if prefix!=stack[-1][0]:raise DistributionError('shared stop launchd block indentation differs')
+            stack.pop();continue
+        if not prefix.startswith(stack[-1][0]) or len(prefix)<=len(stack[-1][0]):
+            raise DistributionError('shared stop launchd field indentation differs')
+        if len(stack)==2 and stack[-1][1]=='arguments':
+            arguments.append(text);continue
+        match=re.fullmatch(r'(.+?)\s*=\s*(.*)',text)
+        if len(stack)==1:
+            if top_indent is None:top_indent=prefix
+            if prefix!=top_indent or match is None:raise DistributionError('shared stop launchd top-level field shape differs')
+            key,value=match.groups()
+            if key in fields:raise DistributionError('shared stop launchd duplicate top-level field')
+            fields[key]=value
+            if key=='arguments':
+                if value!='{':raise DistributionError('shared stop launchd arguments are unknown')
+                arguments=[]
+        if match is not None and match[2]=='{':stack.append((prefix,match[1]))
+    if stack:raise DistributionError('shared stop launchd job blocks are incomplete')
+    return fields,arguments
+
+def _shared_stop_bootout_proof(trusted,state,record,plist,decoded,raw,stamp,owner,arguments,observe,fs,target):
+    """Same-operation captured owner only; no replacement PID or signal adoption."""
+    import hashlib,re
+    current=fs.inspect(owner['pid']);actual_command=None
+    if current==owner:actual_command=fs.command(owner)
+    live=current==owner and actual_command==' '.join(arguments)
+    if not live:
+        write_json_new(private_directory(trusted['data_root']/'run')/('shared-stop-agent-check-'+uuid.uuid4().hex+'.json'),{
+            'schema_version':1,'enum':'SHARED_STOP_CAPTURED_AGENT_CHECK','pid':owner['pid'],
+            'owner_absent_at_check':current is None,
+            'changed_fields':[key for key in fs.IDENTITY_FIELDS if current is None or current[key]!=owner[key]],
+            'observed':None if current is None else {key:current[key] for key in ('pid','ppid','pgid','uid')},
+            'observed_command_sha256':None if actual_command is None else hashlib.sha256(actual_command.encode()).hexdigest(),
+            'observed_identity_command_sha256':None if current is None else current['command_sha256'],
+            'expected_command_sha256':hashlib.sha256(' '.join(arguments).encode()).hexdigest(),
+            'command_matches_plist':None if actual_command is None else actual_command==' '.join(arguments),
+            'phase':'after_captured_tree_and_pg_before_bootout','signal_authorized':False,'cause':'UNKNOWN'})
+        if current is not None and any(current[key]!=owner[key] for key in ('pid','pgid','uid','started')):
+            raise DistributionError('shared stop captured agent birth/group/owner changed')
+        if not observe(owner):raise DistributionError('shared stop frozen agent identity/command differs')
+    for _ in range(2):
+        info=private_file(plist).stat()
+        if (info.st_dev,info.st_ino)!=stamp or private_file(plist).read_bytes()!=raw:
+            raise DistributionError('shared stop plist changed before bootout')
+        if state.exists() and read_object(private_file(state))!=record:
+            raise DistributionError('shared stop agent registry changed before bootout')
+        result=subprocess.run(['/bin/launchctl','print',target],capture_output=True,text=True,timeout=3)
+        lines=result.stdout.splitlines()
+        if result.returncode or result.stderr.strip() or len(result.stdout.encode())>65536 or not lines or lines[0].strip()!=target+' = {':
+            raise DistributionError('shared stop launchd job is unknown before bootout')
+        fields,printed_arguments=_shared_launchd_job_fields(lines)
+        if (printed_arguments!=arguments or fields.get('path')!=str(plist) or fields.get('program')!=arguments[0]
+                or fields.get('working directory')!=decoded['WorkingDirectory']):
+            raise DistributionError('shared stop launchd job/plist identity differs')
+        pids=[fields['pid']] if 'pid' in fields else []
+        if live:
+            if pids!=[str(owner['pid'])] or not fs.exact(owner) or fs.command(owner)!=' '.join(arguments):
+                raise DistributionError('shared stop live agent/job identity changed')
+        else:
+            if pids not in ([],[str(owner['pid'])]):raise DistributionError('shared stop launchd replacement PID refused')
+            if pids:
+                if fs.inspect(owner['pid']) is not None or fs.inspect(owner['pid']) is not None:
+                    raise DistributionError('shared stop cached launchd PID absence is unproven')
+            elif fields.get('state') not in ('spawn scheduled','not running'):
+                raise DistributionError('shared stop no-PID launchd state is unknown')
+            if not observe(owner):raise DistributionError('shared stop captured agent exit changed')
+
+def _force_clear_shared_model_records(trusted,captured,fs,lease,record):
+    # The record was authenticated while the frozen child was still captured.
+    # Revalidate installed source/binary trust, then require that same complete
+    # record and both exact exited identities. No lane/release event is inferred.
+    runner,child=fs.shared_model_record(trusted,record);bypid={x['pid']:x for x in captured}
+    def ended():
+        if any(bypid.get(value['pid'])!=value or not fs.exited(value) for value in (runner,child)):
+            raise DistributionError('shared stop owner is not an exact exited captured child')
+    ended()
+    model=no_symlinks(trusted['data_root']/'run/mtp2-shared-model.json');targets=[]
+    for path,directory in ((lease,True),(model,False)):
+        if not path.exists():continue
+        if directory:private_directory(path)
+        else:private_file(path)
+        before=path.stat();record_path=path/'lease.json' if directory else path
+        if (read_object(private_file(record_path))!=record
+                or directory and {x.name for x in path.iterdir()}!={'lease.json'}):
+            raise DistributionError('shared stop lease/model record changed; retained for review')
+        targets.append((path,directory,(before.st_dev,before.st_ino)))
+    moved=[]
+    try:
+        for path,directory,stamp in targets:
+            ended();current=path.stat();record_path=path/'lease.json' if directory else path
+            if ((current.st_dev,current.st_ino)!=stamp or read_object(private_file(record_path))!=record
+                    or directory and {x.name for x in path.iterdir()}!={'lease.json'}):
+                raise DistributionError('shared stop lease/model identity changed before quarantine')
+            quarantine=path.with_name(path.name+'.portable-stopped-'+uuid.uuid4().hex)
+            os.rename(path,quarantine);moved.append((path,quarantine,directory,stamp))
+            current=quarantine.stat();record_path=quarantine/'lease.json' if directory else quarantine
+            if ((current.st_dev,current.st_ino)!=stamp or read_object(private_file(record_path))!=record
+                    or directory and {x.name for x in quarantine.iterdir()}!={'lease.json'}):
+                raise DistributionError('shared stop quarantine identity changed; retained for review')
+        ended()
+        for path,quarantine,directory,stamp in moved:
+            current=quarantine.stat();record_path=quarantine/'lease.json' if directory else quarantine
+            if (path.exists() or (current.st_dev,current.st_ino)!=stamp
+                    or read_object(private_file(record_path))!=record
+                    or directory and {x.name for x in quarantine.iterdir()}!={'lease.json'}):
+                raise DistributionError('shared stop ownership changed during quarantine')
+        for _,quarantine,directory,_ in moved:
+            if directory:(quarantine/'lease.json').unlink();quarantine.rmdir()
+            else:quarantine.unlink()
+    except BaseException:
+        for path,quarantine,_,stamp in reversed(moved):
+            if quarantine.exists() and not path.exists():
+                current=quarantine.stat()
+                if (current.st_dev,current.st_ino)==stamp:os.rename(quarantine,path)
+        raise
+
+def _force_clear_model_records(trusted,captured,fs,*,shared_record=None):
     # No event counters or identity fields are rewritten. Only exact exited
     # installation-owned stale records may be removed after physical teardown.
     data=trusted['data_root'];bypid={x['pid']:x for x in captured};lease=no_symlinks(Path.home()/'Library/Application Support/LiliuxFlow-runtime-leases/gpu.lease')
+    if shared_record is not None:_force_clear_shared_model_records(trusted,captured,fs,lease,shared_record)
     path=lease/'lease.json'
     if path.exists():
         record=read_object(private_file(path))
@@ -805,7 +1241,7 @@ def stop(data,*,dry_run=False,controlplane_only=False,force=False):
         decoded=plistlib.loads(private_file(plist).read_bytes())
         arguments=decoded.get('ProgramArguments',[])
         expected_prefix=[str(trusted['binaries']['compat_python']),str(trusted['source_root']/'scripts/distribution/agent.py'),'--data-root',str(data)]
-        if decoded.get('Label')!=trusted['config']['launchd_label'] or arguments[:4]!=expected_prefix or arguments[4:] not in ([],['--controlplane-only']):
+        if decoded.get('Label')!=trusted['config']['launchd_label'] or arguments[:4]!=expected_prefix or arguments[4:] not in ([],['--controlplane-only'],['--mtp2-shared-context']):
             raise DistributionError('pre-start agent plist identity differs; no job signaled')
         label='gui/'+str(os.getuid())+'/'+trusted['config']['launchd_label']
         status=subprocess.run(['/bin/launchctl','print',label],capture_output=True,text=True)
@@ -849,8 +1285,8 @@ def stop(data,*,dry_run=False,controlplane_only=False,force=False):
     return {**result,'force':False,'normal_idle_drain':True,'native_exit_proven':True}
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--data-root',type=Path,required=True);parser.add_argument('--controlplane-only',action='store_true');args=parser.parse_args();os.umask(0o077)
-    try:raise SystemExit(run(args.data_root,controlplane_only=args.controlplane_only))
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--data-root',type=Path,required=True);parser.add_argument('--controlplane-only',action='store_true');parser.add_argument('--mtp2-shared-context',action='store_true');args=parser.parse_args();os.umask(0o077)
+    try:raise SystemExit(run(args.data_root,controlplane_only=args.controlplane_only,shared_context=args.mtp2_shared_context))
     except (DistributionError,OSError,ValueError,KeyError) as error:
         reason=str(error) if isinstance(error,DistributionError) else type(error).__name__
         print('LILIUXFLOW_AGENT_STOPPED reason='+reason,flush=True)

@@ -1,0 +1,581 @@
+diff --git a/src/engine.rs b/src/engine.rs
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -78,8 +78,15 @@
+         self.check_scope(&header.scope)?;
+         anyhow::ensure!(proposals.len() == SPEC_CONTINUATION_SLOTS,
+             "MTP2 continuation requires exactly two proposals");
+-        source.validate_two_slots(!header.sampling.is_greedy())?;
+-        self.distributions.copy_two_slots_from(ctx, source)?;
++        let idle = ctx.idle_shared_access()?;
++// MTP2_PHASE_DIAG_BEGIN
++let phase_capture = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::Capture);
++// MTP2_PHASE_DIAG_END
++        self.distributions.copy_two_slots_cpu_from(source, &idle, !header.sampling.is_greedy())?;
++        idle.finish()?;
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_capture);
++// MTP2_PHASE_DIAG_END
+         self.ready = Some((header, [proposals[0], proposals[1]]));
+         Ok(())
+     }
+@@ -88,8 +95,15 @@
+         self.check_scope(&expected.scope)?;
+         let Some((header, proposals)) = &self.ready else { return Ok(None) };
+         header.validate(expected)?;
+-        self.distributions.validate_two_slots(!header.sampling.is_greedy())?;
+-        target.copy_two_slots_from(ctx, &self.distributions)?;
++        let idle = ctx.idle_shared_access()?;
++// MTP2_PHASE_DIAG_BEGIN
++let phase_restore = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::Restore);
++// MTP2_PHASE_DIAG_END
++        target.copy_two_slots_cpu_from(&self.distributions, &idle, !header.sampling.is_greedy())?;
++        idle.finish()?;
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_restore);
++// MTP2_PHASE_DIAG_END
+         let proposals = proposals.to_vec(); self.ready = None;
+         Ok(Some(proposals))
+     }
+diff --git a/src/kernels/sample.rs b/src/kernels/sample.rs
+--- a/src/kernels/sample.rs
++++ b/src/kernels/sample.rs
+@@ -246,6 +246,21 @@
+         let copies: Vec<_> = src.iter().zip(&dst).map(|(src, dst)| BlitCopy {
+             src, dst, src_offset: 0, dst_offset: 0, len: src.byte_len() }).collect();
+         ctx.blit_copy(&copies)
++    }
++
++    /// Only cooperative continuation uses this settled, context-bound host copy.
++    /// Copies all candidate ids, all probability bytes, and both counts unchanged.
++    pub(crate) fn copy_two_slots_cpu_from(&self, source: &Self,
++        access: &crate::metal::IdleSharedAccess<'_>, sampled: bool) -> Result<()> {
++        self.validate_two_slots(false)?; source.validate_two_slots(false)?;
++        let src = [source.ids.view(0, &[2 * SAMPLE_K_CAP])?,
++            source.probs.view(0, &[2 * SAMPLE_K_CAP])?, source.counts.view(0, &[2])?];
++        let dst = [self.ids.view(0, &[2 * SAMPLE_K_CAP])?,
++            self.probs.view(0, &[2 * SAMPLE_K_CAP])?, self.counts.view(0, &[2])?];
++        access.validate_two_slot_copy(&src, &dst)?;
++        source.validate_two_slots(sampled)?;
++        for (src, dst) in src.iter().zip(&dst) { dst.write_bytes(src.raw_bytes())?; }
++        Ok(())
+     }
+ }
+ 
+diff --git a/src/metal.rs b/src/metal.rs
+--- a/src/metal.rs
++++ b/src/metal.rs
+@@ -58,6 +58,9 @@
+ };
+ 
+ use crate::tensor::Tensor;
++
++mod idle_shared;
++pub(crate) use idle_shared::IdleSharedAccess;
+ 
+ pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+ 
+@@ -531,6 +534,11 @@
+             )?;
+         }
+         pass.commit_wait()
++    }
++
++    /// Private continuation access only; refuses if any submitted work is unfinished.
++    pub(crate) fn idle_shared_access(&self) -> Result<IdleSharedAccess<'_>> {
++        idle_shared::acquire(self)
+     }
+ 
+     /// Submits a pass's program in order and signals the fence after it.
+@@ -1708,9 +1716,18 @@
+         if let Some(wake_at) = pacer.wake_at() {
+             let now = Instant::now();
+             if wake_at > now {
++// MTP2_PHASE_DIAG_BEGIN
++let phase_sleep = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::Sleep);
++// MTP2_PHASE_DIAG_END
+                 std::thread::sleep(wake_at - now);
+-            }
+-        }
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_sleep);
++// MTP2_PHASE_DIAG_END
++            }
++        }
++// MTP2_PHASE_DIAG_BEGIN
++let phase_poll_fence = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::PollFence);
++// MTP2_PHASE_DIAG_END
+         let overslept = event.signaled_value() >= value;
+         if !overslept {
+             let spin_until = Instant::now() + SPIN_CAP;
+@@ -1728,6 +1745,9 @@
+         if self.done.is_some() {
+             self.ctx.wait_fence(self.fence_value)?;
+         }
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_poll_fence);
++// MTP2_PHASE_DIAG_END
+         self.finished()
+     }
+ 
+diff --git a/src/metal/idle_shared.rs b/src/metal/idle_shared.rs
+new file mode 100644
+--- /dev/null
++++ b/src/metal/idle_shared.rs
+@@ -0,0 +1,140 @@
++//! Private, fail-closed host access to settled continuation distributions.
++//! No wait, submit, event signal, GPU allocation, or public unsafe API.
++use std::rc::Rc;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Mutex, MutexGuard};
++
++use anyhow::{Result, anyhow, ensure};
++use objc2_metal::MTLBuffer;
++
++use super::{Fault, MetalContext};
++use crate::tensor::Tensor;
++
++/// Holds the existing submission mutex until all three host copies finish.
++/// Its private constructor checks the latest context-wide fence, so neither
++/// a pending row nor a concurrently submitted pass can touch these buffers.
++pub(crate) struct IdleSharedAccess<'a> {
++    ctx: &'a MetalContext,
++    _submission: MutexGuard<'a, ()>,
++}
++
++fn lock_completed_submit<'a>(submit: &'a Mutex<()>, latest: &AtomicU64,
++    fault: &Fault, completed: impl FnOnce() -> u64) -> Result<MutexGuard<'a, ()>> {
++    let guard = submit.lock().map_err(|_| anyhow!("MTP2 host copy submission lock poisoned"))?;
++    fault.check()?;
++    let frontier = latest.load(Ordering::Acquire);
++    ensure!(completed() >= frontier, "MTP2 host copy requires completed GPU frontier");
++    fault.check()?;
++    Ok(guard)
++}
++
++pub(super) fn acquire(ctx: &MetalContext) -> Result<IdleSharedAccess<'_>> {
++    let submission = lock_completed_submit(&ctx.submit, &ctx.fence_value,
++        &ctx.fault, || ctx.fence.signaled_value())?;
++    Ok(IdleSharedAccess { ctx, _submission: submission })
++}
++
++#[derive(Clone, Copy)]
++struct CopyRange {
++    owner: usize,
++    base: usize,
++    allocation_len: usize,
++    offset: usize,
++    len: usize,
++}
++
++/// Every view is validated before the first write. The six payload ranges
++/// must be disjoint, including source/source and destination/destination.
++fn validate_ranges(owner: usize, ranges: &[CopyRange; 6]) -> Result<()> {
++    ensure!(owner != 0, "MTP2 host copy context identity unavailable");
++    let mut bounds = [(0usize, 0usize); 6];
++    for (i, range) in ranges.iter().enumerate() {
++        ensure!(range.owner == owner, "MTP2 host copy buffer belongs to another context");
++        let end_offset = range.offset.checked_add(range.len)
++            .ok_or_else(|| anyhow!("MTP2 host copy range overflow"))?;
++        ensure!(range.len > 0 && end_offset <= range.allocation_len,
++            "MTP2 host copy exceeds allocation bounds");
++        let start = range.base.checked_add(range.offset)
++            .ok_or_else(|| anyhow!("MTP2 host copy address overflow"))?;
++        let end = start.checked_add(range.len)
++            .ok_or_else(|| anyhow!("MTP2 host copy address overflow"))?;
++        bounds[i] = (start, end);
++    }
++    let cap = crate::kernels::sample::SAMPLE_K_CAP;
++    let expected = [2 * cap * 4, 2 * cap * 4, 2 * 4];
++    for i in 0..3 {
++        ensure!(ranges[i].len == expected[i] && ranges[i + 3].len == expected[i],
++            "MTP2 host copy requires complete two-slot distributions");
++    }
++    for i in 0..6 {
++        for j in i + 1..6 {
++            ensure!(bounds[i].1 <= bounds[j].0 || bounds[j].1 <= bounds[i].0,
++                "MTP2 host copy distribution ranges overlap");
++        }
++    }
++    Ok(())
++}
++
++impl IdleSharedAccess<'_> {
++    pub(crate) fn validate_two_slot_copy(&self, source: &[Tensor; 3], target: &[Tensor; 3]) -> Result<()> {
++        let owner = Rc::as_ptr(&self.ctx.residency) as usize;
++        let range = |tensor: &Tensor| {
++            let (buffer, offset) = tensor.binding();
++            CopyRange { owner: Rc::as_ptr(&buffer.residency) as usize,
++                base: buffer.contents().as_ptr() as usize, allocation_len: buffer.length(),
++                offset, len: tensor.byte_len() }
++        };
++        validate_ranges(owner, &[range(&source[0]), range(&source[1]), range(&source[2]),
++            range(&target[0]), range(&target[1]), range(&target[2])])
++    }
++
++    /// Preserve the fault check that the previous blit wait performed.
++    /// The submission mutex remains held through this check and is then dropped.
++    pub(crate) fn finish(self) -> Result<()> { self.ctx.fault.check() }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn ranges() -> [CopyRange; 6] {
++        std::array::from_fn(|i| CopyRange { owner: 7, base: 0x10000 + i * 0x10000,
++            allocation_len: 0x10000, offset: 16, len: if i % 3 == 2 { 8 } else { 8192 } })
++    }
++    #[test] fn completed_frontier_holds_existing_submit_lock_cpu() {
++        let submit = Mutex::new(()); let latest = AtomicU64::new(12); let fault = Fault::default();
++        let guard = lock_completed_submit(&submit, &latest, &fault, || 12).unwrap();
++        assert!(submit.try_lock().is_err()); drop(guard); assert!(submit.try_lock().is_ok());
++    }
++    #[test] fn unfinished_frontier_refuses_without_wait_cpu() {
++        let submit = Mutex::new(()); let latest = AtomicU64::new(12);
++        assert!(lock_completed_submit(&submit, &latest, &Fault::default(), || 11).is_err());
++        assert!(submit.try_lock().is_ok());
++    }
++    #[test] fn actual_fault_gate_refuses_and_unlocks_cpu() {
++        let submit = Mutex::new(()); let latest = AtomicU64::new(12); let fault = Fault::default();
++        fault.record("synthetic CPU fault".to_owned());
++        assert!(lock_completed_submit(&submit, &latest, &fault, || 12).is_err());
++        assert!(submit.try_lock().is_ok());
++    }
++    #[test] fn complete_three_payload_ranges_are_admitted_cpu() {
++        let values = ranges(); assert!(validate_ranges(7, &values).is_ok());
++        assert_eq!(values[..3].iter().map(|r| r.len).sum::<usize>(), 16_392);
++    }
++    #[test] fn cross_context_refuses_before_any_write_cpu() {
++        let mut values = ranges(); values[4].owner = 8;
++        assert!(validate_ranges(7, &values).is_err()); assert!(validate_ranges(0, &ranges()).is_err());
++    }
++    #[test] fn source_destination_or_internal_overlap_refuses_cpu() {
++        for (a, b) in [(0, 3), (0, 1), (3, 4)] {
++            let mut values = ranges(); values[b].base = values[a].base;
++            assert!(validate_ranges(7, &values).is_err());
++        }
++    }
++    #[test] fn partial_payload_bounds_and_address_overflow_refuse_cpu() {
++        let mut values = ranges(); values[0].len -= 4; assert!(validate_ranges(7, &values).is_err());
++        let mut values = ranges(); values[5].offset = values[5].allocation_len - 4;
++        assert!(validate_ranges(7, &values).is_err());
++        let mut values = ranges(); values[0].base = usize::MAX - 8;
++        assert!(validate_ranges(7, &values).is_err());
++    }
++}
+diff --git a/src/qwen4exp/spec.rs b/src/qwen4exp/spec.rs
+--- a/src/qwen4exp/spec.rs
++++ b/src/qwen4exp/spec.rs
+@@ -133,6 +133,9 @@
+             s.spec.is_some() && self.weights.mtp.is_some(),
+             "verify without a draft head"
+         );
++// MTP2_PHASE_DIAG_BEGIN
++let phase_host_prepare = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::HostPrepare);
++// MTP2_PHASE_DIAG_END
+         let mut tokens = Vec::with_capacity(drafts.len() + 1);
+         tokens.push(pending);
+         tokens.extend_from_slice(drafts);
+@@ -167,6 +170,10 @@
+         }
+         let pos_before = state.pos;
+         let hist_before = state.ple.as_ref().map(|p| p.hist);
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_host_prepare);
++let phase_verify_encode = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::VerifyEncode);
++// MTP2_PHASE_DIAG_END
+         let committed = match parked {
+             Some(pass) => {
+                 s.sync.release()?;
+@@ -189,6 +196,9 @@
+             }
+         };
+         // Same bookkeeping as a prefill chunk; the draft pass rolls it back.
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_verify_encode);
++// MTP2_PHASE_DIAG_END
+         // Done before the draft pass is encoded: it sees the state as the
+         // verify pass leaves it.
+         state.pos += m;
+@@ -198,6 +208,9 @@
+         state.conv_slot = 1 - state.conv_slot;
+         // The draft pass follows on the queue; the GPU reads the accepted
+         // count itself.
++// MTP2_PHASE_DIAG_BEGIN
++let phase_draft_encode = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::DraftEncode);
++// MTP2_PHASE_DIAG_END
+         let draft = self
+             .encode_draft_selected(
+                 ctx,
+@@ -210,6 +223,10 @@
+                 step0 + m,
+             )?
+             .commit()?;
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_draft_encode);
++let phase_variants = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::Variants);
++// MTP2_PHASE_DIAG_END
+         // While the GPU works, encode the next verify pass for every possible
+         // outcome; finish_speculation retains only the matching one.
+         let prepared = if can_prepare {
+@@ -217,9 +234,16 @@
+         } else {
+             Vec::new()
+         };
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_variants);
++let phase_verify_wait = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::VerifyWait);
++// MTP2_PHASE_DIAG_END
+         let mut pace = s.sync.pace_verify.get();
+         let done = committed.wait_retain_paced(&mut pace)?;
+         s.sync.pace_verify.set(pace);
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_verify_wait);
++// MTP2_PHASE_DIAG_END
+         // The draft pass starts as the verify pass ends.
+         let mut pace = s.sync.pace_draft.get();
+         pace.begin(Instant::now());
+@@ -533,9 +557,15 @@
+         drafts: usize,
+         pending: &SpecPending,
+     ) -> Result<Vec<u32>> {
++// MTP2_PHASE_DIAG_BEGIN
++let phase_draft_wait = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::DraftWait);
++// MTP2_PHASE_DIAG_END
+         let mut pace = s.sync.pace_draft.get();
+         let done = committed.wait_retain_paced(&mut pace)?;
+         s.sync.pace_draft.set(pace);
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_draft_wait);
++// MTP2_PHASE_DIAG_END
+         if profiling() {
+             let t = done.timing()?;
+             let gap = pending
+diff --git a/src/serve.rs b/src/serve.rs
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -31,6 +31,9 @@
+ pub mod http;
+ pub mod mtp2;
+ pub mod mtp2_control;
++// MTP2_PHASE_DIAG_BEGIN
++pub(crate) mod mtp2_phase_diag;
++// MTP2_PHASE_DIAG_END
+ pub mod pin;
+ pub mod request;
+ pub mod session;
+diff --git a/src/serve/batch.rs b/src/serve/batch.rs
+--- a/src/serve/batch.rs
++++ b/src/serve/batch.rs
+@@ -803,14 +803,24 @@
+         &mut self, generator: &Generator, row: &mut Row<'_, M>,
+         max_steps: usize, waiting: &dyn Fn() -> bool,
+     ) -> Result<usize> {
++// MTP2_PHASE_DIAG_BEGIN
++let phase_scope = super::mtp2_phase_diag::Scope::enter(&row.sink.metadata.request_id,
++    &self.mtp2_residency.as_ref().expect("controlled MTP2").allocation_id, row.slot, row.step_index);
++// MTP2_PHASE_DIAG_END
+         if row.sink.cancelled() || row.req.parser.stopped || self.shutdown.cancel() {
+             if let Some(saved) = &mut row.continuation { saved.invalidate(); }
+             row.finish = Some(FinishReason::Callback); return Ok(0);
+         }
+         ensure!(row.req.session.state.pos() == row.req.facts.n + row.generated.len() - 1,
+             "MTP2 row resumed without its last-unfed draw");
++// MTP2_PHASE_DIAG_BEGIN
++let phase_counts_in = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::CountsIn);
++// MTP2_PHASE_DIAG_END
+         self.model.move_sampler_counts(&self.ctx, &mut self.scratch,
+             CountsSlot::Batch(row.slot), CountsSlot::Engine)?;
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_counts_in);
++// MTP2_PHASE_DIAG_END
+         let before = row.generated.len();
+         let scope = SpecContinuationScope::new(&row.sink.metadata.request_id,
+             &self.mtp2_residency.as_ref().expect("candidate").allocation_id, row.slot)?;
+@@ -888,12 +898,21 @@
+         }
+         row.stats.solo_tokens += row.generated.len() - before;
+         if row.finish.is_none() {
++// MTP2_PHASE_DIAG_BEGIN
++let phase_counts_out = crate::serve::mtp2_phase_diag::Span::enter(crate::serve::mtp2_phase_diag::Phase::CountsOut);
++// MTP2_PHASE_DIAG_END
+             self.model.move_sampler_counts(&self.ctx, &mut self.scratch,
+                 CountsSlot::Engine, CountsSlot::Batch(row.slot))?;
++// MTP2_PHASE_DIAG_BEGIN
++drop(phase_counts_out);
++// MTP2_PHASE_DIAG_END
+         }
+         ensure!(row.req.bytes().checked_add(row.continuation.as_ref()
+             .map_or(0, SpecContinuation::allocated_bytes)).is_some_and(|n| n <= row.reserved_bytes),
+             "MTP2 actual state exceeded its endpoint reservation");
++// MTP2_PHASE_DIAG_BEGIN
++if let Some(scope) = phase_scope { scope.finish(row.step_index, used_steps, row.finish.is_some()); }
++// MTP2_PHASE_DIAG_END
+         Ok(used_steps)
+     }
+ 
+diff --git a/src/serve/mtp2_phase_diag.rs b/src/serve/mtp2_phase_diag.rs
+new file mode 100644
+--- /dev/null
++++ b/src/serve/mtp2_phase_diag.rs
+@@ -0,0 +1,160 @@
++//! Controlled-MTP2 numeric phase totals. Default off, no GPU operation.
++use std::cell::RefCell;
++use std::sync::OnceLock;
++
++pub const WINDOW: usize = 16;
++pub const PHASES: [&str; 13] = ["counts_in", "counts_out", "restore_copy_fence",
++    "capture_copy_fence", "host_prepare", "verify_encode_submit", "draft_encode_submit",
++    "prepare_variants", "verify_wait", "draft_wait", "pace_sleep", "pace_poll_fence",
++    "scheduler_gap"];
++#[derive(Clone, Copy)]
++pub enum Phase { CountsIn, CountsOut, Restore, Capture, HostPrepare, VerifyEncode,
++    DraftEncode, Variants, VerifyWait, DraftWait, Sleep, PollFence, Scheduler }
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Identity { pub request_id: String, pub epoch: String, pub slot: usize }
++impl Identity {
++    pub fn new(request_id: &str, epoch: &str, slot: usize) -> Option<Self> {
++        if !(1..=128).contains(&request_id.len()) || !request_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
++            || epoch.len() != 64 || !epoch.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) || slot >= 2 { return None; }
++        Some(Self { request_id: request_id.to_owned(), epoch: epoch.to_owned(), slot })
++    }
++}
++#[derive(Clone, Debug)]
++pub struct Totals {
++    pub identity: Identity, pub quanta: usize, pub completed_quanta: usize,
++    pub zero_step_quanta: usize, pub aborted_quanta: usize, pub spec_steps: usize,
++    pub first_step: usize, pub last_step: usize,
++    pub first_begin_ns: u64, pub last_end_ns: u64, pub whole_ns: u64,
++    pub ns: [u64; 13], pub samples: [u64; 13], pub invalid_clock: bool,
++}
++impl Totals {
++    fn new(identity: Identity, now: u64) -> Self { Self { identity, quanta: 0,
++        completed_quanta: 0, zero_step_quanta: 0, aborted_quanta: 0, spec_steps: 0,
++        first_step: 0, last_step: 0, first_begin_ns: now, last_end_ns: now, whole_ns: 0,
++        ns: [0; 13], samples: [0; 13], invalid_clock: false } }
++    fn add(&mut self, phase: Phase, start: u64, end: u64) {
++        let index = phase as usize;
++        match (end.checked_sub(start).and_then(|d| self.ns[index].checked_add(d)), self.samples[index].checked_add(1)) {
++            (Some(value), Some(samples)) => { self.ns[index] = value; self.samples[index] = samples; }
++            _ => self.invalid_clock = true,
++        }
++    }
++    pub fn line(&self) -> String {
++        let mut line = format!("[lily-meta] request_id={} phase=mtp2_phase_diag protocol=1 clock=mach_absolute_time_ns clock_conversion=host_secs_f64_to_u64_ns resident_epoch={} row_slot={} quanta={} completed_quanta={} zero_step_quanta={} aborted_quanta={} spec_steps={} first_step={} last_step={} first_begin_ns={} last_end_ns={} whole_ns={} invalid_clock={}",
++            self.identity.request_id, self.identity.epoch, self.identity.slot, self.quanta,
++            self.completed_quanta, self.zero_step_quanta, self.aborted_quanta, self.spec_steps,
++            self.first_step, self.last_step, self.first_begin_ns, self.last_end_ns, self.whole_ns, self.invalid_clock);
++        for (i, name) in PHASES.iter().enumerate() { line.push_str(&format!(" {name}_ns={} {name}_samples={}", self.ns[i], self.samples[i])); }
++        line
++    }
++}
++struct Active { slot: usize, step: usize, began: u64 }
++#[derive(Default)]
++pub struct Collector { rows: [Option<Totals>; 2], active: Option<Active>, last_end: Option<u64> }
++impl Collector {
++    pub fn begin(&mut self, enabled: bool, identity: Identity, step: usize, now: u64) -> Option<Totals> {
++        if !enabled || self.active.is_some() { return None; }
++        let slot = identity.slot;
++        let changed = self.rows[slot].as_ref().is_some_and(|row| row.identity != identity);
++        let old = if changed { self.rows[slot].take() } else { None };
++        if self.rows[slot].is_none() { self.rows[slot] = Some(Totals::new(identity, now)); }
++        self.active = Some(Active { slot, step, began: now });
++        // Previous ANY row scope end to this begin: dispatch/logging/idle/prefill, not peer execution.
++        if let Some(end) = self.last_end { self.add(Phase::Scheduler, end, now); }
++        old
++    }
++    pub fn add(&mut self, phase: Phase, start: u64, end: u64) {
++        if let Some(active) = &self.active { if let Some(row) = self.rows[active.slot].as_mut() { row.add(phase, start, end); } }
++    }
++    pub fn active(&self) -> bool { self.active.is_some() }
++    pub fn end(&mut self, step: usize, steps: usize, terminal: bool, aborted: bool, now: u64) -> Option<Totals> {
++        let active = self.active.take()?; self.last_end = Some(now);
++        let row = self.rows[active.slot].as_mut()?;
++        row.quanta += 1; // bounded by WINDOW; zero/error attempts are explicitly labelled
++        row.last_end_ns = now;
++        match now.checked_sub(active.began).and_then(|d| row.whole_ns.checked_add(d)) {
++            Some(value) => row.whole_ns = value, None => row.invalid_clock = true,
++        }
++        if aborted { row.aborted_quanta += 1; }
++        else if steps == 0 { row.zero_step_quanta += 1; }
++        else {
++            row.completed_quanta += 1;
++            if step.checked_sub(active.step) != Some(steps) { row.invalid_clock = true; }
++            match row.spec_steps.checked_add(steps) { Some(n) => row.spec_steps = n, None => row.invalid_clock = true }
++            if row.first_step == 0 { match active.step.checked_add(1) { Some(n) => row.first_step = n, None => row.invalid_clock = true } }
++            if step <= row.last_step { row.invalid_clock = true; } else { row.last_step = step; }
++        }
++        if row.quanta >= WINDOW || terminal { self.rows[active.slot].take() } else { None }
++    }
++}
++thread_local! { static DIAG: RefCell<Collector> = RefCell::new(Collector::default()); }
++fn enabled() -> bool { static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var("LILIUXFLOW_MTP2_PHASE_DIAG").ok().as_deref() == Some("1")) }
++fn now() -> u64 { super::mtp2::monotonic_ns() }
++fn emit(value: Option<Totals>) { if let Some(value) = value { eprintln!("{}", value.line()); } }
++pub struct Scope { step: usize, active: bool }
++impl Scope {
++    pub fn enter(request_id: &str, epoch: &str, slot: usize, step: usize) -> Option<Self> {
++        if !enabled() { return None; }
++        let identity = Identity::new(request_id, epoch, slot)?;
++        DIAG.with(|cell| { let mut c = cell.borrow_mut(); if c.active() { return None; }
++            emit(c.begin(true, identity, step, now())); Some(Self { step, active: true }) })
++    }
++    pub fn finish(mut self, step: usize, steps: usize, terminal: bool) {
++        DIAG.with(|cell| emit(cell.borrow_mut().end(step, steps, terminal, false, now()))); self.active = false;
++    }
++}
++impl Drop for Scope { fn drop(&mut self) { if self.active {
++    DIAG.with(|cell| emit(cell.borrow_mut().end(self.step, 0, true, true, now()))); } } }
++pub struct Span { phase: Phase, started: Option<u64> }
++impl Span {
++    pub fn enter(phase: Phase) -> Self {
++        let started = if enabled() && DIAG.with(|c| c.borrow().active()) { Some(now()) } else { None };
++        Self { phase, started }
++    }
++}
++impl Drop for Span { fn drop(&mut self) { if let Some(start) = self.started {
++    let end = now(); DIAG.with(|c| c.borrow_mut().add(self.phase, start, end)); } } }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn id(slot: usize) -> Identity { Identity::new(&format!("req-123-{slot}"), &"a".repeat(64), slot).unwrap() }
++    #[test] fn default_off_collects_nothing() { let mut c = Collector::default(); c.begin(false, id(0), 0, 10);
++        c.add(Phase::CountsIn, 10, 20); assert!(c.end(1, 1, true, false, 30).is_none()); assert!(!c.active()); }
++    #[test] fn aggregates_exact16_quanta_then_resets_range() { let mut c = Collector::default();
++        for step in 0..16 { c.begin(true, id(0), step, 100 + step as u64 * 30);
++            c.add(Phase::VerifyWait, 110, 120); let out = c.end(step + 1, 1, false, false, 120 + step as u64 * 30);
++            if step == 15 { let out = out.unwrap(); assert_eq!((out.quanta, out.first_step, out.last_step), (16, 1, 16)); assert_eq!(out.ns[8], 160); assert_eq!(out.whole_ns, 320); assert_eq!(out.spec_steps, 16); }
++            else { assert!(out.is_none()); } }
++        c.begin(true, id(0), 16, 1000); assert_eq!(c.end(17, 1, true, false, 1010).unwrap().first_step, 17); }
++    #[test] fn isolates_two_rows_and_epoch_reuse_flushes_old() { let mut c = Collector::default();
++        c.begin(true, id(0), 0, 10); c.add(Phase::Restore, 10, 25); c.end(1, 1, false, false, 30);
++        c.begin(true, id(1), 4, 40); c.add(Phase::Restore, 40, 60); let b = c.end(5, 1, true, false, 65).unwrap();
++        assert_eq!(b.ns[2], 20); assert_eq!(b.identity.slot, 1); assert_eq!(b.ns[12], 10);
++        let changed = Identity::new("req-new", &"b".repeat(64), 0).unwrap(); let old = c.begin(true, changed, 0, 70).unwrap();
++        assert_eq!(old.ns[2], 15); assert_eq!(old.identity.epoch, "a".repeat(64)); }
++    #[test] fn malformed_identity_and_backward_clock_are_not_hidden() {
++        assert!(Identity::new("prompt with spaces", &"a".repeat(64), 0).is_none());
++        assert!(Identity::new("req-1", &"G".repeat(64), 0).is_none()); assert!(Identity::new("req-1", &"a".repeat(64), 2).is_none());
++        let mut c = Collector::default(); c.begin(true, id(0), 0, 100); c.add(Phase::Sleep, 50, 20);
++        let row = c.end(1, 1, true, false, 110).unwrap(); assert!(row.invalid_clock); assert_eq!(row.ns[10], 0); }
++    #[test] fn zero_and_aborted_attempts_do_not_claim_completed_steps() {
++        let mut c = Collector::default(); c.begin(true, id(0), 8, 1);
++        let row = c.end(8, 0, true, false, 3).unwrap(); assert_eq!((row.first_step, row.last_step, row.spec_steps, row.completed_quanta, row.zero_step_quanta), (0, 0, 0, 0, 1));
++        c.begin(true, id(0), 8, 4); let row = c.end(8, 0, true, true, 6).unwrap(); assert_eq!((row.completed_quanta, row.aborted_quanta, row.first_step), (0, 1, 0));
++    }
++    #[test] fn solo_multiple_steps_use_actual_control_count() { let mut c = Collector::default(); c.begin(true, id(0), 8, 1);
++        let row = c.end(18, 10, true, false, 30).unwrap(); assert_eq!((row.quanta, row.spec_steps, row.first_step, row.last_step), (1, 10, 9, 18));
++        c.begin(true, id(0), 18, 40); assert!(c.end(20, 1, true, false, 50).unwrap().invalid_clock);
++    }
++    #[test] fn counter_overflow_marks_invalid_without_panicking() { let mut row = Totals::new(id(0), 0);
++        row.samples[0] = u64::MAX; row.add(Phase::CountsIn, 0, 1); assert!(row.invalid_clock); assert_eq!(row.ns[0], 0);
++        row.invalid_clock = false; row.ns[1] = u64::MAX; row.add(Phase::CountsOut, 0, 1); assert!(row.invalid_clock);
++    }
++    #[test] fn metadata_line_is_only_bounded_numeric_and_owned_identity() {
++        let mut c = Collector::default(); c.begin(true, id(0), 0, 1); c.add(Phase::CountsOut, 1, 2);
++        let row = c.end(1, 1, true, false, 3).unwrap(); let line = row.line(); assert!(line.len() < 2048);
++        assert!(!line.contains("proposals") && !line.contains("sampled") && !line.contains("logits")); }
++}

@@ -2,7 +2,7 @@
 <h1 align="center">LiliuxFlow</h1>
 <p align="center">Apple Silicon 向けローカル LLM 配信・運用プラットフォーム</p>
 <p align="center">
-  <a href="https://github.com/Hiruynk/LiliuxFlow/releases"><img alt="version / v0.1.0" src="https://img.shields.io/badge/version-v0.1.0-2563eb?style=flat-square"></a>
+  <a href="https://github.com/Hiruynk/LiliuxFlow/releases"><img alt="version / v0.1.1" src="https://img.shields.io/badge/version-v0.1.1-2563eb?style=flat-square"></a>
   <a href="#requirements"><img alt="macOS / 27.0" src="https://img.shields.io/badge/macOS-27.0-4c4e75?style=flat-square&amp;logo=apple&amp;logoColor=white"></a>
   <a href="#requirements"><img alt="Apple Silicon / M5+" src="https://img.shields.io/badge/Apple_Silicon-M5%2B-e7883b?style=flat-square&amp;logo=apple&amp;logoColor=white"></a>
   <a href="LICENSE"><img alt="license / Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square"></a>
@@ -90,19 +90,17 @@ LiliuxFlow 独自の実装には、インストール環境の監督プログラ
 
 上記の3つの MTP0 設定は同じ外部 Q4 チェックポイントを共有し、チェックポイント既定の high thinking、QSA Split、MTP0 を維持します。総コンテキストの上限には入力と出力の両方が含まれます。長いコンテキストを使うアプリケーションには、対象モデルへのアクセスを仮想キーに明示的に許可してください。リクエストは上限のあるキューに入り、設定の切り替えは実行中の生成とリソースの解放が完了するまで待機します。
 
-### 任意の MTP2 設定
+### 共有 MTP2 推論
 
-3つの追加 MTP2 エイリアスは、それぞれ `ctx64k-mtp2`、`ctx128k-mtp2`、`ctx262k-mtp2` を選択します。総コンテキストは65,536、131,072、262,144トークンです。同じエンジンと Q4 チェックポイントを共有し、HIGH thinking、QSA Split、BF16 KV を使用します。推論を含む最大出力予算は各設定とも65,536トークンです。API の既定モデルは64K MTP0のままです。
+**共有 MTP2 推論**では、1つの Q4 モデルを64K、128K、262Kの MTP2 設定にまたがって常駐させ、最大2件の生成リクエストと4件の待機リクエストを扱います。各リクエストのコンテキスト上限、セッション状態、キャンセル処理は独立しています。この MTP2 グループ内の設定を切り替えても、重みは再ロードされません。生成処理は完全な speculative step ごとに交互に進めます。
 
-3つの MTP2 設定は、上記の M5 Max／128 GiB ホストで検証し、有効化しています。この結果はそのローカル環境での検証によるもので、新規インストールで自動的に有効になるわけではありません。ソースの設定一覧では、すべての MTP2 設定が初期状態で無効です。
+共有モードは明示的に選択します。既定の64K MTP0と既存の MTP0 設定も利用できます。MTP0や別のエンジンへの切り替えには独立したモデルのライフサイクルが適用され、モデルが再ロードされる場合があります。MTP2 エイリアスは HIGH thinking、QSA Split、BF16 KV を使用し、推論を含む最大出力予算は65,536トークンです。
 
-停止中のインストールで「クイックスタート」の `lf` 関数を使い、`lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute` を実行します。この追加エンジンのビルドが最初に有効化するのは MTP2 64K のみです。128K と262K は、運用者がそれぞれ検証し、信頼されたインストール設定で有効化する必要があります。一方の有効化で他方が有効になることはありません。`lf profiles list` と `lf profiles info ctx128k-mtp2` はモデルを読み込まず、設定一覧を参照します。
+各アプリケーションは自分の LiteLLM virtual key と明示的なモデル権限を使用します。キーの制限も適用されるため、同時実行数が1のキーでは2件の同時リクエストを試せません。テナントのキャッシュは常駐メモリ内に保持し、共有ディスクキャッシュは無効です。リクエスト body からエンジン、パス、メモリ、KV 精度、コンテキストを変更することはできません。JSON／JSON Schema 形式の応答とツール実行は非対応です。
 
-設定を有効化した後、`lf profiles grant-owner ctx128k-mtp2 --dry-run` で指定 owner caller への権限追加を確認し、必要な場合だけ `--execute` で適用します。他の2設定には `ctx64k-mtp2` または `ctx262k-mtp2` を指定してください。他の caller にも対象モデルへの明示的な権限が必要です。空またはワイルドカードの権限では MTP2 を利用できません。caller への権限追加だけでは、無効な設定は有効になりません。
+共有モードのインストールとクライアントのコマンドは下記にあります。詳しい選択手順は[インストール](docs/INSTALLATION.md#shared-mtp2)、リクエストと使用量の扱いは [API](docs/API.md#shared-mtp2-serving) を参照してください。
 
-API リクエストには、有効化済みの正確なエイリアスを指定します。[API](docs/API.md) に128K と262K を直接指定する例があります。リクエスト body からエンジン、パス、メモリ、KV 精度、context を変更することはできません。JSON／JSON Schema 形式の応答とツール実行は引き続き非対応です。
-
-## 同一ワークロードの性能
+## MTP0 の単一リクエスト性能の参考値
 
 > [!NOTE]
 > 同じ Q4 チェックポイント、MTP0、QSA Split、チェックポイント既定の high thinking、温度 0 で実測しました。キャッシュを使わない入力 4,096 トークンと出力 256 トークンを使い、各設定を交互に 3 回実行しています。値は中央値で、prefill の範囲は実行ごとの変動を示します。この共通の 4K ワークロードは、コンテキスト上限近くでの処理速度を示すものではありません。
@@ -137,7 +135,7 @@ GitHub が自動生成する **Source code (zip/tar.gz)** にはこのソース�
 
 既存モデルを使う場合は、完全なチェックポイントのディレクトリを `MODEL_DIR` に指定してください。setup はその場所を直接使用します。
 
-リポジトリのルートで実行します。
+既定の MTP0 をインストールする場合は、リポジトリのルートから実行してください。下記の共有モードの手順でも、ここで定義する関数と変数を使用します：
 
 ```sh
 export MODEL_DIR="$HOME/Models/Qwen3.8-Flash-Next-lily-q4"
@@ -168,6 +166,37 @@ lf models install qwen3.8-flash-next-lily-q4 --output "$MODEL_DIR" --execute
 ```
 
 `--dry-run` は Hugging Face に接続してダウンロードのメタデータを取得し、`--execute` はモデルファイルをダウンロードします。管理サービスを先にセットアップする場合は、上記のモデルディレクトリを指定する setup を `lf setup --without-model` に置き換え、`lf verify-model` を省略してください。モデルを追加する前に管理サービスを利用できます。推論の提供を始めるときに、モデルを追加して検証してください。後からモデルを追加する手順は[インストール](docs/INSTALLATION.md)を参照してください。
+
+### 共有 MTP2 のインストール
+
+共有モードを使う場合は、上で定義した `lf` 関数と完全な `MODEL_DIR` チェックポイントを使い、新しいデータディレクトリにインストールします。この拡張のビルドで3つの MTP2 設定が有効になります。起動時にインストール用 caller が作成され、その後で128Kと262Kの権限を付与します。
+
+新しいデータディレクトリでも既定のポートは同じです。元のサービスが稼働している場合は、[個別インストールとポート競合](docs/INSTALLATION.md#separate-installations-and-port-conflicts)に従って setup で空いているポートを選ぶか、計画した切り替え時に元のインストールを停止してから起動してください。既存のインストールには[アップグレード手順](docs/OPERATIONS.md#upgrade-and-rollback)を使用します。
+
+```sh
+SHARED_DATA="$HOME/Library/Application Support/LiliuxFlow shared"
+lf --data-root "$SHARED_DATA" setup --model-dir "$MODEL_DIR"
+lf --data-root "$SHARED_DATA" build \
+  --optin-engine latest13f-defer-pc123-mtp2-shared-context-v1 \
+  --ui-manifest manifests/distribution/ui-recipe-mtp2-shared.json --execute
+lf --data-root "$SHARED_DATA" verify-model
+lf --data-root "$SHARED_DATA" initialize --execute
+lf --data-root "$SHARED_DATA" doctor
+lf --data-root "$SHARED_DATA" start --mtp2-shared-context
+lf --data-root "$SHARED_DATA" status
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --dry-run
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --execute
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx262k-mtp2 --mtp2-shared-context --execute
+
+uv run --no-project --python 3.12 python scripts/distribution/client_example.py \
+  --data-root "$SHARED_DATA" --api openai \
+  --model qwen3.8-flash-next-lily-q4-mtp2-128k --stream
+uv run --no-project --python 3.12 python scripts/distribution/client_example.py \
+  --data-root "$SHARED_DATA" --api openai \
+  --model qwen3.8-flash-next-lily-q4-mtp2-262k --stream
+```
+
+上の例は、指定されたインストール用 caller を使用します。他のアプリケーションのキーには、API 管理画面で必要なエイリアスを正確に指定して権限を付与してください。空またはワイルドカードの権限では MTP2 を利用できません。状態確認、停止、サービスモードの切り替えは[運用](docs/OPERATIONS.md#shared-mtp2-operations)を参照してください。
 
 | 用途 | 既定の接続先 |
 | --- | --- |

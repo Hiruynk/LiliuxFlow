@@ -47,10 +47,16 @@ def apply_manager_source_patches(source,target,pin):
 
 LEGACY_ENGINE = 'legacy-db3-mtp0'
 OPT64_ENGINE = 'latest13f-defer-pc123-mtp2-opt64k'
+SHARED_ENGINE = 'latest13f-defer-pc123-mtp2-shared-context-v1'
+# A source-only selector; physical ENGINE_ID and logical profiles are unchanged.
+SHARED_CPU_COPY_ENGINE = 'latest13f-defer-pc123-mtp2-shared-context-cpu-copy-source-v1'
 
 
 def select_lily_recipe(lock, engine_id=LEGACY_ENGINE):
     """Select one fixed source recipe; the default recipe remains unchanged."""
+    if engine_id in (SHARED_ENGINE, SHARED_CPU_COPY_ENGINE):
+        from mtp2_shared_runtime import candidate_expectation, select_shared_recipe
+        return select_shared_recipe(lock, candidate_expectation(engine_id == SHARED_CPU_COPY_ENGINE))
     if engine_id == LEGACY_ENGINE:
         pin = lock['lily']
         if pin.get('commit') != 'db3f8a7cdb33f1e88b68c6889331abd31098c923':
@@ -75,6 +81,12 @@ def select_lily_recipe(lock, engine_id=LEGACY_ENGINE):
 
 def apply_lily_source_patches(source, target, lock, engine_id=LEGACY_ENGINE):
     """Normal builder replay and complete hash inventory, without compilation."""
+    if engine_id in (SHARED_ENGINE, SHARED_CPU_COPY_ENGINE):
+        from mtp2_shared_recipe import source_preflight
+        from mtp2_shared_runtime import candidate_expectation, replay_shared_source
+        performance_candidate = engine_id == SHARED_CPU_COPY_ENGINE
+        source_preflight(source, performance_candidate=performance_candidate)
+        return replay_shared_source(source, target, lock, candidate_expectation(performance_candidate))
     from common import read_object
     import hashlib, json
     pin, baseline_path = select_lily_recipe(lock, engine_id)

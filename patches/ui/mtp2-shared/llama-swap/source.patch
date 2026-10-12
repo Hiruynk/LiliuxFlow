@@ -1,0 +1,142 @@
+diff --git a/ui/src/components/ActivityTable.svelte b/ui/src/components/ActivityTable.svelte
+index 07aed89..443bbf0 100644
+--- a/ui/src/components/ActivityTable.svelte
++++ b/ui/src/components/ActivityTable.svelte
+@@ -50,7 +50,7 @@ import {displayEnum} from "../liliuxflow/display";
+   import SourceCell from "./activity-table/SourceCell.svelte";
+   import ExportDialog from "./activity-table/ExportDialog.svelte";
+   import { buildActivityMarkdown, formatDrafted } from "../lib/activityExport";
+-  import { formatDuration, formatSpeed, formatRelativeTime } from "../lib/format";
++  import { formatDuration, formatSpeed } from "../lib/format";
+   import { formatBytes, liveElapsedMs, requestHeader, sessionID } from "../lib/inflight";
+ 
+   interface Props {
+diff --git a/ui/src/components/playground/ChatInterface.svelte b/ui/src/components/playground/ChatInterface.svelte
+index 7f4f5bf..30fff8f 100644
+--- a/ui/src/components/playground/ChatInterface.svelte
++++ b/ui/src/components/playground/ChatInterface.svelte
+@@ -1,4 +1,5 @@
+ <script lang="ts">
++import SharedVirtualKey from "../../liliuxflow/SharedVirtualKey.svelte";
+ import {uiText} from "../../liliuxflow/runtime";
+ 
+   import { get } from "svelte/store";
+@@ -423,6 +424,8 @@ import {uiText} from "../../liliuxflow/runtime";
+     imageError = null;
+   }
+ </script>
++<SharedVirtualKey />
++
+ 
+ <div class="flex flex-col h-full">
+   <!-- Model selector and controls -->
+diff --git a/ui/src/components/playground/ConcurrencyInterface.svelte b/ui/src/components/playground/ConcurrencyInterface.svelte
+index c0c03ce..b0b9f8f 100644
+--- a/ui/src/components/playground/ConcurrencyInterface.svelte
++++ b/ui/src/components/playground/ConcurrencyInterface.svelte
+@@ -1,4 +1,5 @@
+ <script lang="ts">
++import SharedVirtualKey from "../../liliuxflow/SharedVirtualKey.svelte";
+ import {uiText} from "../../liliuxflow/runtime";
+ import {displayEnum} from "../../liliuxflow/display";
+ 
+@@ -378,6 +379,8 @@ import {displayEnum} from "../../liliuxflow/display";
+     maxTokensStore.set(DEFAULT_MAX_TOKENS);
+   }
+ </script>
++<SharedVirtualKey />
++
+ 
+ <div class="flex flex-col md:flex-row gap-4 h-full min-h-0">
+   <!-- Left column: run controls, model picker, settings -->
+diff --git a/ui/src/lib/activityExport.test.ts b/ui/src/lib/activityExport.test.ts
+index 164b2e9..9018f45 100644
+--- a/ui/src/lib/activityExport.test.ts
++++ b/ui/src/lib/activityExport.test.ts
+@@ -223,7 +223,10 @@ describe("activityCellText", () => {
+     expect(activityCellText(empty, "req_path")).toBe("-");
+     expect(activityCellText(empty, "resp_content_type")).toBe("-");
+     expect(activityCellText(empty, "resp_status_code")).toBe("-");
+-    expect(activityCellText(empty, "cached")).toBe("-");
++    // Zero is an observed count; unavailable is represented separately.
++    expect(activityCellText(empty, "cached")).toBe("0");
++    const unavailableCache = entry({ tokens: { ...empty.tokens, cache_tokens: -1 } });
++    expect(activityCellText(unavailableCache, "cached")).toBe("-");
+     expect(activityCellText(empty, "drafted")).toBe("-");
+     expect(activityCellText(empty, "meta")).toBe("-");
+   });
+diff --git a/ui/src/lib/chatApi.ts b/ui/src/lib/chatApi.ts
+index 7abf267..c2ea25b 100644
+--- a/ui/src/lib/chatApi.ts
++++ b/ui/src/lib/chatApi.ts
+@@ -1,4 +1,6 @@
++import {get} from "svelte/store";
+ import type { ChatMessage, ContentPart } from "./types";
++import {sharedInferenceHeaders} from "../liliuxflow/sharedKey.mjs";
+ import { playgroundSessionHeaders } from "./playgroundSession";
+ 
+ export type Endpoint = "v1/chat/completions" | "v1/messages" | "v1/responses";
+@@ -536,13 +538,17 @@ export async function* streamChatCompletion(
+   options?: ChatOptions
+ ): AsyncGenerator<StreamChunk> {
+   const endpoint = options?.endpoint ?? "v1/chat/completions";
+-  const send = (timingsPerToken: boolean) => {
++  const send = async (timingsPerToken: boolean) => {
+     const { url, body } = buildRequest(endpoint, model, messages, { ...options, timingsPerToken });
++    let sharedHeaders={};
++    try {sharedHeaders=sharedInferenceHeaders(model,endpoint);}
++    catch(error){const {uiText}=await import('../liliuxflow/runtime');throw new Error(get(uiText)(error instanceof Error&&error.message==='SHARED_CHAT_ONLY'?'shared.context.chatOnly':'shared.context.keyRequired'));}
+     return fetch(url, {
+       method: "POST",
+       headers: {
+         "Content-Type": "application/json",
+         ...playgroundSessionHeaders,
++        ...sharedHeaders,
+       },
+       body: JSON.stringify(body),
+       signal,
+diff --git a/ui/src/routes/ModelDetail.svelte b/ui/src/routes/ModelDetail.svelte
+index 680725a..64a2018 100644
+--- a/ui/src/routes/ModelDetail.svelte
++++ b/ui/src/routes/ModelDetail.svelte
+@@ -16,7 +16,7 @@ import { localizedUptime } from "../liliuxflow/timeDisplay";
+   import ModelLogsTab from "../components/model/ModelLogsTab.svelte";
+   import ModelDetailsTab from "../components/model/ModelDetailsTab.svelte";
+   import { modelServerPath } from "../lib/modelUtils";
+-  import { formatAbsoluteTime, formatUptime } from "../lib/format";
++  import { formatAbsoluteTime } from "../lib/format";
+ 
+   let modelId = $derived($params?.id ?? "");
+ 
+diff --git a/ui/src/stores/api.ts b/ui/src/stores/api.ts
+index 885a5c8..02b1078 100644
+--- a/ui/src/stores/api.ts
++++ b/ui/src/stores/api.ts
+@@ -1,3 +1,4 @@
++import {sharedKeyHeaders,sharedModelRecords,keyRevision} from "../liliuxflow/sharedKey.mjs";
+ import { writable, derived } from "svelte/store";
+ import type {
+   Model,
+@@ -259,6 +260,7 @@ interface ModelListRecord {
+ 
+ async function loadPlaygroundModels(request: number): Promise<Model[]> {
+   try {
++    const revision=keyRevision();
+     const response = await fetch("/v1/models");
+     if (!response.ok) {
+       throw new Error(`HTTP error! status: ${response.status}`);
+@@ -308,7 +310,13 @@ async function loadPlaygroundModels(request: number): Promise<Model[]> {
+     newModels.sort((a, b) => {
+       return (a.name + a.id).localeCompare(b.name + b.id, undefined, { numeric: true });
+     });
+-    if (request === playgroundModelsRequest) playgroundModels.set(newModels);
++    if(Object.keys(sharedKeyHeaders()).length) {
++      try {
++        const authenticated=await fetch('/v1/models',{headers:sharedKeyHeaders(),cache:'no-store'});
++        if(authenticated.ok) newModels.push(...sharedModelRecords(await authenticated.json()));
++      } catch { /* Invalid key/catalog adds no shared choices. */ }
++    }
++    if (request === playgroundModelsRequest && revision===keyRevision()) playgroundModels.set(newModels);
+     return newModels;
+   } catch (error) {
+     console.error("Failed to fetch Playground models:", error);

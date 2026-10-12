@@ -1,0 +1,95 @@
+--- a/src/serve/request.rs
++++ b/src/serve/request.rs
+@@ -627,6 +627,14 @@
+         let mut session = acquired.session;
+         let reused = acquired.reused;
+         if sink.control_admission.is_some(){self.control_prepared_usage(sink,n,reused,p.kind==Kind::Chat)?;}
++        // Same native counter ID, captured before a cancelled prefill can
++        // end. The eventual Output reuses this exact tuple; no caller ID.
++        let controlled_response=if sink.control_admission.is_some() {
++            let created=now();
++            let id=response_id(p.kind,created,&mut self.next_id);
++            self.control_usage_response_id(sink,&id)?;
++            Some((created,id))
++        } else {None};
+         let agreement = acquired.agreement;
+         if sink.cancelled() {
+             drop(session);
+@@ -819,8 +827,13 @@
+             }
+             let counters_end = crate::stats::counters();
+             let vm_end = crate::stats::vm_counters();
+-            let created = now();
+-            let id = response_id(p.kind, created, &mut self.next_id);
++            let (created,id)=match controlled_response {
++                Some(actual)=>actual,
++                None=>{
++                    let created=now();
++                    (created,response_id(p.kind,created,&mut self.next_id))
++                }
++            };
+             let by = if client_cancelled { "client" } else { "shutdown" };
+             // The prefill ended at the stop: its samples are the stop's.
+             let facts = Facts {
+@@ -930,9 +943,13 @@
+             );
+         }
+ 
+-        let created = now();
+-        let id = response_id(p.kind, created, &mut self.next_id);
+-        if sink.control_admission.is_some(){self.control_usage_response_id(sink,&id)?;}
++        let (created,id)=match controlled_response {
++            Some(actual)=>actual,
++            None=>{
++                let created=now();
++                (created,response_id(p.kind,created,&mut self.next_id))
++            }
++        };
+         let tokenizer = generator.tokenizer();
+         let detokenize: Detokenize<'g> =
+             Box::new(move |ids: &[u32]| tokenizer.decode(ids, false));
+--- a/src/serve/mtp2_control.rs
++++ b/src/serve/mtp2_control.rs
+@@ -462,15 +462,19 @@
+         if !matches!(finish_reason,"length"|"stop"|"tool_calls"|"cancelled") {return Err(Error::Schema);}
+         if let Some(id)=response_id {
+             if row.native_response_id.as_deref()!=Some(id){return Err(Error::Origin);}
+-        } else if row.native_response_id.is_some() || !cancelled || finish_reason!="cancelled" || value["completion_tokens"]!=0 {return Err(Error::Schema);}
++        } else {return Err(Error::Unknown);}
+         let binding=lp(USAGE_DOMAIN,&[&row.epoch.text(),&row.nonce.text(),&hex(&row.tenant.0),row.profile.alias(),row.profile.id()])?;
+         row.final_usage=Some(FinalUsage{tenant_binding:hex(&sha256(&binding)),response_id:response_id.map(str::to_owned),value,finish_reason,cancelled});Ok(())
+     }
+     pub(super) fn finish_cancelled_prefill_usage(&self,owner:&mut EngineAuthority,token:&RequestToken)->Result<()> {
+         self.owner(owner)?;let key=self.token(token)?;
+-        let (facts,id)={let l=self.lock()?;let row=l.live.get(&key).ok_or(Error::Unknown)?;
++        let (facts,id)={let l=self.lock()?;
++            if l.state!=RuntimeState::Ready || l.epoch!=Some(key.0){return Err(Error::Epoch);}
++            let row=l.live.get(&key).ok_or(Error::Unknown)?;
++            if row.phase!=Phase::Acquired || row.faulted{return Err(Error::Transition);}
+             if row.final_usage.is_some(){return Ok(());} (row.prepared_usage,row.native_response_id.clone())};
+-        if let Some(f)=facts {self.final_usage(owner,token,id.as_deref(),super::api::usage(f.prompt,f.cached,0,f.chat.then_some(0),None),"cancelled",true)?;}
++        // An absent native ID is unknown accounting, never a caller-ID fallback.
++        if let (Some(f),Some(id))=(facts,id) {self.final_usage(owner,token,Some(&id),super::api::usage(f.prompt,f.cached,0,f.chat.then_some(0),None),"cancelled",true)?;}
+         Ok(())
+     }
+     pub(super) fn finish_release(&self, owner: &mut EngineAuthority, token: &RequestToken, now: u64) -> Result<()> {
+@@ -835,13 +839,15 @@
+         let l=c.lock().unwrap();let peer=l.live.get(&(b.epoch,b.nonce)).unwrap();assert!(!peer.cancel.load(Ordering::Acquire));
+         assert!(peer.snapshot()["usage"].is_null());assert_eq!((peer.acquired,peer.released),(1,0));
+     }
+-    #[test] fn prefill_cancel_has_actual_prompt_cache_known_zero_and_optional_native_id() {
++    #[test] fn prefill_cancel_has_actual_prompt_cache_known_zero_only_with_native_id() {
+         for has_id in [false,true] {let (c,mut o)=setup();let t=usage_row(&c,&mut o,1,true);
+             if has_id{c.publish_usage_response_id(&mut o,&t,"chatcmpl-1000-1").unwrap();}
+             c.finish_cancelled_prefill_usage(&mut o,&t).unwrap();let row=usage_release(&c,&mut o,&t,1001);
+-            assert_eq!(row["usage"]["usage"],super::super::api::usage(4096,4095,0,Some(0),None));
+-            assert_eq!(row["usage"]["response_id"],if has_id{json!("chatcmpl-1000-1")}else{Value::Null});
+-            assert_eq!(row["usage"]["finish_reason"],"cancelled");assert_eq!(row["usage"]["cancelled"],true);
++            if has_id {
++                assert_eq!(row["usage"]["usage"],super::super::api::usage(4096,4095,0,Some(0),None));
++                assert_eq!(row["usage"]["response_id"],"chatcmpl-1000-1");
++                assert_eq!(row["usage"]["finish_reason"],"cancelled");assert_eq!(row["usage"]["cancelled"],true);
++            } else {assert!(row["usage"].is_null());}
+         }
+     }
+     #[test] fn unknown_failed_fault_and_zero_state_never_invent_usage() {

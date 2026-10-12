@@ -11,6 +11,16 @@ from common import DistributionError,read_object,no_symlinks
 from trust import ALIAS,installation,private_file
 
 
+def catalog_profile(model):
+    """Bound client aliases; the server authorizes installed profiles and keys."""
+    from profile_registry import load_registry
+    registry = load_registry(Path(__file__).resolve().parents[2])
+    for profile in registry.profiles:
+        if profile.public_alias == model:
+            return profile
+    raise DistributionError('requested model is outside the context registry')
+
+
 def request_parts(data,api,stream,prompt,model=None):
     config=installation(data);caller=read_object(private_file(data/'secrets/caller.json'))
     base='http://127.0.0.1:'+str(config['ports']['litellm']);compat='http://127.0.0.1:'+str(config['ports']['compat'])
@@ -19,8 +29,7 @@ def request_parts(data,api,stream,prompt,model=None):
     key=caller.get('api_key')
     if not isinstance(key,str) or not key.startswith('sk-'):
         raise DistributionError('caller virtual key is unavailable')
-    from profile_registry import load_registry
-    profile=load_registry(Path(__file__).resolve().parents[2]).resolve(model or caller['alias'])
+    profile=catalog_profile(model or caller['alias'])
     if profile.public_alias not in caller.get('models',[caller['alias']]):
         raise DistributionError('selected model is not enabled for this caller; update designated owner ACL first')
     body={'model':profile.public_alias,'messages':[{'role':'user','content':prompt}],'stream':stream}
@@ -34,8 +43,7 @@ def main():
     try:
         url,body,key=request_parts(no_symlinks(args.data_root),args.api,args.stream,args.prompt,args.model)
         req=Request(url,data=json.dumps(body,ensure_ascii=False).encode(),headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'},method='POST')
-        from profile_registry import load_registry
-        profile=load_registry(Path(__file__).resolve().parents[2]).resolve(body['model'])
+        profile=catalog_profile(body['model'])
         with build_opener(ProxyHandler({})).open(req,timeout=profile.total_deadline_seconds+50) as response:
             # Preserve each API's own wire format, thinking/content and terminal events.
             decoder=codecs.getincrementaldecoder('utf-8')()

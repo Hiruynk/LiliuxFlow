@@ -56,9 +56,17 @@ LiliuxFlow's UI integration adds branding, English/Traditional Chinese/Simplifie
 
 ## Serving profile
 
-[The default profile](../profiles/distribution/safe64k.json) defines public model name `qwen3.8-flash-next-lily-q4-64k`, 65,536-token total context, checkpoint-default high thinking, QSA Split and zero MTP drafts. The finite [context registry](../profiles/distribution/context-registry.json) also defines 131,072- and 262,144-token profiles; 64K, 128K and 262K are enabled; 64K remains the API default. All profiles use the same Qwen3.8-Flash-Next Lily Q4 checkpoint. The default output budget is 4,096 tokens and the model idle interval is 1,800 seconds.
+[The default profile](../profiles/distribution/safe64k.json) defines public model name `qwen3.8-flash-next-lily-q4-64k`, 65,536-token total context, checkpoint-default high thinking, QSA Split and zero MTP drafts. The finite [context registry](../profiles/distribution/context-registry.json) also defines 131,072- and 262,144-token profiles; 64K, 128K and 262K are enabled; 64K remains the API default. All profiles use the same Qwen3.8-Flash-Next Lily Q4 checkpoint. The default and maximum output budget is 65,536 tokens, including thinking. The model idle interval is 1,800 seconds.
 
 The model runner uses the installation's verified runtime and external weights. It allows one model runner through a shared lease, checks owned child processes before signaling them, and monitors resource headroom. llama-swap owns demand loading and idle unloading; the LiliuxFlow guard coordinates these lifecycle actions with active requests. These checks support local service operation and are not a reservation of physical RAM or a distributed scheduler.
+
+## Shared MTP2 runtime
+
+The explicit shared build and startup mode add a trusted extension for the three MTP2 context aliases. The shared gateway and coordinator preserve each caller's virtual-key identity and context cap while routing to one physical 262K Lily runtime. It serves at most two active requests and four pending requests; native MTP2 generation is interleaved at complete speculative steps, with independent request sessions and cancellation.
+
+Switching context within the MTP2 family does not reload the weights. MTP0 keeps its existing engine and lifecycle. Shared tenant caching remains in resident memory under a 24 GiB cache/reservation policy; the disk cache is disabled. Native response identity and terminal counts connect usage to the original caller, including interrupted requests. The normal generator binds the shared recipe, sources and binaries before startup; request input cannot select engine paths or authorize trust.
+
+See [Shared MTP2 installation](INSTALLATION.md#shared-mtp2), [API semantics](API.md#shared-mtp2-serving) and [Operations](OPERATIONS.md#shared-mtp2-operations).
 
 ## Optional model catalog
 

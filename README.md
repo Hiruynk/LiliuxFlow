@@ -2,7 +2,7 @@
 <h1 align="center">LiliuxFlow</h1>
 <p align="center">Local LLM serving and operations for Apple Silicon.</p>
 <p align="center">
-  <a href="https://github.com/Hiruynk/LiliuxFlow/releases"><img alt="version / v0.1.0" src="https://img.shields.io/badge/version-v0.1.0-2563eb?style=flat-square"></a>
+  <a href="https://github.com/Hiruynk/LiliuxFlow/releases"><img alt="version / v0.1.1" src="https://img.shields.io/badge/version-v0.1.1-2563eb?style=flat-square"></a>
   <a href="#requirements"><img alt="macOS / 27.0" src="https://img.shields.io/badge/macOS-27.0-4c4e75?style=flat-square&amp;logo=apple&amp;logoColor=white"></a>
   <a href="#requirements"><img alt="Apple Silicon / M5+" src="https://img.shields.io/badge/Apple_Silicon-M5%2B-e7883b?style=flat-square&amp;logo=apple&amp;logoColor=white"></a>
   <a href="LICENSE"><img alt="license / Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square"></a>
@@ -90,22 +90,20 @@ Other Apple Silicon configurations have not been validated. A compatible macOS a
 
 The three MTP0 profiles share one external Q4 checkpoint, checkpoint-default high thinking, QSA Split and MTP0. Input and output share the total context limit. Each application needs an explicit virtual-key grant for the selected long-context model. Requests use a bounded queue; switching profiles waits for the active generation and its resources to finish releasing.
 
-### Optional MTP2 profiles
+### Shared MTP2 serving
 
-The three optional MTP2 aliases select `ctx64k-mtp2`, `ctx128k-mtp2` and `ctx262k-mtp2`, with total contexts of 65,536, 131,072 and 262,144 tokens. They share one engine and the same Q4 checkpoint, HIGH thinking, QSA Split and BF16 KV. Each profile has a 65,536-token maximum output budget including reasoning. The API default remains the 64K MTP0 model.
+**Shared MTP2 serving** keeps one Q4 model resident across the 64K, 128K and 262K MTP2 profiles, with up to two active generation requests and four pending requests. Each request retains its own context limit, session state and cancellation lifecycle. Selecting another profile within this MTP2 family does not reload the weights. Generation is interleaved at complete speculative steps.
 
-All three MTP2 profiles have been validated and enabled on the tested M5 Max / 128 GiB host. This is a local validation result; a fresh installation does not automatically enable them. The source catalog starts with all MTP2 profiles disabled.
+Shared mode is an explicit opt-in; the default 64K MTP0 and existing MTP0 profiles remain available. Switching to MTP0 or another engine uses a separate model lifecycle and can reload the model. The MTP2 aliases use HIGH thinking, QSA Split and BF16 KV, with a maximum output budget of 65,536 tokens including reasoning.
 
-On a stopped installation, use the `lf` helper from Quick start with `lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute`. This optional-engine build initially enables only MTP2 64K. The 128K and 262K profiles require separate operator validation and enablement in the trusted installed configuration; enabling one does not enable the other. `lf profiles list` and `lf profiles info ctx128k-mtp2` inspect the catalog without loading a model.
+Each application needs its own LiteLLM virtual key and explicit model grants. Key limits still apply: one key limited to a single parallel request cannot demonstrate two concurrent requests. Tenant caches stay in resident memory; the shared disk cache is disabled. Request bodies cannot override engines, paths, memory, KV precision or context. JSON/JSON Schema response formats and tool execution remain unsupported.
 
-Once a profile is enabled, preview its designated owner caller grant with `lf profiles grant-owner ctx128k-mtp2 --dry-run`; apply that exact append-only grant with `--execute` when wanted. Use `ctx64k-mtp2` or `ctx262k-mtp2` for the other profiles. Other callers need their own explicit model grant; empty or wildcard grants do not authorize MTP2. A caller grant does not enable a disabled profile.
+The shared installation and client commands appear below. See [Installation](docs/INSTALLATION.md#shared-mtp2) for the full opt-in flow and [API](docs/API.md#shared-mtp2-serving) for request and usage semantics.
 
-Select the exact enabled alias in each API request; [API](docs/API.md) includes direct 128K and 262K examples. Request bodies cannot change engines, paths, memory, KV precision or context. JSON/JSON Schema response formats and tool execution remain unsupported.
-
-## Shared workload performance
+## MTP0 single-request performance reference
 
 > [!NOTE]
-> Measured on the same Q4 checkpoint with MTP0, QSA Split, checkpoint-default high thinking and temperature 0: 4,096 uncached input tokens, 256 output tokens, three interleaved repeats per profile. Values are medians; the prefill range shows variation between repeats. This shared 4K workload does not measure near-full-context throughput.
+> Measured on the same Q4 checkpoint with MTP0, QSA Split, checkpoint-default high thinking and temperature 0: 4,096 uncached input tokens, 256 output tokens, three interleaved repeats per profile. Values are medians; the prefill range shows variation between repeats. This identical 4K workload does not measure near-full-context throughput.
 
 | Model | Prefill (tokens/s) | Prefill range | Decode (tokens/s) |
 | --- | ---: | ---: | ---: |
@@ -137,7 +135,7 @@ GitHub’s automatic **Source code (zip/tar.gz)** archives lack this source reco
 
 For the existing-model route, point `MODEL_DIR` at your complete checkpoint directory. Setup uses it in place.
 
-Run from the repository root:
+For the default MTP0 installation, run from the repository root. The shared alternative below reuses these shell definitions:
 
 ```sh
 export MODEL_DIR="$HOME/Models/Qwen3.8-Flash-Next-lily-q4"
@@ -168,6 +166,37 @@ lf models install qwen3.8-flash-next-lily-q4 --output "$MODEL_DIR" --execute
 ```
 
 `--dry-run` contacts Hugging Face for download metadata; `--execute` downloads the payload. To install the management services first, choose `lf setup --without-model` in place of the model-directory setup above and omit `lf verify-model`. Management services can run before a model is attached; attach and verify a model when you are ready to serve inference. See [Installation](docs/INSTALLATION.md) to attach a model later.
+
+### Shared MTP2 installation
+
+As an alternative to the default installation above, reuse the same `lf` helper and complete `MODEL_DIR` checkpoint in a fresh data directory. Building this extension enables all three MTP2 profiles; startup creates the installation caller before its 128K and 262K grants are applied.
+
+A new data directory still uses the same default ports. If the original stack is running, select free ports during setup as described in [Separate installations and port conflicts](docs/INSTALLATION.md#separate-installations-and-port-conflicts), or stop it during a planned handover before starting this installation. Existing installations require the [upgrade procedure](docs/OPERATIONS.md#upgrade-and-rollback).
+
+```sh
+SHARED_DATA="$HOME/Library/Application Support/LiliuxFlow shared"
+lf --data-root "$SHARED_DATA" setup --model-dir "$MODEL_DIR"
+lf --data-root "$SHARED_DATA" build \
+  --optin-engine latest13f-defer-pc123-mtp2-shared-context-v1 \
+  --ui-manifest manifests/distribution/ui-recipe-mtp2-shared.json --execute
+lf --data-root "$SHARED_DATA" verify-model
+lf --data-root "$SHARED_DATA" initialize --execute
+lf --data-root "$SHARED_DATA" doctor
+lf --data-root "$SHARED_DATA" start --mtp2-shared-context
+lf --data-root "$SHARED_DATA" status
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --dry-run
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --execute
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx262k-mtp2 --mtp2-shared-context --execute
+
+uv run --no-project --python 3.12 python scripts/distribution/client_example.py \
+  --data-root "$SHARED_DATA" --api openai \
+  --model qwen3.8-flash-next-lily-q4-mtp2-128k --stream
+uv run --no-project --python 3.12 python scripts/distribution/client_example.py \
+  --data-root "$SHARED_DATA" --api openai \
+  --model qwen3.8-flash-next-lily-q4-mtp2-262k --stream
+```
+
+These examples use the designated installation caller. Grant other application keys the required exact aliases in the API dashboard; empty or wildcard grants do not authorize MTP2. See [Operations](docs/OPERATIONS.md#shared-mtp2-operations) for status, shutdown and switching service modes.
 
 | Purpose | Default endpoint |
 | --- | --- |

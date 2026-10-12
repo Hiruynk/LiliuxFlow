@@ -136,12 +136,76 @@ def host_metadata():
             result['chip'] = chip.stdout.strip()
     return result
 
+def normal_shared_status(trusted):
+    """Read-only capability/mode/request snapshot; never native release authority."""
+    if trusted.get('trust',{}).get('mtp2_shared_runtime') is None:return None
+    value={'capability_verified':False,'capability_profiles':[],
+        'service_mode':'UNVERIFIED','runtime_enabled_profiles':[],
+        'request_snapshot':None,'per_nonce_release_authority':False}
+    try:
+        from mtp2_shared_runtime import normal_shared_view,PROFILE_IDS
+        selected=normal_shared_view(trusted)
+        value.update(capability_verified=True,capability_profiles=list(PROFILE_IDS),service_mode='STOPPED')
+        data=trusted['data_root'];path=data/'run/agent.json'
+        if not path.exists():return value
+        value['service_mode']='UNVERIFIED'
+        from trust import private_file
+        from ownership import unchanged
+        from agent import launchd_plist,http_json
+        import plistlib
+        raw=private_file(path).read_bytes();record=json.loads(raw)
+        me=record.get('agent');shared=record.get('shared_context',False)
+        if (type(shared) is not bool or type(me) is not dict or me.get('uid')!=trusted['config']['owner_uid']
+            or record.get('installation_id')!=trusted['config']['installation_id'] or not unchanged(me)):
+            raise DistributionError('shared status agent ownership is unavailable')
+        mode=dict(selected if shared else trusted)
+        mode['controlplane_only']=record.get('controlplane_only') is True
+        plist=plistlib.loads(private_file(data/'run/stack.plist').read_bytes())
+        if plist!=launchd_plist(mode,shared_context=shared):
+            raise DistributionError('shared status exact service selection differs')
+        value['service_mode']='SHARED_MTP2' if shared else 'MTP0'
+        if not shared:return value
+        value['runtime_enabled_profiles']=list(PROFILE_IDS)
+        child=record.get('children',{}).get('guard')
+        if (record.get('ready') is not True or type(child) is not dict
+            or child.get('uid')!=trusted['config']['owner_uid'] or child.get('ppid')!=me['pid'] or not unchanged(child)):
+            raise DistributionError('shared status guard ownership is unavailable')
+        status,body=http_json('http://127.0.0.1:'+str(trusted['config']['ports']['guard'])+'/__recovery/status',timeout=2)
+        if (status!=200 or type(body) is not dict
+            or any(type(body.get(k)) is not int or body[k]<0 for k in ('active_inferences','pending_inferences'))
+            or type(body.get('admission_paused')) is not bool
+            or body['active_inferences']>2 or body['pending_inferences']>4
+            or private_file(path).read_bytes()!=raw or not unchanged(me) or not unchanged(child)):
+            raise DistributionError('shared status request snapshot is unavailable')
+        value['request_snapshot']={'kind':'OWNED_GUARD_AGGREGATE_INCLUDES_CLEANUP',
+            'observed_ns':time.monotonic_ns(),'active_inferences':body['active_inferences'],
+            'pending_inferences':body['pending_inferences'],'admission_paused':body['admission_paused']}
+    except (DistributionError,OSError,ValueError,KeyError,TypeError):
+        value['observation_error']='SHARED_STATUS_UNVERIFIED'
+    return value
+
+
+def installed_shared_status(data,config):
+    if config['runtime_state']=='NOT_BUILT':return None
+    from trust import private_file,validate
+    path=Path(data)/'runtime/release-trust.json'
+    if not path.exists():return None
+    if read_object(private_file(path)).get('mtp2_shared_runtime') is None:return None
+    try:
+        return normal_shared_status(validate(no_symlinks(data),require_checkpoint='available'))
+    except (DistributionError,OSError,ValueError,KeyError,TypeError):
+        return {'capability_verified':False,'capability_profiles':[],'service_mode':'UNVERIFIED',
+            'runtime_enabled_profiles':[],'request_snapshot':None,'observation_error':'SHARED_INSTALLATION_UNVERIFIED',
+            'per_nonce_release_authority':False}
+
+
 def doctor(args):
     config = load_install(args.data_root)
     host = host_metadata()
     problems = []
     warnings = []
     guard_state = None
+    shared_state = None
     degraded = False
     if host['os'] != 'Darwin' or host['machine'] != 'arm64':
         problems.append('native serving requires Darwin arm64; CPU package checks are portable')
@@ -176,6 +240,9 @@ def doctor(args):
         from trust import validate
         try:
             trusted=validate(no_symlinks(args.data_root), require_checkpoint='controlplane' if getattr(args,'controlplane_only',False) else 'available')
+            shared_state=normal_shared_status(trusted)
+            if shared_state is not None and (not shared_state['capability_verified'] or shared_state['service_mode']=='UNVERIFIED' or shared_state['service_mode']=='SHARED_MTP2' and shared_state['request_snapshot'] is None):
+                problems.append('shared MTP2 capability or owned runtime observation is unverified')
             # Read-only health classification, never cleanup or model mutation.
             if occupied.get('guard') and not problems:
                 from agent import guard_admission_status
@@ -184,7 +251,7 @@ def doctor(args):
         except (DistributionError, OSError, ValueError, KeyError, TypeError):
             problems.append('release trust or owned guard admission verification failed')
     inference_ready = configured and not getattr(args,'controlplane_only',False) and not problems and not degraded
-    emit({'state': 'blocked' if problems else 'DEGRADED' if degraded else 'ready' if inference_ready else 'controlplane_ready',
+    result={'state': 'blocked' if problems else 'DEGRADED' if degraded else 'ready' if inference_ready else 'controlplane_ready',
           'serving_ready': inference_ready, 'inference_ready': inference_ready, 'controlplane_ready': not problems and not degraded,
           'model_configured': configured,
           'next_step': None if configured else 'models attach qwen3.8-flash-next-lily-q4 --model-dir PATH',
@@ -193,7 +260,9 @@ def doctor(args):
           'payload_verified':False if not configured or getattr(args,'controlplane_only',False) else None, 'host': host, 'free_disk_bytes': free,
           'tools': tools, 'occupied_ports': occupied, 'model': model, 'problems': problems,
           'hardware_baseline_policy': 'advisory', 'hardware_baseline_matches': hardware_baseline_matches,
-          'warnings': warnings})
+          'warnings': warnings}
+    if shared_state is not None:result['shared_mtp2']=shared_state
+    emit(result)
     return 2 if problems or degraded else 0
 
 def status(args):
@@ -208,11 +277,17 @@ def status(args):
         record = read_object(private_file(registry))
         control_ready = record.get('installation_id') == config['installation_id'] and record.get('ready') is True and unchanged(record['agent'])
         inference_ready = control_ready and configured and record.get('controlplane_only') is not True
-    emit({'installation_id': config['installation_id'], 'runtime_state': config['runtime_state'],
+    result={'installation_id': config['installation_id'], 'runtime_state': config['runtime_state'],
           'database_initialized': config['database_initialized'], 'caller_key_created': config['caller_key_created'],
           'ports_listening': {name: listening(port) for name, port in config['ports'].items()},
           'owned_processes': 'registered' if control_ready else 'not_ready', 'model_resident': None,
-          'model_configured': configured, 'controlplane_ready': control_ready, 'inference_ready': inference_ready})
+          'model_configured': configured, 'controlplane_ready': control_ready, 'inference_ready': inference_ready}
+    shared=installed_shared_status(no_symlinks(args.data_root),config)
+    if shared is not None:
+        result['shared_mtp2']=shared
+        if not shared['capability_verified'] or shared['service_mode']=='UNVERIFIED' or shared['service_mode']=='SHARED_MTP2' and shared['request_snapshot'] is None:
+            result['inference_ready']=False
+    emit(result)
     return 0
 
 def require_runtime(args):
@@ -222,6 +297,8 @@ def require_runtime(args):
     from agent import start, stop
     operation = start if args.command == 'start' else stop
     options={'dry_run':args.dry_run,'controlplane_only':args.controlplane_only}
+    if args.command=='start' and getattr(args,'mtp2_shared_context',False):
+        options['shared_context']=True
     if args.command=='stop':options['force']=getattr(args,'force',False)
     emit(operation(no_symlinks(args.data_root),**options))
     return 0
@@ -248,15 +325,19 @@ def profiles(args):
     registry=load_registry(ROOT)
     catalog_source='source_catalog'
     install=Path(args.data_root)/'install.json'
+    shared_context=getattr(args,'mtp2_shared_context',False)
+    selection={'shared_context':True} if shared_context else {}
+    if shared_context and (not install.exists() or read_object(no_symlinks(install)).get('runtime_state') in (None,'NOT_BUILT')):
+        raise DistributionError('shared MTP2 profile selection requires a normally built installation')
     if install.exists() and read_object(no_symlinks(install)).get('runtime_state') not in (None,'NOT_BUILT'):
         from trust import validate
-        registry=validate(no_symlinks(args.data_root),require_checkpoint=False)['registry'];catalog_source='trusted_installation'
+        registry=validate(no_symlinks(args.data_root),require_checkpoint=True if shared_context else False,**selection)['registry'];catalog_source='trusted_installation'
     if args.profile_command=='list':
         emit({'default_profile_id':registry.default.profile_id,'profiles':[p.as_dict() for p in registry.profiles],'catalog_source':catalog_source,'network_operation':False,'model_loaded_by_command':False});return 0
     if args.profile_command=='grant-ui-user':
         from trust import validate
         from agent import reconcile_ui_user
-        trusted=validate(no_symlinks(args.data_root));ids=args.profile_ids
+        trusted=validate(no_symlinks(args.data_root),**selection);ids=args.profile_ids
         if len(set(ids))!=len(ids):raise DistributionError('UI user profile grants must be unique')
         aliases=tuple(trusted['registry'].by_id(pid).public_alias for pid in ids)
         emit(reconcile_ui_user(trusted,args.user_id,dry_run=not args.execute,authorized_opt_in_aliases=aliases));return 0
@@ -266,7 +347,7 @@ def profiles(args):
     if args.profile_id not in ('ctx64k-mtp2','ctx128k-mtp2','ctx262k-mtp2'):raise DistributionError('explicit caller opt-in requires a finite MTP2 profile')
     from trust import validate
     from agent import reconcile_owner_caller
-    trusted=validate(no_symlinks(args.data_root))
+    trusted=validate(no_symlinks(args.data_root),**selection)
     selected=trusted['registry'].by_id(args.profile_id)
     emit(reconcile_owner_caller(trusted,dry_run=not args.execute,authorized_opt_in_aliases=(selected.public_alias,)));return 0
 
@@ -565,7 +646,7 @@ def parse_port(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--version', action='version', version='LiliuxFlow 0.1.0')
+    parser.add_argument('--version', action='version', version='LiliuxFlow 0.1.1')
     parser.add_argument('--data-root', type=Path, default=Path.home() / 'Library/Application Support/LiliuxFlow')
     commands = parser.add_subparsers(dest='command', required=True)
     command = commands.add_parser('setup', help='generate an isolated installation, no DB/service/model load')
@@ -594,11 +675,12 @@ def main():
         command=commands.add_parser(name)
         command.add_argument('--dry-run', action='store_true')
         command.add_argument('--controlplane-only', action='store_true')
+        if name=='start':command.add_argument('--mtp2-shared-context',action='store_true',help='explicitly use the installed shared MTP2 extension; MTP0 remains the default')
         if name=='stop':command.add_argument('--force',action='store_true',help='cancel inference and stop only this verified installation')
     commands.add_parser('configure').add_argument('--port',action='append',type=parse_port,required=True)
     command = commands.add_parser('build')
     command.add_argument('--execute', action='store_true')
-    command.add_argument('--optin-engine',choices=('latest13f-defer-pc123-mtp2-opt64k',),help='explicitly build and enable the optional MTP2 64K engine alongside the established MTP0 profiles')
+    command.add_argument('--optin-engine',choices=('latest13f-defer-pc123-mtp2-opt64k','latest13f-defer-pc123-mtp2-shared-context-v1'),help='build an explicit finite MTP2 engine alongside the established MTP0 profiles; shared mode also requires explicit start selection')
     for name in ('cargo','go','node','npm-cli','pg-bin','ui-manifest'):
         command.add_argument('--'+name, type=Path)
     command=commands.add_parser('build-optin',help='add only the finite MTP2 engine, or compile a fresh source candidate without enablement')
@@ -620,13 +702,15 @@ def main():
     command.add_argument('--commit', required=True)
     command.add_argument('--output', type=Path, required=True)
     profile_commands=commands.add_parser('profiles',help='read-only profile catalog and explicit designated owner opt-in').add_subparsers(dest='profile_command',required=True)
-    profile_commands.add_parser('list')
-    profile_commands.add_parser('info').add_argument('profile_id')
+    command=profile_commands.add_parser('list');command.add_argument('--mtp2-shared-context',action='store_true')
+    command=profile_commands.add_parser('info');command.add_argument('profile_id');command.add_argument('--mtp2-shared-context',action='store_true')
     command=profile_commands.add_parser('grant-owner',help='append the enabled opt-in alias only to the existing designated owner caller')
     command.add_argument('profile_id',choices=('ctx64k-mtp2','ctx128k-mtp2','ctx262k-mtp2'))
+    command.add_argument('--mtp2-shared-context',action='store_true')
     grant=command.add_mutually_exclusive_group(required=True);grant.add_argument('--dry-run',action='store_true');grant.add_argument('--execute',action='store_true')
     command=profile_commands.add_parser('grant-ui-user',help='append explicit enabled MTP2 models to one named UI user; sign in again afterward')
     command.add_argument('user_id');command.add_argument('profile_ids',nargs='+',choices=('ctx64k-mtp2','ctx128k-mtp2','ctx262k-mtp2'))
+    command.add_argument('--mtp2-shared-context',action='store_true')
     grant=command.add_mutually_exclusive_group(required=True);grant.add_argument('--dry-run',action='store_true');grant.add_argument('--execute',action='store_true')
     args = parser.parse_args()
     os.umask(0o077)

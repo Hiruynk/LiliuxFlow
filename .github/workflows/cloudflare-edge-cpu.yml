@@ -30,6 +30,9 @@ jobs:
         with:
           node-version: "24"
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
+        with:
+          version: "0.12.19"
+          enable-cache: false
       - name: Validate source, guard and bounded builder (no backend/model requests)
         run: |
           node --test services/cloudflare-edge/test/*.test.mjs

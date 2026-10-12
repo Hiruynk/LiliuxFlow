@@ -2,7 +2,7 @@
 <h1 align="center">LiliuxFlow</h1>
 <p align="center">本地 LLM 部署與服務管理平台</p>
 <p align="center">
-  <a href="https://github.com/Hiruynk/LiliuxFlow/releases"><img alt="version / v0.1.0" src="https://img.shields.io/badge/version-v0.1.0-2563eb?style=flat-square"></a>
+  <a href="https://github.com/Hiruynk/LiliuxFlow/releases"><img alt="version / v0.1.1" src="https://img.shields.io/badge/version-v0.1.1-2563eb?style=flat-square"></a>
   <a href="#requirements"><img alt="macOS / 27.0" src="https://img.shields.io/badge/macOS-27.0-4c4e75?style=flat-square&amp;logo=apple&amp;logoColor=white"></a>
   <a href="#requirements"><img alt="Apple Silicon / M5+" src="https://img.shields.io/badge/Apple_Silicon-M5%2B-e7883b?style=flat-square&amp;logo=apple&amp;logoColor=white"></a>
   <a href="LICENSE"><img alt="license / Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square"></a>
@@ -90,19 +90,17 @@ LiliuxFlow 的自有實作包含安裝監督程序、模型執行器、生命週
 
 上述三個 MTP0 設定檔共用同一份外置 Q4 checkpoint，保留 checkpoint 預設 high thinking、QSA Split 與 MTP0。輸入及輸出共同受總上下文上限約束。應用程式使用長上下文模型前，須為其虛擬金鑰明確授予該模型的存取權。請求採有界佇列；切換設定檔會等待目前生成結束並完成資源釋放。
 
-### 選用的 MTP2 設定檔
+### 共享 MTP2 推理
 
-三個選用的 MTP2 別名分別對應 `ctx64k-mtp2`、`ctx128k-mtp2` 及 `ctx262k-mtp2`，總上下文為 65,536、131,072 及 262,144 tokens。它們共用同一引擎與 Q4 checkpoint，採用 HIGH thinking、QSA Split 及 BF16 KV。各設定檔的最大輸出預算均為 65,536 tokens，包含推理。API 預設仍為 64K MTP0 模型。
+**共享 MTP2 推理**讓一份 Q4 模型在 64K、128K 與 262K MTP2 設定檔之間保持常駐，最多同時處理兩個生成請求，另容納四個等待中的請求。每個請求保留獨立的上下文上限、對話狀態與取消流程；切換此 MTP2 組內的設定檔不會重新載入權重。生成工作在完整的 speculative step 之間交錯排程。
 
-三個 MTP2 設定檔均已在上述 M5 Max／128 GiB 主機完成驗證並啟用。這是本機驗證結果；全新安裝不會自動啟用它們。原始碼目錄中的所有 MTP2 設定檔初始皆為停用。
+共享模式須明示選用；預設 64K MTP0 與既有 MTP0 設定檔仍可使用。切換到 MTP0 或其他引擎會走獨立的模型生命週期，可能重新載入模型。MTP2 別名採用 HIGH thinking、QSA Split 及 BF16 KV，最大輸出預算為 65,536 tokens，包含推理。
 
-在已停止的安裝中，使用「快速開始」的 `lf` 函式執行 `lf build --optin-engine latest13f-defer-pc123-mtp2-opt64k --ui-manifest manifests/distribution/ui-recipe-context-profiles.json --execute`。此選用引擎建置最初只啟用 MTP2 64K。128K 與 262K 須由操作者分別驗證，再於可信的已安裝設定中啟用；啟用其中一檔不會啟用另一檔。`lf profiles list` 與 `lf profiles info ctx128k-mtp2` 可查看設定檔目錄，不載入模型。
+每個應用程式使用自己的 LiteLLM virtual key 及明確模型授權。金鑰限制仍適用：並行上限為一的金鑰無法示範兩個同時請求。租戶快取保留於常駐記憶體，共享磁碟快取停用。請求 body 不能更改引擎、路徑、記憶體、KV 精度或上下文；JSON／JSON Schema 回應格式及工具執行仍不支援。
 
-設定檔啟用後，可用 `lf profiles grant-owner ctx128k-mtp2 --dry-run` 預覽指定 owner caller 的授權，再於需要時加上 `--execute` 附加該別名。其他兩檔分別使用 `ctx64k-mtp2` 或 `ctx262k-mtp2`。其他 caller 須各自明確獲授予模型權限；空白或萬用授權不允許使用 MTP2。授予 caller 權限不會啟用已停用的設定檔。
+共享安裝及客戶端指令見下文。完整選用流程見[安裝說明](docs/INSTALLATION.md#shared-mtp2)，請求與用量語義見 [API](docs/API.md#shared-mtp2-serving)。
 
-API 請求須選用已啟用的精確別名；[API](docs/API.md) 提供直接使用 128K 與 262K 別名的範例。請求 body 不能更改引擎、路徑、記憶體、KV 精度或 context。JSON／JSON Schema 回應格式及工具執行仍不支援。
-
-## 相同工作負載的效能
+## MTP0 單請求效能參考
 
 > [!NOTE]
 > 實測使用同一份 Q4 checkpoint、MTP0、QSA Split、checkpoint 預設 high thinking 與溫度 0：4,096 個未命中快取的輸入 token、256 個輸出 token，各設定檔交錯測試三次。數值為中位數；prefill 範圍反映各次測試的波動。這組相同的 4K 工作負載不代表接近上下文上限時的吞吐量。
@@ -137,7 +135,7 @@ GitHub 自動產生的 **Source code (zip/tar.gz)** 壓縮包缺少此來源記�
 
 若使用現有模型，請將 `MODEL_DIR` 指向完整 checkpoint 目錄；setup 會直接使用該目錄。
 
-在倉庫根目錄執行：
+預設 MTP0 安裝請從儲存庫根目錄執行。下方的共享模式流程會沿用此處定義的函式與變數：
 
 ```sh
 export MODEL_DIR="$HOME/Models/Qwen3.8-Flash-Next-lily-q4"
@@ -168,6 +166,37 @@ lf models install qwen3.8-flash-next-lily-q4 --output "$MODEL_DIR" --execute
 ```
 
 `--dry-run` 會連線至 Hugging Face 取得下載中繼資料；`--execute` 才會下載模型檔案。若要先安裝管理服務，請用 `lf setup --without-model` 取代上方指定模型目錄的 setup，並略過 `lf verify-model`。管理服務可先行啟用；準備提供推理時，再加入並驗證模型。稍後加入模型的方式詳見[安裝文件](docs/INSTALLATION.md)。
+
+### 共享 MTP2 安裝
+
+如要改用共享模式，可沿用上方的 `lf` 函式及完整 `MODEL_DIR` checkpoint，在全新的資料目錄建立安裝。此擴充建置會啟用三個 MTP2 設定檔；啟動時先建立安裝 caller，再套用其 128K 與 262K 授權。
+
+新資料目錄仍使用相同的預設連接埠。若原服務正在運作，請依[獨立安裝與連接埠衝突說明](docs/INSTALLATION.md#separate-installations-and-port-conflicts)於 setup 選擇未占用的連接埠，或在安排好的交接時段先停止原安裝，再啟動此安裝。既有安裝請依[升級流程](docs/OPERATIONS.md#upgrade-and-rollback)處理。
+
+```sh
+SHARED_DATA="$HOME/Library/Application Support/LiliuxFlow shared"
+lf --data-root "$SHARED_DATA" setup --model-dir "$MODEL_DIR"
+lf --data-root "$SHARED_DATA" build \
+  --optin-engine latest13f-defer-pc123-mtp2-shared-context-v1 \
+  --ui-manifest manifests/distribution/ui-recipe-mtp2-shared.json --execute
+lf --data-root "$SHARED_DATA" verify-model
+lf --data-root "$SHARED_DATA" initialize --execute
+lf --data-root "$SHARED_DATA" doctor
+lf --data-root "$SHARED_DATA" start --mtp2-shared-context
+lf --data-root "$SHARED_DATA" status
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --dry-run
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --execute
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx262k-mtp2 --mtp2-shared-context --execute
+
+uv run --no-project --python 3.12 python scripts/distribution/client_example.py \
+  --data-root "$SHARED_DATA" --api openai \
+  --model qwen3.8-flash-next-lily-q4-mtp2-128k --stream
+uv run --no-project --python 3.12 python scripts/distribution/client_example.py \
+  --data-root "$SHARED_DATA" --api openai \
+  --model qwen3.8-flash-next-lily-q4-mtp2-262k --stream
+```
+
+上述範例使用指定的安裝 caller。其他應用程式金鑰須在 API 管理介面取得所需精確別名的權限；空白或萬用授權不允許使用 MTP2。狀態、停止與服務模式切換見[運維說明](docs/OPERATIONS.md#shared-mtp2-operations)。
 
 | 用途 | 預設入口 |
 | --- | --- |

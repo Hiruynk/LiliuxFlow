@@ -111,4 +111,88 @@ class NativeCleanroomTests(unittest.TestCase):
  def test_default_plan_performs_no_model_or_host_actions(self):
   with patch.object(runner,'verify_archive') as archive:
    result=runner.stage(argparse.Namespace(execute=False,action='smoke'));archive.assert_not_called();self.assertFalse(result['full_Q4_acceptance'])
+class ClientCatalogTests(unittest.TestCase):
+ def setUp(self):
+  import client_example
+  self.client=client_example
+  self.temp=tempfile.TemporaryDirectory(prefix='client CPU fixture ');self.addCleanup(self.temp.cleanup)
+  self.data=Path(self.temp.name).resolve();(self.data/'secrets').mkdir(mode=0o700)
+  self.config={'ports':{'litellm':14000,'compat':18001}}
+  self.key='sk-synthetic-client-fixture'
+  self.mtp2=['qwen3.8-flash-next-lily-q4-mtp2-128k','qwen3.8-flash-next-lily-q4-mtp2-262k']
+  self.caller={'api_base':'http://127.0.0.1:14000/v1','compat_base':'http://127.0.0.1:18001','alias':self.client.ALIAS,'api_key':self.key,'models':[self.client.ALIAS]+self.mtp2}
+  self.write_caller()
+ def write_caller(self):
+  file=self.data/'secrets/caller.json';file.write_text(json.dumps(self.caller));file.chmod(0o600)
+ def test_true_client_default_and_both_shared_aliases_reach_only_configured_loopback(self):
+  import contextlib,io,types
+  for model in (None,*self.mtp2):
+   for api in ('openai','legacy'):
+    with self.subTest(model=model,api=api):
+     argv=['client_example','--data-root',str(self.data),'--api',api,'--stream']
+     if model:argv+=['--model',model]
+     response=types.SimpleNamespace(read1=unittest.mock.Mock(side_effect=[b'CPU response',b'']))
+     output=io.StringIO()
+     with patch.object(self.client,'installation',return_value=self.config),patch.object(sys,'argv',argv),patch.object(self.client,'build_opener') as opener,contextlib.redirect_stdout(output):
+      opener.return_value.open.return_value.__enter__.return_value=response
+      self.assertEqual(self.client.main(),0)
+     request=opener.return_value.open.call_args.args[0]
+     expected='http://127.0.0.1:14000/v1/chat/completions' if api=='openai' else 'http://127.0.0.1:18001/api/chat'
+     self.assertEqual(request.full_url,expected);self.assertEqual(request.get_header('Authorization'),'Bearer '+self.key)
+     body=json.loads(request.data);self.assertEqual(body['model'],model or self.client.ALIAS);self.assertTrue(body['stream'])
+     self.assertEqual(opener.return_value.open.call_args.kwargs['timeout'],self.client.catalog_profile(body['model']).total_deadline_seconds+50)
+     self.assertIn('CPU response',output.getvalue());self.assertNotIn(self.key,output.getvalue())
+ def test_unknown_alias_and_missing_or_wildcard_grants_refuse_before_HTTP(self):
+  import contextlib,io
+  cases=[('unknown-model',self.caller['models']),(self.mtp2[0],[self.client.ALIAS]),(self.mtp2[0],['*']),(self.mtp2[0],[])]
+  for model,grants in cases:
+   with self.subTest(model=model,grants=grants):
+    self.caller['models']=grants;self.write_caller()
+    with patch.object(self.client,'installation',return_value=self.config),patch.object(sys,'argv',['client_example','--data-root',str(self.data),'--api','openai','--model',model]),patch.object(self.client,'build_opener') as opener,contextlib.redirect_stdout(io.StringIO()):
+     self.assertEqual(self.client.main(),2)
+    opener.assert_not_called()
+ def test_server_rejection_is_reported_without_fallback_or_estimated_success(self):
+  import contextlib,io
+  from urllib.error import HTTPError
+  output=io.StringIO()
+  argv=['client_example','--data-root',str(self.data),'--api','openai','--model',self.mtp2[0]]
+  with patch.object(self.client,'installation',return_value=self.config),patch.object(sys,'argv',argv),patch.object(self.client,'build_opener') as opener,contextlib.redirect_stdout(output):
+   opener.return_value.open.side_effect=HTTPError('http://127.0.0.1:14000/v1/chat/completions',403,'CPU refused',{},None)
+   self.assertEqual(self.client.main(),2)
+  opener.return_value.open.assert_called_once();self.assertEqual(json.loads(output.getvalue()),{'state':'api_error','status':403})
+  self.assertNotIn(self.key,output.getvalue())
+ def test_endpoint_default_alias_key_and_private_file_checks_preserved(self):
+  for field,value in (('api_base','https://foreign.invalid/v1'),('compat_base','http://127.0.0.1:8001'),('alias','unknown-model'),('api_key','not-a-virtual-key')):
+   with self.subTest(field=field):
+    original=self.caller[field];self.caller[field]=value;self.write_caller()
+    with patch.object(self.client,'installation',return_value=self.config),self.assertRaises(DistributionError):self.client.request_parts(self.data,'openai',False,'CPU prompt',self.mtp2[0])
+    self.caller[field]=original
+  self.write_caller();(self.data/'secrets/caller.json').chmod(0o644)
+  with patch.object(self.client,'installation',return_value=self.config),self.assertRaises(DistributionError):self.client.request_parts(self.data,'openai',False,'CPU prompt',self.mtp2[0])
+
+class SharedInstallationCLIParserTests(unittest.TestCase):
+ def test_documented_sequence_dispatches_actual_parser_without_mutations(self):
+  import liliuxflow as cli
+  # Parse the whole documented setup-to-grant sequence; only mutation handlers
+  # are replaced. No listener, build, DB initialization or live model is used.
+  calls=[('setup',['setup','--model-dir','/CPU/checkpoint','--port','litellm=14000']),
+         ('build_runtime',['build','--optin-engine','latest13f-defer-pc123-mtp2-shared-context-v1','--ui-manifest','manifests/distribution/ui-recipe-mtp2-shared.json','--execute']),
+         ('verify_model',['verify-model']),('initialize_runtime',['initialize','--execute']),
+         ('doctor',['doctor']),('require_runtime',['start','--mtp2-shared-context']),('status',['status']),
+         ('profiles',['profiles','list','--mtp2-shared-context']),
+         ('profiles',['profiles','info','ctx128k-mtp2','--mtp2-shared-context']),
+         ('profiles',['profiles','grant-owner','ctx128k-mtp2','--mtp2-shared-context','--dry-run']),
+         ('profiles',['profiles','grant-owner','ctx128k-mtp2','--mtp2-shared-context','--execute']),
+         ('profiles',['profiles','grant-owner','ctx262k-mtp2','--mtp2-shared-context','--execute']),
+         ('profiles',['profiles','grant-ui-user','my-ui-user','ctx128k-mtp2','ctx262k-mtp2','--mtp2-shared-context','--execute'])]
+  for handler,arguments in calls:
+   with self.subTest(arguments=arguments),patch.object(sys,'argv',['liliuxflow','--data-root','/CPU/shared',*arguments]),patch.object(cli,handler,return_value=0) as dispatch,patch.object(cli.os,'umask'):
+    self.assertEqual(cli.main(),0)
+    parsed=dispatch.call_args.args[0];self.assertEqual(parsed.data_root,Path('/CPU/shared'))
+    self.assertEqual(parsed.command,arguments[0])
+    if '--mtp2-shared-context' in arguments:self.assertTrue(parsed.mtp2_shared_context)
+    if '--execute' in arguments:self.assertTrue(parsed.execute)
+    if '--dry-run' in arguments:self.assertTrue(parsed.dry_run)
+    if parsed.command=='build':self.assertEqual(parsed.optin_engine,'latest13f-defer-pc123-mtp2-shared-context-v1');self.assertEqual(parsed.ui_manifest,Path('manifests/distribution/ui-recipe-mtp2-shared.json'))
+
 if __name__=='__main__':unittest.main()

@@ -1,0 +1,18 @@
+diff --git a/ui/litellm-dashboard/src/app/(dashboard)/playground/page.tsx b/ui/litellm-dashboard/src/app/(dashboard)/playground/page.tsx
+index 3fbab5c..a9f91df 100644
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/page.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/page.tsx
+@@ -1,4 +1,5 @@
+ "use client";
++import SharedContextSummary from "@/liliuxflow/SharedContextSummary";
+ import { LocalizedText } from "@/liliuxflow/LocalizedText";
+ import { useState, useEffect } from "react";
+ import AgentBuilderView from "@/app/(dashboard)/playground/components/chat_ui/AgentBuilderView";
+@@ -37,6 +38,7 @@ export default function PlaygroundPage() {
+       </div>);
+     }
+     return (<div className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden">
++      <SharedContextSummary accessToken={accessToken}/>
+       <Tabs defaultValue="chat" className="flex min-h-0 min-w-0 flex-1 flex-col gap-0 overflow-hidden">
+         <TabsList variant="line" className="w-full shrink-0 justify-start overflow-x-auto pb-1">
+           <TabsTrigger value="chat" className="flex-none"><LocalizedText id="ui.admin.display.chat.9a9735d9"/></TabsTrigger>

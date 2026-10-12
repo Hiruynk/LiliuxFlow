@@ -15,6 +15,48 @@ PROFILE = {'public_alias': ALIAS, 'runtime_model_id': 'Qwen3.8-Flash-Next', 'con
            'pin_weights': 'off', 'ngram_lock': 'off', 'long128k_enabled': False}
 SHA = re.compile(r'^[0-9a-f]{64}$')
 
+def shared_native_build_record(replay, binary_sha256, *, performance_candidate=False):
+    """Normal native builder output only; this does not grant runtime admission."""
+    from mtp2_shared_runtime import candidate_expectation
+    EXPECTED = candidate_expectation(performance_candidate)
+    from mtp2_shared_runtime import ENGINE_ID, ARCHIVE_SHA256, from_generated_trust
+    from optin_engine import LATEST_COMMIT
+    fixed={'engine_id':ENGINE_ID,'source_commit':LATEST_COMMIT,'archive_sha256':ARCHIVE_SHA256,
+           'patch_sha256':[row['sha256'] for row in EXPECTED.patches],
+           'source_inventory_sha256':EXPECTED.source_inventory_sha256,
+           'source_file_count':EXPECTED.source_file_count,'default':False}
+    if (not isinstance(replay,dict) or replay.get('replay')!='PASS'
+        or replay.get('runtime_acceptance') is not False
+        or any(replay.get(key)!=value or type(replay.get(key)) is not type(value)
+               for key,value in fixed.items() if key!='default')):
+        raise DistributionError('shared native build replay is not the fixed source recipe')
+    record={**fixed,'binary_sha256':binary_sha256}
+    from_generated_trust(record,EXPECTED)
+    return record
+
+def append_shared_serving_sources(source, source_files, *, performance_candidate=False):
+    """Final normal generator hook; call after the gateway source is frozen.
+
+    Existing MTP0/opt-in binaries and records stay in their current schema.
+    Shared runtime binary/engine belongs in its separately validated extension.
+    This function writes no trust and enables no profiles or runtime.
+    """
+    from mtp2_shared_recipe import serving_source_records
+    if not isinstance(source_files,list) or any(not isinstance(row,dict) for row in source_files):
+        raise DistributionError('generated serving source records are malformed')
+    paths=[row.get('path') for row in source_files]
+    if any(type(path) is not str for path in paths) or len(paths)!=len(set(paths)):
+        raise DistributionError('generated serving source records are duplicated or malformed')
+    for row in source_files:verified_file(source,row)
+    additions=serving_source_records(source, performance_candidate=performance_candidate)
+    existing=dict(zip(paths,source_files))
+    for row in additions:
+        if row['path'] in existing and existing[row['path']]!=row:
+            raise DistributionError('shared generator source hash conflicts with existing trust')
+    result=list(source_files)+[row for row in additions if row['path'] not in existing]
+    for row in result:verified_file(source,row)
+    return result
+
 def sha256(path):
     digest = hashlib.sha256()
     with Path(path).open('rb') as handle:
@@ -73,7 +115,13 @@ def model_configured(config):
         raise DistributionError('attached checkpoint configuration is incomplete')
     return True
 
-def validate(data, *, require_checkpoint=True, trace=None):
+def validate(data, *, require_checkpoint=True, trace=None, shared_context=False):
+    if type(shared_context) is not bool:
+        raise DistributionError('shared MTP2 selection must be an exact boolean')
+    if shared_context:
+        if not (require_checkpoint is True or type(require_checkpoint) is str and require_checkpoint == 'available'):
+            raise DistributionError('shared MTP2 requires full configured checkpoint validation')
+        require_checkpoint = True
     def step(stage,relative=None):
         if trace is not None:trace({'stage':stage,'relative_file':relative})
     data = no_symlinks(data)
@@ -232,7 +280,28 @@ def validate(data, *, require_checkpoint=True, trace=None):
         verified_file(data,item)
     step('credentials_open','secrets/bootstrap.json')
     secrets = read_object(private_file(data / 'secrets/bootstrap.json'))
-    if any(not isinstance(secrets.get(k), str) or len(secrets[k]) < 24 for k in ('LITELLM_MASTER_KEY','LITELLM_SALT_KEY','DB_PASSWORD','PG_OWNER_PASSWORD','UI_PASSWORD','MANAGER_BACKEND_TOKEN','GUARD_CONTROL_TOKEN')):
+    preserved_ui = False
+    imported = trust.get('resource_import')
+    if imported is not None:
+        if (not isinstance(imported, dict) or set(imported) != {'path', 'sha256'}
+            or imported.get('path') != 'runtime/resource-import.json'):
+            raise DistributionError('portable resource import record differs')
+        imported_record = read_object(verified_file(data, imported))
+        helper = next((row for row in trust['source_files'] if row['path'] == 'scripts/distribution/resource_import.py'), None)
+        if (helper is None or type(imported_record.get('schema_version')) is not int or imported_record['schema_version'] != 1
+            or imported_record.get('purpose') != 'fresh_candidate_resource_import'
+            or imported_record.get('installation_id') != config['installation_id']
+            or imported_record.get('source_commit') != trust['source_commit']
+            or imported_record.get('bootstrap_sha256') != sha256(data / 'secrets/bootstrap.json')
+            or imported_record.get('bootstrap_policy') != {'origin': 'preserved_existing_operator_values', 'ui_password_minimum': 1}
+            or type(imported_record.get('bootstrap_policy', {}).get('ui_password_minimum')) is not int
+            or any(imported_record.get(key) is not False for key in ('runtime_acceptance','database_initialized','caller_key_created','weights_copied','services_started','shared_enabled'))):
+            raise DistributionError('portable resource import credential provenance differs')
+        verified_file(source, helper)
+        preserved_ui = True
+    if (any(not isinstance(secrets.get(k), str) or len(secrets[k]) < 24 for k in ('LITELLM_MASTER_KEY','LITELLM_SALT_KEY','DB_PASSWORD','PG_OWNER_PASSWORD','MANAGER_BACKEND_TOKEN','GUARD_CONTROL_TOKEN'))
+        or (not preserved_ui and (not isinstance(secrets.get('UI_PASSWORD'), str) or len(secrets['UI_PASSWORD']) < 24))
+        or (preserved_ui and any(type(secrets.get(k)) is not str or not secrets[k] or '\x00' in secrets[k] or '\n' in secrets[k] for k in ('UI_USERNAME','UI_PASSWORD')))):
         raise DistributionError('portable bootstrap credentials are incomplete')
     checkpoint = None
     if require_checkpoint:
@@ -260,10 +329,14 @@ def validate(data, *, require_checkpoint=True, trace=None):
                 if sha256(within(model, item['path'])) != item['sha256']:
                     raise DistributionError('checkpoint runtime metadata hash differs')
     step('trust_complete')
-    return {'config': config, 'profile': profile, 'registry': registry, 'profiles': registry.enabled_profiles if configured else (),
+    result = {'config': config, 'profile': profile, 'registry': registry, 'profiles': registry.enabled_profiles if configured else (),
             'trust': trust, 'binaries': binaries, 'engines': engines, 'secrets': secrets, 'checkpoint': checkpoint,
             'model_configured': configured,
             'source_root': source, 'data_root': data}
+    if shared_context:
+        from mtp2_shared_runtime import normal_shared_view
+        return normal_shared_view(result)
+    return result
 
 def checkpoint_records(model, manifest):
     """Verify the canonical inventory once, with stable file fingerprints."""

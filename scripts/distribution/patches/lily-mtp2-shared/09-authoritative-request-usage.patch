@@ -1,0 +1,349 @@
+--- a/src/serve.rs
++++ b/src/serve.rs
+@@ -1081,6 +1081,30 @@
+ }
+ 
+ impl<M: LanguageModel> Engine<M> {
++    fn control_prepared_usage(&self,sink:&Sink,prompt:usize,cached:usize,chat:bool)->Result<()> {
++        if let Some(control)=&self.control {
++            let guard=sink.control_admission.as_ref().context("mtp2_control_admission_missing")?;
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            control.prepared_usage(&mut authority,&guard.token,prompt,cached,chat)?;
++        }Ok(())
++    }
++    fn control_usage_response_id(&self,sink:&Sink,id:&str)->Result<()> {
++        if let Some(control)=&self.control {
++            let guard=sink.control_admission.as_ref().context("mtp2_control_admission_missing")?;
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            control.publish_usage_response_id(&mut authority,&guard.token,id)?;
++        }Ok(())
++    }
++    fn control_final_usage(&self,sink:&Sink,id:&str,usage:serde_json::Value,finish:&'static str,cancelled:bool)->Result<()> {
++        if let Some(control)=&self.control {
++            let guard=sink.control_admission.as_ref().context("mtp2_control_admission_missing")?;
++            let owner=self.control_owner.as_ref().context("mtp2_control_owner_missing")?;
++            let mut authority=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))?;
++            control.final_usage(&mut authority,&guard.token,Some(id),usage,finish,cancelled)?;
++        }Ok(())
++    }
+     /// Called only after this request's Admitted/Session and continuation have
+     /// been dropped or returned to the inactive cache. The caller has returned
+     /// from the whole quantum/prefill, so every PendingPass is already out of
+--- a/src/serve/request.rs
++++ b/src/serve/request.rs
+@@ -626,6 +626,7 @@
+         let session_secs = started.elapsed().as_secs_f64();
+         let mut session = acquired.session;
+         let reused = acquired.reused;
++        if sink.control_admission.is_some(){self.control_prepared_usage(sink,n,reused,p.kind==Kind::Chat)?;}
+         let agreement = acquired.agreement;
+         if sink.cancelled() {
+             drop(session);
+@@ -931,6 +932,7 @@
+ 
+         let created = now();
+         let id = response_id(p.kind, created, &mut self.next_id);
++        if sink.control_admission.is_some(){self.control_usage_response_id(sink,&id)?;}
+         let tokenizer = generator.tokenizer();
+         let detokenize: Detokenize<'g> =
+             Box::new(move |ids: &[u32]| tokenizer.decode(ids, false));
+@@ -1282,6 +1284,13 @@
+         if self.control.is_some() {
+             if faulted {let _=self.control_retire();}
+             else {
++                if matches!(&ending,Ending::Answered) && sink.cancelled() {
++                    if let (Some(control),Some(guard),Some(owner))=(&self.control,&sink.control_admission,&self.control_owner) {
++                        let sealed=owner.try_borrow_mut().map_err(|_|anyhow::anyhow!("mtp2_control_owner_borrow"))
++                            .and_then(|mut authority|control.finish_cancelled_prefill_usage(&mut authority,&guard.token).map_err(Into::into));
++                        if sealed.is_err(){let _=self.control_retire();}
++                    }
++                }
+                 let _=self.control_transition(&sink,super::mtp2_control::OwnerTransition::Cleanup);
+             }
+         }
+@@ -1458,6 +1467,14 @@
+             created: out.created,
+             timings: measured,
+         });
++        let controlled_usage=if sink.control_admission.is_some() {
++            // The same scalar accounting as a normal final response, committed
++            // before a departed client prevents final SSE delivery.
++            let usage=api::usage(n,f.reused,completion_tokens,
++                (p.kind==Kind::Chat).then(||parser.reasoning_tokens()),outcome.speculation.filter(|s|s.drafted>0));
++            self.control_final_usage(sink,&out.id,usage.clone(),finish_reason,sink.cancelled())?;
++            Some(usage)
++        } else {None};
+         if sink.cancelled() {
+             return Ok(());
+         }
+@@ -1467,13 +1484,13 @@
+             error_end(sink, p.stream, 503, "the server is shutting down");
+             return Ok(());
+         }
+-        let usage = api::usage(
++        let usage = controlled_usage.unwrap_or_else(||api::usage(
+             n,
+             f.reused,
+             completion_tokens,
+             (p.kind == Kind::Chat).then(|| parser.reasoning_tokens()),
+             outcome.speculation.filter(|s| s.drafted > 0),
+-        );
++        ));
+         let closing = Closing {
+             kind: p.kind,
+             id: &out.id,
+--- a/src/serve/mtp2_control.rs
++++ b/src/serve/mtp2_control.rs
+@@ -16,6 +16,7 @@
+ 
+ const REQUEST_DOMAIN: &[u8] = b"LiliuxFlow/MTP2/native-request/v1\0";
+ const RESPONSE_DOMAIN: &[u8] = b"LiliuxFlow/MTP2/native-response/v1\0";
++const USAGE_DOMAIN: &[u8] = b"LiliuxFlow/MTP2/native-usage/v1\0";
+ const MAX_INT: u64 = (1u64 << 53) - 1;
+ const MAX_TTL: u64 = 30;
+ const MAX_LIVE: usize = 8; // fixed queue4 + active2 + preparation2
+@@ -143,19 +144,30 @@
+     fn text(self) -> &'static str { match self { Self::Preparing => "preparing", Self::Queued => "queued", Self::Acquired => "acquired", Self::Cleanup => "cleanup", Self::Released => "released", Self::Zero => "rejected_without_native_state", Self::Faulted => "faulted" } }
+     fn terminal(self) -> bool { matches!(self, Self::Released | Self::Zero) }
+ }
++#[derive(Clone)]
++struct FinalUsage { tenant_binding: String, response_id: Option<String>, value: Value, finish_reason: &'static str, cancelled: bool }
++#[derive(Clone, Copy)]
++struct PreparedUsage { prompt: usize, cached: usize, chat: bool }
+ struct Row { epoch: Epoch, nonce: Nonce, tenant: TenantScope, profile: Profile, phase: Phase,
+     revision: u64, acquired: u8, released: u8, cancel: Arc<AtomicBool>,
+     reserved: bool, queue_returned: bool, job_disposed: bool,
+     pin_ever: bool, pin_live: bool, session_ever: bool, session_live: bool,
+     gpu_ever: bool, gpu_unsettled: bool, faulted: bool,
+-    pending_cpu_disposal: Option<CpuDisposal> }
++    pending_cpu_disposal: Option<CpuDisposal>, prepared_usage: Option<PreparedUsage>, native_response_id: Option<String>, final_usage: Option<FinalUsage> }
+ impl Row {
+     fn snapshot(&self) -> Value {
+         let mut out = json!({"nonce":self.nonce.text(),"alias":self.profile.alias(),"profile":self.profile.id(),
+-            "phase":self.phase.text(),"revision":self.revision,"acquired":self.acquired,"released":self.released});
++            "phase":self.phase.text(),"revision":self.revision,"acquired":self.acquired,"released":self.released,
++            "usage":Value::Null});
+         if self.phase == Phase::Released {
+             out["proof"] = json!({"registered":true,"queue_reservation_returned":true,"job_disposed":true,
+                 "session_disposed":true,"pin_released":true,"gpu_fault":false});
++            if let Some(usage)=&self.final_usage {
++                // Commitment binds this immutable native usage to the exact
++                // signed admission without exposing tenant scope in JSON.
++                out["usage"]=json!({"v":1,"tenant_binding":usage.tenant_binding,"response_id":usage.response_id,
++                    "finish_reason":usage.finish_reason,"cancelled":usage.cancelled,"usage":usage.value});
++            }
+         } else if self.phase == Phase::Zero {
+             out["proof"] = json!({"registered":true,"engine_acquired":false,"pin_acquired":false,
+                 "session_acquired":false,"gpu_work_started":false,"queue_reservation_returned":true,"job_disposed":true});
+@@ -291,7 +303,8 @@
+         let i = e.identity.as_ref().ok_or(Error::Origin)?; let mut l = self.lock()?; l.prune(now);
+         if l.state != RuntimeState::Ready || l.epoch != Some(i.epoch) { return Err(Error::Epoch); }
+         if l.cache.is_none() { return Err(Error::Store); }
+-        if l.seen.contains_key(&i.nonce) || l.live.keys().any(|(_, n)| *n == i.nonce) { return Err(Error::Replay); }
++        if l.seen.contains_key(&i.nonce) || l.live.keys().any(|(_, n)| *n == i.nonce)
++            || l.recent.iter().any(|(_,row)|row.nonce==i.nonce) { return Err(Error::Replay); }
+         if l.live.len() >= MAX_LIVE || l.seen.len() >= MAX_NONCES { return Err(Error::Capacity); }
+         let revision = l.bump()?; let cancel = Arc::new(AtomicBool::new(false));
+         l.seen.insert(i.nonce, e.expires);
+@@ -300,7 +313,7 @@
+             cancel: cancel.clone(), reserved: false, queue_returned: true, job_disposed: false,
+             pin_ever: false, pin_live: false, session_ever: false, session_live: false,
+             gpu_ever: false, gpu_unsettled: false, faulted: false,
+-            pending_cpu_disposal: None });
++            pending_cpu_disposal: None, prepared_usage: None, native_response_id: None, final_usage: None });
+         Ok((RequestToken { origin: self.origin.clone(), epoch: i.epoch, nonce: i.nonce }, cancel))
+     }
+     /// Recheck and reserve immediately before publication. `reserve` is the
+@@ -416,6 +429,50 @@
+         row.revision = revision; Ok(())
+     }
+     pub(super) fn owner_transition(&self, owner: &mut EngineAuthority, token: &RequestToken, action: OwnerTransition) -> Result<()> { self.owner_row(owner, token, action) }
++    /// Facts from the same admitted session used by normal api::usage.
++    /// Hidden until final release; this does not mutate lane/cache/GPU state.
++    pub(super) fn prepared_usage(&self, owner: &mut EngineAuthority, token: &RequestToken, prompt:usize,cached:usize,chat:bool) -> Result<()> {
++        self.owner(owner)?;let key=self.token(token)?;let mut l=self.lock()?;
++        if l.state!=RuntimeState::Ready || l.epoch!=Some(key.0) {return Err(Error::Epoch);}
++        let row=l.live.get_mut(&key).ok_or(Error::Unknown)?;
++        if row.phase!=Phase::Acquired || row.faulted || !row.session_live || !row.gpu_ever || row.prepared_usage.is_some()
++            || cached>prompt || prompt==0 || prompt as u64>MAX_INT {return Err(Error::Transition);}
++        row.prepared_usage=Some(PreparedUsage{prompt,cached,chat});Ok(())
++    }
++    /// Capture the native response counter's ID before any role/SSE chunk.
++    pub(super) fn publish_usage_response_id(&self,owner:&mut EngineAuthority,token:&RequestToken,id:&str)->Result<()> {
++        self.owner(owner)?;let key=self.token(token)?;let mut l=self.lock()?;
++        if l.state!=RuntimeState::Ready || l.epoch!=Some(key.0){return Err(Error::Epoch);}
++        if l.live.values().chain(l.recent.iter().map(|(_,row)|row)).any(|row|row.native_response_id.as_deref()==Some(id)) {
++            return Err(Error::Replay);
++        }
++        let row=l.live.get_mut(&key).ok_or(Error::Unknown)?;let facts=row.prepared_usage.ok_or(Error::Unknown)?;
++        if row.phase!=Phase::Acquired || row.faulted || row.native_response_id.is_some(){return Err(Error::Transition);}
++        validate_response_id(id,facts.chat)?;row.native_response_id=Some(id.to_owned());Ok(())
++    }
++    /// Sole engine owner supplies the actual normal-final usage value, not a
++    /// caller object, text estimator, timing observer or unsigned log record.
++    pub(super) fn final_usage(&self, owner:&mut EngineAuthority, token:&RequestToken,response_id:Option<&str>,value:Value,finish_reason:&'static str,cancelled:bool)->Result<()> {
++        self.owner(owner)?;let key=self.token(token)?;let mut l=self.lock()?;
++        if l.state!=RuntimeState::Ready || l.epoch!=Some(key.0) {return Err(Error::Epoch);}
++        let row=l.live.get_mut(&key).ok_or(Error::Unknown)?;
++        let facts=row.prepared_usage.ok_or(Error::Unknown)?;
++        if row.phase!=Phase::Acquired || row.faulted || row.final_usage.is_some() {return Err(Error::Transition);}
++        validate_usage(&value,facts)?;
++        if !matches!(finish_reason,"length"|"stop"|"tool_calls"|"cancelled") {return Err(Error::Schema);}
++        if let Some(id)=response_id {
++            if row.native_response_id.as_deref()!=Some(id){return Err(Error::Origin);}
++        } else if row.native_response_id.is_some() || !cancelled || finish_reason!="cancelled" || value["completion_tokens"]!=0 {return Err(Error::Schema);}
++        let binding=lp(USAGE_DOMAIN,&[&row.epoch.text(),&row.nonce.text(),&hex(&row.tenant.0),row.profile.alias(),row.profile.id()])?;
++        row.final_usage=Some(FinalUsage{tenant_binding:hex(&sha256(&binding)),response_id:response_id.map(str::to_owned),value,finish_reason,cancelled});Ok(())
++    }
++    pub(super) fn finish_cancelled_prefill_usage(&self,owner:&mut EngineAuthority,token:&RequestToken)->Result<()> {
++        self.owner(owner)?;let key=self.token(token)?;
++        let (facts,id)={let l=self.lock()?;let row=l.live.get(&key).ok_or(Error::Unknown)?;
++            if row.final_usage.is_some(){return Ok(());} (row.prepared_usage,row.native_response_id.clone())};
++        if let Some(f)=facts {self.final_usage(owner,token,id.as_deref(),super::api::usage(f.prompt,f.cached,0,f.chat.then_some(0),None),"cancelled",true)?;}
++        Ok(())
++    }
+     pub(super) fn finish_release(&self, owner: &mut EngineAuthority, token: &RequestToken, now: u64) -> Result<()> {
+         self.owner(owner)?; if now > MAX_INT { return Err(Error::Expiry); }
+         let key = self.token(token)?; let mut l = self.lock()?;
+@@ -425,6 +482,7 @@
+             || row.pin_live || row.session_live || row.gpu_unsettled
+             || !row.job_disposed || !row.queue_returned { return Err(Error::Transition); }
+         let revision = l.bump()?; let row = l.live.get_mut(&key).ok_or(Error::Unknown)?;
++        if let Some(usage)=row.final_usage.as_mut(){usage.cancelled|=row.cancel.load(Ordering::Acquire);}
+         row.released = 1; row.phase = Phase::Released; row.revision = revision; l.finish(key, now)
+     }
+     /// Engine owner only, after actual no-Job/body-refusal or queued-Job cleanup.
+@@ -504,6 +562,34 @@
+             ("x-liliuxflow-control-epoch",epoch),("x-liliuxflow-control-mac",hex(&mac(&self.key.0,&frame)?))], body })
+     }
+ }
++fn validate_response_id(id:&str,chat:bool)->Result<()> {
++    let tail=id.strip_prefix(if chat{"chatcmpl-"}else{"cmpl-"}).ok_or(Error::Schema)?;
++    let parts:Vec<_>=tail.split('-').collect();
++    if parts.len()!=2 || parts.iter().any(|p|p.is_empty() || p.len()>20 || p.len()>1&&p.starts_with('0')
++        || !p.bytes().all(|c|c.is_ascii_digit()) || p.parse::<u64>().is_err()){return Err(Error::Schema);}
++    Ok(())
++}
++fn validate_usage(value:&Value,facts:PreparedUsage)->Result<()> {
++    let map=value.as_object().ok_or(Error::Schema)?;
++    let required=["prompt_tokens","completion_tokens","total_tokens","prompt_tokens_details"];
++    if map.len()!=4+usize::from(map.contains_key("completion_tokens_details")) || required.iter().any(|k|!map.contains_key(*k)) {return Err(Error::Schema);}
++    let get=|v:&Value|v.as_u64().filter(|n|*n<=MAX_INT).ok_or(Error::Counter);
++    let prompt=get(&value["prompt_tokens"])?;let completion=get(&value["completion_tokens"])?;
++    if prompt!=facts.prompt as u64 || completion>65536 || get(&value["total_tokens"])?!=prompt.checked_add(completion).ok_or(Error::Counter)? {return Err(Error::Schema);}
++    let cache=value["prompt_tokens_details"].as_object().ok_or(Error::Schema)?;
++    if cache.len()!=1 || get(&value["prompt_tokens_details"]["cached_tokens"])?!=facts.cached as u64 {return Err(Error::Schema);}
++    let details=value.get("completion_tokens_details").and_then(Value::as_object);
++    if map.contains_key("completion_tokens_details") && details.is_none(){return Err(Error::Schema);}
++    if facts.chat && details.is_none_or(|m|!m.contains_key("reasoning_tokens")) {return Err(Error::Schema);}
++    if let Some(d)=details {
++        if d.keys().any(|k|!matches!(k.as_str(),"reasoning_tokens"|"accepted_prediction_tokens"|"rejected_prediction_tokens")) {return Err(Error::Schema);}
++        if let Some(n)=d.get("reasoning_tokens") {if !facts.chat || get(n)?>completion {return Err(Error::Schema);}}
++        match (d.get("accepted_prediction_tokens"),d.get("rejected_prediction_tokens")) {
++            (Some(a),Some(r))=>{if get(a)?.checked_add(get(r)?).filter(|n|*n<=MAX_INT).is_none(){return Err(Error::Counter);}},
++            (None,None)=>{},_=>return Err(Error::Schema),
++        }
++    }Ok(())
++}
+ #[derive(Clone, Copy)]
+ pub(super) enum OwnerTransition { PinStarted, SessionStarted, GpuStarted, Cleanup,
+     PinDisposed, SessionDisposed, GpuSettled, JobDisposed }
+@@ -713,4 +799,95 @@
+         c.retire_epoch(&mut o).unwrap();assert!(c.owner_transition(&mut o,&t,OwnerTransition::GpuSettled).is_err());
+         assert!(c.lock().unwrap().live.get(&(t.epoch,t.nonce)).unwrap().gpu_unsettled);
+     }
+-}
++    fn usage_row(c:&Control,o:&mut EngineAuthority,n:u8,chat:bool)->RequestToken {
++        let t=request(c,o,n);c.before_publish(&t,||true).unwrap();c.queue_returned(o,&t).unwrap();c.before_acquire(o,&t,E).unwrap();
++        for action in [OwnerTransition::PinStarted,OwnerTransition::SessionStarted,OwnerTransition::GpuStarted]{c.owner_transition(o,&t,action).unwrap();}
++        c.prepared_usage(o,&t,4096,4095,chat).unwrap();t
++    }
++    fn usage_release(c:&Control,o:&mut EngineAuthority,t:&RequestToken,now:u64)->Value {
++        for action in [OwnerTransition::Cleanup,OwnerTransition::SessionDisposed,OwnerTransition::GpuSettled,OwnerTransition::PinDisposed,OwnerTransition::JobDisposed]{c.owner_transition(o,t,action).unwrap();}
++        c.finish_release(o,t,now).unwrap();c.lock().unwrap().recent.back().unwrap().1.snapshot()
++    }
++    fn normal_usage(chat:bool)->Value {super::super::api::usage(4096,4095,200,chat.then_some(187),Some(super::super::timings::Speculation{drafted:300,accepted:123}))}
++    #[test] fn usage_is_identical_to_normal_final_and_hidden_until_actual_release() {
++        let (c,mut o)=setup();let t=usage_row(&c,&mut o,1,true);
++        let before=c.lock().unwrap().live.get(&(t.epoch,t.nonce)).unwrap().snapshot();
++        c.publish_usage_response_id(&mut o,&t,"chatcmpl-1000-1").unwrap();
++        let value=normal_usage(true);c.final_usage(&mut o,&t,Some("chatcmpl-1000-1"),value.clone(),"length",false).unwrap();
++        assert_eq!(before,c.lock().unwrap().live.get(&(t.epoch,t.nonce)).unwrap().snapshot());
++        assert!(c.finish_release(&mut o,&t,1001).is_err());
++        let released=usage_release(&c,&mut o,&t,1001);
++        assert_eq!(released["usage"]["usage"],value);assert_eq!(released["usage"]["response_id"],"chatcmpl-1000-1");
++        assert_eq!(released["usage"]["tenant_binding"],"47ea6109fd61f4720d2e327d00e1efab0d2e56d97d7996a024705ddf642c9cae");
++        assert_eq!((released["acquired"].as_u64(),released["released"].as_u64()),(Some(1),Some(1)));
++        assert_eq!(released["usage"]["usage"]["completion_tokens"],200);
++        assert_eq!(released["usage"]["usage"]["completion_tokens_details"]["reasoning_tokens"],187);
++        assert!(!serde_json::to_string(&released).unwrap().contains(E));
++    }
++    #[test] fn late_cancel_seals_generated_high_counts_and_does_not_touch_peer() {
++        let (c,mut o)=setup();let a=usage_row(&c,&mut o,1,true);let b=usage_row(&c,&mut o,2,true);
++        c.publish_usage_response_id(&mut o,&a,"chatcmpl-1000-1").unwrap();c.publish_usage_response_id(&mut o,&b,"chatcmpl-1000-2").unwrap();
++        c.final_usage(&mut o,&a,Some("chatcmpl-1000-1"),normal_usage(true),"stop",false).unwrap();
++        let body=serde_json::to_vec(&json!({"v":1,"epoch":E,"nonce":a.nonce.text()})).unwrap();
++        c.private_reply(&envelope(&c,"cancel",E,&a.nonce.text(),&body),&body,1000).unwrap();
++        let released=usage_release(&c,&mut o,&a,1001);assert_eq!(released["usage"]["cancelled"],true);
++        assert_eq!(released["usage"]["usage"],normal_usage(true));
++        let l=c.lock().unwrap();let peer=l.live.get(&(b.epoch,b.nonce)).unwrap();assert!(!peer.cancel.load(Ordering::Acquire));
++        assert!(peer.snapshot()["usage"].is_null());assert_eq!((peer.acquired,peer.released),(1,0));
++    }
++    #[test] fn prefill_cancel_has_actual_prompt_cache_known_zero_and_optional_native_id() {
++        for has_id in [false,true] {let (c,mut o)=setup();let t=usage_row(&c,&mut o,1,true);
++            if has_id{c.publish_usage_response_id(&mut o,&t,"chatcmpl-1000-1").unwrap();}
++            c.finish_cancelled_prefill_usage(&mut o,&t).unwrap();let row=usage_release(&c,&mut o,&t,1001);
++            assert_eq!(row["usage"]["usage"],super::super::api::usage(4096,4095,0,Some(0),None));
++            assert_eq!(row["usage"]["response_id"],if has_id{json!("chatcmpl-1000-1")}else{Value::Null});
++            assert_eq!(row["usage"]["finish_reason"],"cancelled");assert_eq!(row["usage"]["cancelled"],true);
++        }
++    }
++    #[test] fn unknown_failed_fault_and_zero_state_never_invent_usage() {
++        let (c,mut o)=setup();let a=request(&c,&mut o,1);
++        c.owner_transition(&mut o,&a,OwnerTransition::JobDisposed).unwrap();c.finish_zero_state(&mut o,&a,1000).unwrap();
++        assert!(c.lock().unwrap().recent.back().unwrap().1.snapshot()["usage"].is_null());
++        let b=usage_row(&c,&mut o,2,true);assert!(usage_release(&c,&mut o,&b,1001)["usage"].is_null());
++        let d=usage_row(&c,&mut o,3,true);c.retire_epoch(&mut o).unwrap();
++        assert!(c.finish_cancelled_prefill_usage(&mut o,&d).is_err());
++        assert!(c.lock().unwrap().live.get(&(d.epoch,d.nonce)).unwrap().snapshot()["usage"].is_null());
++    }
++    #[test] fn response_id_peer_swap_reuse_origin_epoch_and_duplicate_final_are_refused() {
++        let (c,mut o)=setup();let a=usage_row(&c,&mut o,1,true);let b=usage_row(&c,&mut o,2,true);
++        c.publish_usage_response_id(&mut o,&a,"chatcmpl-1000-1").unwrap();
++        assert!(c.publish_usage_response_id(&mut o,&b,"chatcmpl-1000-1").is_err());
++        c.publish_usage_response_id(&mut o,&b,"chatcmpl-1000-2").unwrap();
++        assert!(c.final_usage(&mut o,&a,Some("chatcmpl-1000-2"),normal_usage(true),"stop",false).is_err());
++        let (_,mut foreign)=setup();assert!(c.final_usage(&mut foreign,&a,Some("chatcmpl-1000-1"),normal_usage(true),"stop",false).is_err());
++        c.final_usage(&mut o,&a,Some("chatcmpl-1000-1"),normal_usage(true),"stop",false).unwrap();
++        assert!(c.final_usage(&mut o,&a,Some("chatcmpl-1000-1"),normal_usage(true),"stop",false).is_err());
++        c.retire_epoch(&mut o).unwrap();c.publish_epoch(&mut o,&"b".repeat(64),store()).unwrap();
++        assert!(c.final_usage(&mut o,&b,Some("chatcmpl-1000-2"),normal_usage(true),"stop",false).is_err());
++    }
++    #[test] fn malformed_counter_details_or_kind_cannot_publish_usage() {
++        let facts=PreparedUsage{prompt:4096,cached:4095,chat:true};
++        for (key,value) in [("prompt_tokens",json!(97)),("completion_tokens",json!(true)),("total_tokens",json!(0)),
++            ("completion_tokens_details",Value::Null),("prompt_tokens_details",json!({"cached_tokens":4096})),
++            ("completion_tokens_details",json!({"reasoning_tokens":201})),
++            ("completion_tokens_details",json!({"reasoning_tokens":187,"accepted_prediction_tokens":2})),
++            ("completion_tokens_details",json!({"reasoning_tokens":187,"raw_text":"forbidden"}))] {
++            let mut value0=normal_usage(true);value0[key]=value;assert!(validate_usage(&value0,facts).is_err());
++        }
++        for id in ["cmpl-1000-1","chatcmpl-01-1","chatcmpl-1000-+1","chatcmpl-1000-18446744073709551616","caller-chosen"] {assert!(validate_response_id(id,true).is_err());}
++    }
++    #[test] fn completion_usage_keeps_unknown_reasoning_and_cancel_zero_is_exact() {
++        let (c,mut o)=setup();let t=usage_row(&c,&mut o,1,false);c.publish_usage_response_id(&mut o,&t,"cmpl-1000-1").unwrap();
++        let value=normal_usage(false);c.final_usage(&mut o,&t,Some("cmpl-1000-1"),value.clone(),"stop",true).unwrap();
++        assert_eq!(usage_release(&c,&mut o,&t,1001)["usage"]["usage"],value);
++        assert!(value["completion_tokens_details"].get("reasoning_tokens").is_none());
++    }
++    #[test] fn usage_retention_is_existing_bounded_recent_and_nonce_cannot_shadow_it() {
++        let (c,mut o)=setup();let a=usage_row(&c,&mut o,1,true);c.finish_cancelled_prefill_usage(&mut o,&a).unwrap();usage_release(&c,&mut o,&a,1000);
++        let h=headers(&c,"infer",E,&a.nonce.text(),b"{}",1030);let e=c.authenticate("POST","/v1/chat/completions",&h,1030).unwrap();
++        assert!(matches!(c.register(&e,1030),Err(Error::Replay)));
++        for n in 2..=130 {let t=usage_row(&c,&mut o,n,true);c.finish_cancelled_prefill_usage(&mut o,&t).unwrap();usage_release(&c,&mut o,&t,1000);}
++        let mut l=c.lock().unwrap();assert_eq!(l.recent.len(),MAX_RECENT);assert!(!l.recent.iter().any(|(_,row)|row.nonce==a.nonce));
++        l.prune(1120);assert!(l.recent.is_empty());
++    }
++}
