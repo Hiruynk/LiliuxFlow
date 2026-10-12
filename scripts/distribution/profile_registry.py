@@ -13,10 +13,11 @@ from common import DistributionError, no_symlinks
 
 REGISTRY_PATH = 'profiles/distribution/context-registry.json'
 DEFAULT_ALIAS = 'qwen3.8-flash-next-lily-q4-64k'
+MAX_OUTPUT_TOKENS = 65536
 TARGETS = (
-    ('ctx64k', DEFAULT_ALIAS, 65536, 600, 300, 4, 32 * 1024**3),
-    ('ctx128k', 'qwen3.8-flash-next-lily-q4-128k', 131072, 1200, 600, 2, 10 * 1024**3),
-    ('ctx262k', 'qwen3.8-flash-next-lily-q4-262k', 262144, 1800, 900, 1, 10 * 1024**3),
+    ('ctx64k', DEFAULT_ALIAS, 65536, 3672, 300, 4, 32 * 1024**3),
+    ('ctx128k', 'qwen3.8-flash-next-lily-q4-128k', 131072, 4272, 600, 2, 10 * 1024**3),
+    ('ctx262k', 'qwen3.8-flash-next-lily-q4-262k', 262144, 4872, 900, 1, 10 * 1024**3),
 )
 MINIMUM_RAM_HEADROOM_GIB = {'ctx64k': 15, 'ctx128k': 15, 'ctx262k': 13}
 SHARED = {
@@ -121,7 +122,7 @@ def parse_registry(document):
         if not isinstance(row, dict) or set(row) != fields:
             raise DistributionError('context profile fields differ')
         fixed_profile = {'profile_id': pid, 'public_alias': alias, 'context_tokens': context,
-                         'default_output_tokens': 4096, 'total_deadline_seconds': deadline,
+                         'default_output_tokens': MAX_OUTPUT_TOKENS, 'total_deadline_seconds': deadline,
                          'queue_wait_seconds': wait, 'idle_ttl_seconds': 1800,
                          'max_sessions': sessions,
                          'minimum_ram_headroom_gib': MINIMUM_RAM_HEADROOM_GIB[pid],
@@ -159,7 +160,7 @@ def legacy_registry(profile):
     """Read an established single-profile trust receipt without granting new models."""
     rows = []
     for pid, alias, context, deadline, wait, sessions, disk in TARGETS:
-        rows.append(RuntimeProfile(pid, alias, SHARED['runtime_model_id'], context, 4096, deadline,
+        rows.append(RuntimeProfile(pid, alias, SHARED['runtime_model_id'], context, MAX_OUTPUT_TOKENS, deadline,
                                    wait, 1800, 8 * 1024**3, sessions, disk,
                                    'lily-safe64k' if pid == 'ctx64k' else
                                    'lily-q4-afde8b8e-db3f8a7c-split-mtp0-' + pid,

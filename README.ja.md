@@ -174,7 +174,7 @@ lf models install qwen3.8-flash-next-lily-q4 --output "$MODEL_DIR" --execute
 uv run --no-project --python 3.12 python scripts/distribution/client_example.py --api openai --stream
 ```
 
-別のクライアントには、API base **`http://127.0.0.1:4000/v1`**、モデル **`qwen3.8-flash-next-lily-q4-64k`**、そのアプリケーションに割り当てた LiteLLM 仮想キーを設定します。モデル権限や制限は API 管理画面で管理できます。既定の出力予算は thinking を含む 4,096 トークンで、入力と出力の合計 65,536 トークンの範囲内に収める必要があります。
+別のクライアントには、API base **`http://127.0.0.1:4000/v1`**、モデル **`qwen3.8-flash-next-lily-q4-64k`**、そのアプリケーションに割り当てた LiteLLM 仮想キーを設定します。モデル権限や制限は API 管理画面で管理できます。既定の出力予算と上限は、thinking を含めて 65,536 トークンです。入力と出力は選択したモデルの総コンテキストを共有します。Lily は残りの容量に合わせて出力を制限し、上限に達すると `length` を返します。
 
 この構成は Chat Completions を提供します。既存インターフェースは独自 SSE またはプレーンテキストを使用するため、クライアントの改修時にはその通信形式に従ってください。JSON／JSON Schema 応答形式、音声／動画、リクエストごとの `keep_alive` はサポートしていません。既存 API の例、対応オプション、キャンセル動作は [API](docs/API.md)を参照してください。
 

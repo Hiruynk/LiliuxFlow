@@ -29,8 +29,9 @@ MAX_NONSTREAM_CONTENT_BYTES = 8 * 1024 * 1024
 MAX_INFLIGHT_CHAT_REQUESTS = 4
 MEDIA_PREPROCESS_CONCURRENCY = 1
 FIXED_CONTEXT_PROFILE_TOKENS = 65_536
-DEFAULT_OUTPUT_BUDGET_TOKENS = 4096
-MAX_TOTAL_REQUEST_SECONDS = 600
+MAX_OUTPUT_BUDGET_TOKENS = 65_536
+DEFAULT_OUTPUT_BUDGET_TOKENS = MAX_OUTPUT_BUDGET_TOKENS
+MAX_TOTAL_REQUEST_SECONDS = 3672
 LEGACY_METRIC_KEYS = (
     "prompt_eval_count",
     "eval_count",
@@ -87,9 +88,9 @@ class Settings:
         if self.profiles and self.public_alias not in aliases:
             raise ValueError("Compat default profile must be enabled")
         targets = {
-            "qwen3.8-flash-next-lily-q4-64k": (65536, 600),
-            "qwen3.8-flash-next-lily-q4-128k": (131072, 1200),
-            "qwen3.8-flash-next-lily-q4-262k": (262144, 1800),
+            "qwen3.8-flash-next-lily-q4-64k": (65536, 3672),
+            "qwen3.8-flash-next-lily-q4-128k": (131072, 4272),
+            "qwen3.8-flash-next-lily-q4-262k": (262144, 4872),
         }
         if any(p.public_alias not in targets or (p.context_tokens, p.total_deadline_seconds) != targets[p.public_alias]
                or p.default_output_tokens != DEFAULT_OUTPUT_BUDGET_TOKENS for p in self.profiles):
@@ -302,10 +303,11 @@ def _finite_number(name: str, value: Any, *, minimum: float | None = None, maxim
     return value
 
 
-def _map_options(options: dict[str, Any] | None, *, context_limit_tokens: int) -> dict[str, Any]:
+def _map_options(options: dict[str, Any] | None, *, context_limit_tokens: int,
+                 default_output_tokens: int = DEFAULT_OUTPUT_BUDGET_TOKENS) -> dict[str, Any]:
     if options is not None and not isinstance(options, dict):
         raise ProtocolInputError("options must be an object")
-    mapped: dict[str, Any] = {"max_tokens": DEFAULT_OUTPUT_BUDGET_TOKENS}
+    mapped: dict[str, Any] = {"max_tokens": default_output_tokens}
     if options is None:
         return mapped
     for name, value in options.items():
@@ -326,8 +328,8 @@ def _map_options(options: dict[str, Any] | None, *, context_limit_tokens: int) -
         elif name == "num_predict":
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ProtocolInputError("options.num_predict must be a positive integer")
-            if value > context_limit_tokens:
-                raise ProtocolInputError("options.num_predict cannot exceed the fixed context profile")
+            if value > min(context_limit_tokens, MAX_OUTPUT_BUDGET_TOKENS):
+                raise ProtocolInputError("options.num_predict cannot exceed the 65536-token output limit")
             mapped["max_tokens"] = value
         elif name == "repeat_penalty":
             mapped["repetition_penalty"] = _finite_number(name, value, minimum=0.01, maximum=10)
@@ -909,7 +911,8 @@ def create_app(
                 "num_predict_supported": True,
                 "num_predict_maps_to": "max_tokens",
                 "default_num_predict": generation_profile.default_output_tokens,
-                "maximum_requested_num_predict": generation_profile.context_tokens,
+                "maximum_requested_num_predict": min(generation_profile.context_tokens, MAX_OUTPUT_BUDGET_TOKENS),
+                "thinking_tokens_included_in_output_budget": True,
                 "total_deadline_seconds": generation_profile.total_deadline_seconds,
                 "context_clamp_signal": "done_reason=length for SSE; X-Legacy-Done-Reason=length for pure-text nonstream",
             },
@@ -1003,6 +1006,7 @@ def create_app(
             mapped_options = _map_options(
                 req.options,
                 context_limit_tokens=profile.context_tokens,
+                default_output_tokens=profile.default_output_tokens,
             )
         except ProtocolInputError as exc:
             return JSONResponse(status_code=400, content=_protocol_body(str(exc)))

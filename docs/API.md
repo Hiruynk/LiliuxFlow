@@ -14,7 +14,7 @@ A management-only installation has no inference-ready model until a checkpoint i
 | Model | `qwen3.8-flash-next-lily-q4-64k` |
 | Authentication | `Authorization: Bearer <application virtual key>` |
 | Default total context | 65,536 tokens, input plus output; selected model determines the profile |
-| Default output budget | 4,096 tokens, including thinking |
+| Default output budget | 65,536 tokens, including thinking |
 
 Create application keys and assign model permissions and limits in the [API management dashboard](http://127.0.0.1:4000/ui/). The installation's own caller settings are stored locally in `~/Library/Application Support/LiliuxFlow/secrets/caller.json`. Use an application's virtual key for inference, rather than management credentials.
 
@@ -35,7 +35,7 @@ The 128K model is enabled and has been verified through Chat Completions, legacy
 uv run --no-project --python 3.12 python scripts/distribution/client_example.py --api openai --model qwen3.8-flash-next-lily-q4-128k --stream
 ```
 
-Its total context is 131,072 tokens; the default output budget remains 4,096. The 64K model stays the default. The 262K model is also enabled with a 262,144-token total context. Use `--model qwen3.8-flash-next-lily-q4-262k` with a caller explicitly granted that model; the helper applies its longer bounded timeout. Profile switches and cold cache restores can add delay.
+Its total context is 131,072 tokens; the default output budget is 65,536. The 64K model stays the default. The 262K model is also enabled with a 262,144-token total context. Use `--model qwen3.8-flash-next-lily-q4-262k` with a caller explicitly granted that model; the helper applies its longer bounded timeout. Profile switches and cold cache restores can add delay.
 
 ## Legacy request and response
 
@@ -66,7 +66,7 @@ There is one terminal frame. When supplied by the upstream response, terminal me
 
 | Option | Behavior |
 | --- | --- |
-| `num_predict` | Positive integer up to the selected model's total context; maps to `max_tokens`. Input and output must still fit that context. |
+| `num_predict` | Positive integer from 1 to 65,536; maps to `max_tokens`. Thinking shares the output budget. Lily clamps output to the remaining total context and reports `length` on exhaustion. |
 | `num_ctx` | The 64K model accepts only `65536`; omit this option for larger profiles. Select context through the model name; request-level context overrides are unsupported. |
 | `temperature` | Finite number from 0 to 2 |
 | `top_p`, `min_p` | Finite number from 0 to 1 |
@@ -89,3 +89,5 @@ Client disconnection closes the upstream request through Compat, LiteLLM and the
 Use ordinary HTTP client behavior. This Lily integration treats a TCP write-side half-close as cancellation, so clients must keep the request connection open while reading the response.
 
 Manual model unload is refused with HTTP 409 while inference is active. The model is loaded lazily and unloaded after its configured idle interval. The local API scope is Chat Completions; other OpenAI API families or features visible in upstream dashboards are not implied by this model profile.
+
+An interrupted model shutdown can leave a closed owner record. The lifecycle guard verifies that exact owner has exited, that its backend port is closed, and that its lease matches before recovering the queue. It never clears an active or foreign owner. Requests waiting for recovery remain bounded and cancellable.

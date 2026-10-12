@@ -475,6 +475,8 @@ class _ContextLifecycleGuard(_LifecycleGuard):
         self.cleanup_seconds = 90.0
         self._last_release_method = None
         self._recovering_cleanup = False
+        self._cleanup_recovery_task = None
+        self._cleanup_recovery_resumes_queue = False
 
     def _advance_locked(self):
         while self._pending:
@@ -496,8 +498,21 @@ class _ContextLifecycleGuard(_LifecycleGuard):
         ticket = _ProfileTicket(profile, loop.create_future(), deadline)
         async with self._lock:
             if self._admission_paused:
-                raise _GuardError(503, 'admission_paused', 'manager admission is paused')
-            if self._ticket is None and not self._pending:
+                held = self._ticket
+                if (self._pause_reason != 'resource_release_unverified'
+                    or (held is not None and held.stage != 'cleanup')
+                    or (held is None and self._active_inferences != 0)
+                    or (self._recovering_cleanup and not self._cleanup_recovery_resumes_queue)):
+                    raise _GuardError(503, 'admission_paused', 'manager admission is paused')
+                if len(self._pending) >= self.registry.pending_limit:
+                    raise _GuardError(429, 'queue_full', 'the bounded generation queue is full; retry later')
+                # Keep admission paused until exact exit proof is revalidated.
+                # Recovery never loads a model: only a still-connected queued
+                # caller may prepare its profile after that proof succeeds.
+                self._pending.append(ticket)
+                if not self._recovering_cleanup:
+                    self._start_cleanup_recovery_locked(held, resume_queue=True, profile=profile)
+            elif self._ticket is None and not self._pending:
                 self._ticket = ticket
                 self._active_inferences = 1
                 ticket.granted.set_result(True)
@@ -552,16 +567,18 @@ class _ContextLifecycleGuard(_LifecycleGuard):
                 'active_stage': self._ticket.stage if self._ticket else None,
                 'last_release_method': self._last_release_method}
 
-    async def recover_cleanup(self, *, token):
-        if not self.control_token or not hmac.compare_digest(token, self.control_token):
-            return 403, {'error': 'forbidden'}
-        async with self._lock:
-            ticket = self._ticket
-            if (not self._admission_paused or self._pause_reason != 'resource_release_unverified'
-                or ticket is None or ticket.stage != 'cleanup' or self._pending or self._recovering_cleanup):
-                return 409, {'error': 'cleanup_recovery_not_available'}
-            self._recovering_cleanup = True
+    def _start_cleanup_recovery_locked(self, ticket, *, resume_queue, profile=None):
+        if ticket is not None:
             profile = ticket.cleanup_profile or ticket.profile
+        if profile is None:
+            raise ValueError('cleanup recovery requires a trusted context profile')
+        self._recovering_cleanup = True
+        self._cleanup_recovery_resumes_queue = resume_queue
+        self._cleanup_recovery_task = asyncio.create_task(self._recover_cleanup_ticket(ticket, profile,
+                                                                                     resume_queue=resume_queue))
+        return self._cleanup_recovery_task
+
+    async def _recover_cleanup_ticket(self, ticket, profile, *, resume_queue):
         try:
             deadline = asyncio.get_running_loop().time() + 10
             if await self._running(deadline) is not None:
@@ -575,21 +592,46 @@ class _ContextLifecycleGuard(_LifecycleGuard):
             if await _stage(self.resource_probe(profile, 'unloaded'), deadline=deadline) is not True:
                 return 409, {'error': 'owned_exit_or_lease_unverified'}
             async with self._lock:
-                if self._ticket is not ticket or self._pending or ticket.stage != 'cleanup':
+                if (self._ticket is not ticket or (self._pending and not resume_queue)
+                    or (ticket is not None and ticket.stage != 'cleanup')
+                    or (ticket is None and self._active_inferences != 0)
+                    or not self._admission_paused or self._pause_reason != 'resource_release_unverified'):
                     return 409, {'error': 'cleanup_recovery_state_changed'}
                 self._ticket = None
                 self._active_inferences = 0
                 self._resident_profile = None
                 self._admission_paused = False
                 self._pause_reason = None
-                self._last_release_method = 'privileged_owned_exit_recovery'
+                self._last_release_method = 'owned_exit_recovery' if resume_queue else 'privileged_owned_exit_recovery'
+                if resume_queue:
+                    self._advance_locked()
                 return 200, {'recovered': True, **await self._status_locked(),
                              'inference_completed': False, 'native_lane_counters_modified': False}
         except Exception:
             return 503, {'error': 'cleanup_recovery_proof_unavailable'}
         finally:
             async with self._lock:
+                if (resume_queue and self._ticket is ticket and self._admission_paused
+                    and self._pause_reason == 'resource_release_unverified'):
+                    for waiter in self._pending:
+                        if not waiter.granted.done():
+                            waiter.granted.set_exception(_GuardError(503, 'resource_release_unverified',
+                                                                     'owned resource release is not yet verified'))
+                    self._pending.clear()
                 self._recovering_cleanup = False
+                self._cleanup_recovery_resumes_queue = False
+                self._cleanup_recovery_task = None
+
+    async def recover_cleanup(self, *, token):
+        if not self.control_token or not hmac.compare_digest(token, self.control_token):
+            return 403, {'error': 'forbidden'}
+        async with self._lock:
+            ticket = self._ticket
+            if (not self._admission_paused or self._pause_reason != 'resource_release_unverified'
+                or ticket is None or ticket.stage != 'cleanup' or self._pending or self._recovering_cleanup):
+                return 409, {'error': 'cleanup_recovery_not_available'}
+            task = self._start_cleanup_recovery_locked(ticket, resume_queue=False)
+        return await asyncio.shield(task)
 
     async def _manager_json(self, method, path, *, deadline):
         if self.client is None:
@@ -651,6 +693,9 @@ class _ContextLifecycleGuard(_LifecycleGuard):
             ticket.cleanup_profile = None
             current = None
         ticket.cleanup_profile = ticket.profile
+        # Admission must resolve an exact closed predecessor lease before
+        # health dispatch can start the requested profile's native runner.
+        await self._proof(ticket.profile, 'before_forward', deadline=deadline, disconnect=disconnect)
         # The pinned Lily /health may return HTTP 200 while still loading.
         # Only an explicit granted Load can dispatch upstream health; wait
         # for the native JSON ready state before generation is forwarded.
@@ -741,12 +786,12 @@ class _ContextLifecycleGuard(_LifecycleGuard):
             if isinstance(nested, dict) and forbidden.intersection(nested):
                 raise _GuardError(400, 'invalid_request', 'request cannot override the selected context profile')
         budgets = [value[k] for k in ('max_tokens', 'max_completion_tokens') if k in value and value[k] is not None]
-        if any(type(budget) is not int or not 0 < budget <= profile.context_tokens for budget in budgets):
-            raise _GuardError(400, 'invalid_request', 'output budget must fit the selected profile')
+        if any(type(budget) is not int or not 0 < budget <= min(profile.context_tokens, 65536) for budget in budgets):
+            raise _GuardError(400, 'invalid_request', 'output budget must not exceed 65536 tokens')
         if len(budgets) > 1 and budgets[0] != budgets[1]:
             raise _GuardError(400, 'invalid_request', 'output budgets disagree')
         output = budgets[0] if budgets else profile.default_output_tokens
-        if type(output) is not int or not 0 < output <= profile.context_tokens:
+        if type(output) is not int or not 0 < output <= min(profile.context_tokens, 65536):
             raise _GuardError(400, 'invalid_request', 'output budget must fit the selected profile')
         if self.context_admission is not None:
             try:
@@ -755,8 +800,12 @@ class _ContextLifecycleGuard(_LifecycleGuard):
                 raise _GuardError(503, 'context_validation_failed', 'checkpoint context admission failed') from error
             if type(count) is not int or count <= 0:
                 raise _GuardError(503, 'context_validation_failed', 'checkpoint context count is unavailable')
-            if count + output > profile.context_tokens:
-                raise _GuardError(400, 'context_length_exceeded', 'prompt and output budget exceed the selected profile')
+            if count >= profile.context_tokens:
+                raise _GuardError(400, 'context_length_exceeded', 'prompt leaves no room for output in the selected profile')
+            # Native resolve_budget clamps the requested output to the exact
+            # remaining window and reports finish_reason=length on exhaustion.
+            # Do not reject a nonempty 64K prompt just because its default
+            # output budget is now 64K; input itself is never truncated.
         # When no exact callback is supplied, the pinned native checkpoint
         # renderer/tokenizer remains authoritative: it rejects input overflow
         # and signals output clamp with finish_reason=length. Never estimate

@@ -1,0 +1,109 @@
+diff --git a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/AdditionalModelSettings.tsx b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/AdditionalModelSettings.tsx
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/AdditionalModelSettings.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/AdditionalModelSettings.tsx
+@@ -25,7 +25,7 @@
+ function clamp(value: number, min: number, max: number): number {
+     return Math.min(max, Math.max(min, value));
+ }
+-const AdditionalModelSettings: React.FC<AdditionalModelSettingsProps> = ({ temperature = 1.0, maxTokens = 2048, useAdvancedParams: externalUseAdvancedParams, onTemperatureChange, onMaxTokensChange, onUseAdvancedParamsChange, mockTestFallbacks, onMockTestFallbacksChange, streamingEnabled = true, onStreamingChange, showAdvancedParams = true, }) => {
++const AdditionalModelSettings: React.FC<AdditionalModelSettingsProps> = ({ temperature = 1.0, maxTokens = 65536, useAdvancedParams: externalUseAdvancedParams, onTemperatureChange, onMaxTokensChange, onUseAdvancedParamsChange, mockTestFallbacks, onMockTestFallbacksChange, streamingEnabled = true, onStreamingChange, showAdvancedParams = true, }) => {
+     const [internalUseAdvancedParams, setInternalUseAdvancedParams] = useState(false);
+     const useAdvancedParams = externalUseAdvancedParams !== undefined ? externalUseAdvancedParams : internalUseAdvancedParams;
+     const [localTemperature, setLocalTemperature] = useState(temperature);
+@@ -52,7 +52,7 @@
+         onTemperatureChange?.(newValue);
+     };
+     const handleMaxTokensChange = (value: number) => {
+-        const newValue = clamp(Number.isFinite(value) ? Math.round(value) : 1000, 1, 32768);
++        const newValue = clamp(Number.isFinite(value) ? Math.round(value) : 1000, 1, 65536);
+         setLocalMaxTokens(newValue);
+         setMaxTokensText(String(newValue));
+         onMaxTokensChange?.(newValue);
+@@ -68,7 +68,7 @@
+     const handleMaxTokensTyped = (raw: string) => {
+         setMaxTokensText(raw);
+         const parsed = Number(raw);
+-        if (raw.trim() !== "" && Number.isInteger(parsed) && parsed >= 1 && parsed <= 32768) {
++        if (raw.trim() !== "" && Number.isInteger(parsed) && parsed >= 1 && parsed <= 65536) {
+             setLocalMaxTokens(parsed);
+             onMaxTokensChange?.(parsed);
+         }
+@@ -148,10 +148,10 @@
+               </div>
+               {localizeProps(<Input id={`${maxTokensId}-number`} type="text" inputMode="numeric" aria-label="Max tokens value" value={maxTokensText} disabled={!useAdvancedParams} className="h-8 w-24" onChange={(event) => handleMaxTokensTyped(event.target.value)} onBlur={() => handleMaxTokensChange(Number(maxTokensText))}/>, { "aria-label": "ui.admin.display.max.tokens.value.841d4229" })}
+             </div>
+-            {localizeProps(<input id={maxTokensId} type="range" min={1} max={32768} step={1} value={localMaxTokens} disabled={!useAdvancedParams} aria-label="Max Tokens" className="w-full accent-primary disabled:cursor-not-allowed" onChange={(event) => handleMaxTokensChange(Number(event.target.value))}/>, { "aria-label": "ui.admin.display.max.tokens.7c8233fd" })}
++            {localizeProps(<input id={maxTokensId} type="range" min={1} max={65536} step={1} value={localMaxTokens} disabled={!useAdvancedParams} aria-label="Max Tokens" className="w-full accent-primary disabled:cursor-not-allowed" onChange={(event) => handleMaxTokensChange(Number(event.target.value))}/>, { "aria-label": "ui.admin.display.max.tokens.7c8233fd" })}
+             <div className="mt-1 flex justify-between text-xs text-muted-foreground">
+               <span>1</span>
+-              <span>32768</span>
++              <span>65536</span>
+             </div>
+           </div>
+         </div>)}
+diff --git a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatUI.tsx b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatUI.tsx
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatUI.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/chat_ui/ChatUI.tsx
+@@ -218,7 +218,7 @@
+     const [generatedCode, setGeneratedCode] = useState("");
+     const [selectedSdk, setSelectedSdk] = useState<"openai" | "azure">("openai");
+     const [temperature, setTemperature] = useState<number>(1.0);
+-    const [maxTokens, setMaxTokens] = useState<number>(2048);
++    const [maxTokens, setMaxTokens] = useState<number>(65536);
+     const [useAdvancedParams, setUseAdvancedParams] = useState<boolean>(false);
+     const [mockTestFallbacks, setMockTestFallbacks] = useState<boolean>(false);
+     const [streamingEnabled, setStreamingEnabled] = useState<boolean>(() => {
+diff --git a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/compareUI/CompareUI.tsx b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/compareUI/CompareUI.tsx
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/compareUI/CompareUI.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/compareUI/CompareUI.tsx
+@@ -64,7 +64,7 @@
+             vectorStores: [],
+             guardrails: [],
+             temperature: 1,
+-            maxTokens: 2048,
++            maxTokens: 65536,
+             applyAcrossModels: false,
+             useAdvancedParams: false,
+         },
+@@ -79,7 +79,7 @@
+             vectorStores: [],
+             guardrails: [],
+             temperature: 1,
+-            maxTokens: 2048,
++            maxTokens: 65536,
+             applyAcrossModels: false,
+             useAdvancedParams: false,
+         },
+@@ -185,7 +185,7 @@
+             return {
+                 ...comparison,
+                 temperature: comparison.temperature ?? 1,
+-                maxTokens: comparison.maxTokens ?? 2048,
++                maxTokens: comparison.maxTokens ?? 65536,
+                 applyAcrossModels: comparison.applyAcrossModels ?? false,
+                 useAdvancedParams: comparison.useAdvancedParams ?? false,
+                 ...(comparison.model
+@@ -214,7 +214,7 @@
+             vectorStores: [],
+             guardrails: [],
+             temperature: 1,
+-            maxTokens: 2048,
++            maxTokens: 65536,
+             applyAcrossModels: false,
+             useAdvancedParams: false,
+         };
+diff --git a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/compareUI/components/ComparisonPanel.tsx b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/compareUI/components/ComparisonPanel.tsx
+--- a/ui/litellm-dashboard/src/app/(dashboard)/playground/components/compareUI/components/ComparisonPanel.tsx
++++ b/ui/litellm-dashboard/src/app/(dashboard)/playground/components/compareUI/components/ComparisonPanel.tsx
+@@ -130,9 +130,9 @@
+                   <label className={`text-xs font-medium ${disabledTextColor}`}><LocalizedText id="ui.admin.display.max.tokens.7c8233fd"/></label>
+                   <span className={`text-xs ${disabledTextColor}`}>{comparison.maxTokens}</span>
+                 </div>
+-                <Slider min={1} max={32768} step={1} value={[comparison.maxTokens]} onValueChange={(value) => {
++                <Slider min={1} max={65536} step={1} value={[comparison.maxTokens]} onValueChange={(value) => {
+             const nextValue = Array.isArray(value) ? value[0] : value;
+-            const clamped = Math.min(32768, Math.max(1, Math.round(nextValue)));
++            const clamped = Math.min(65536, Math.max(1, Math.round(nextValue)));
+             handleSettingChange("maxTokens", clamped);
+         }} disabled={!comparison.useAdvancedParams}/>
+               </div>
