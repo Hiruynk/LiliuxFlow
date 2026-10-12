@@ -646,7 +646,7 @@ def parse_port(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--version', action='version', version='LiliuxFlow 0.1.0')
+    parser.add_argument('--version', action='version', version='LiliuxFlow 0.1.2')
     parser.add_argument('--data-root', type=Path, default=Path.home() / 'Library/Application Support/LiliuxFlow')
     commands = parser.add_subparsers(dest='command', required=True)
     command = commands.add_parser('setup', help='generate an isolated installation, no DB/service/model load')

@@ -20,6 +20,7 @@ jobs:
           submodules: false
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
         with:
+          version: "0.12.19"
           enable-cache: false
       - name: Guard every tracked source path and blob format
         run: python3 scripts/distribution/package.py --check-tree
@@ -56,6 +57,14 @@ jobs:
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/liliuxflow-litellm-cpu
         run: |
           uv run --locked --no-dev --project services/litellm python -m unittest discover -s scripts/distribution -p 'test_mtp2_shared_*.py' -v
+      - name: Check shared shutdown ownership and exit recovery with CPU fixtures only
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/liliuxflow-litellm-cpu
+        run: |
+          uv run --locked --no-dev --project services/litellm python -c "import unittest; suite = unittest.defaultTestLoader.discover('scripts/distribution', pattern='test_shared_*.py'); assert suite.countTestCases() > 0, 'shared shutdown suite must not be empty'"
+          uv run --locked --no-dev --project services/litellm python -m unittest discover -s scripts/distribution -p 'test_shared_*.py' -v
+          uv run --locked --no-dev --project services/litellm python -m unittest discover -s scripts/distribution -p test_forced_stop.py -v
+          uv run --locked --no-dev --project services/litellm python -m unittest discover -s scripts/distribution -p test_force_dispatch.py -v
       - name: Exercise the pinned model installer SDK with simulated HTTP only
         env:
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/liliuxflow-model-installer
@@ -75,6 +84,7 @@ jobs:
           submodules: false
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
         with:
+          version: "0.12.19"
           enable-cache: false
       - name: Run the Apple SDK-backed transport CPU test
         env:

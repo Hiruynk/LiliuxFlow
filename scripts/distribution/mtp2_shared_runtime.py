@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unwired CPU adapters for one finite shared MTP2 native recipe.
+"""Source and runtime adapters for the finite shared MTP2 native recipe.
 
-The expectation below is an INTERNAL, code-side review input. It must be frozen
-into the distributed recipe by the normal generator after master review. Never
-derive it from an installation receipt, inference input, or a private approval
-file. No shared recipe is enabled by default in this prototype.
+The normal generator freezes the code-side expectation into the distributed
+recipe and binds it to the installed shared extension. Never derive it from
+an installation receipt, inference input, or a private approval file.
+Shared serving requires explicit build and startup selection.
 
-Existing MTP0 and unshared OPT64 selectors are deliberately not replaced. These
-helpers do not build, launch, create a lease, grant an alias, or write trust.
-Native stderr is evidence only: it cannot authorize a live request release.
-An authenticated owned native transport and request-ID binding remain required.
+MTP0 and unshared OPT64 selectors retain their existing behavior. These helpers
+verify recipe and source boundaries; they do not launch processes, create a
+lease, grant aliases, or write trust. Native stderr is evidence only and cannot
+authorize request release. An authenticated owned native transport and
+request-ID binding remain required.
 """
 from __future__ import annotations
 
@@ -96,10 +97,10 @@ def _digest(value):
 
 @dataclass(frozen=True, slots=True)
 class RecipeExpectation:
-    """Master-bound candidate inputs, not an approval or a trust receipt.
+    """Source-bound recipe inputs, not installation authorization.
 
-    P1 and P2 hashes include all final reviewed source/test/transport changes.
-    The final 237-file candidate is not implicitly a shipping expectation.
+    Patch and inventory hashes describe a fixed recipe generation. The normal
+    generator must bind the selected inputs into the installed extension.
     """
     p1_patch_sha256: str
     p2_patch_sha256: str
@@ -381,8 +382,8 @@ def validate_shared_extension(trusted, expected=None):
     Keep the old top-level executable inventory and both original engine paths.
     New helper/runner/transport/recipe bytes are hash-bound in source_files; the
     shared executable is bound in this separate extension, never arbitrary argv.
-    This prototype deliberately cannot enable an installation without the future
-    reviewed runner and transport source files. No private review file is read.
+    Installation selection requires the bound runner and transport source files.
+    No private review file is read.
     """
     extension = trusted['trust'].get('mtp2_shared_runtime')
     if extension is None:

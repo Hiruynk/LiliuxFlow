@@ -48,7 +48,7 @@ Its total context is 131,072 tokens; the default output budget is 65,536. The 64
 | `qwen3.8-flash-next-lily-q4-mtp2-128k` | 131,072 | Optional MTP2 |
 | `qwen3.8-flash-next-lily-q4-mtp2-262k` | 262,144 | Optional MTP2 |
 
-All three MTP2 profiles have been validated and enabled on the tested M5 Max / 128 GiB installation. Availability on another installation depends on its trusted configuration. A fresh source catalog starts with MTP2 disabled; the optional-engine build initially enables only MTP2 64K. Long profiles require separate operator validation and trusted enablement. Each caller also needs an explicit grant for the selected alias; empty or wildcard grants do not authorize MTP2. The API default stays MTP0 64K.
+The [shared-mode installation](INSTALLATION.md#shared-mtp2) enables all three MTP2 aliases through the normal build and trusted extension. Select it explicitly with `start --mtp2-shared-context`. The separate `latest13f-defer-pc123-mtp2-opt64k` build enables only MTP2 64K. Each caller needs an explicit grant for the selected alias; empty or wildcard grants do not authorize MTP2. The default API model stays MTP0 64K.
 
 For an installation with the selected profile enabled and granted to your virtual key, send either of these bodies to `POST /v1/chat/completions` with the usual `Authorization: Bearer <application virtual key>` header:
 
@@ -62,7 +62,28 @@ For an installation with the selected profile enabled and granted to your virtua
 
 Omitting thinking controls preserves checkpoint-default HIGH thinking. Input and output share the selected total context; reasoning counts toward the output budget, whose maximum is 65,536 tokens for every profile. The aliases also select enabled profiles in legacy requests. Request parameters and caller grants cannot enable a disabled profile or override its engine, KV precision or context.
 
-For an explicitly selected UI login user, preview `lf profiles grant-ui-user my-ui-user ctx64k-mtp2 ctx128k-mtp2 ctx262k-mtp2 --dry-run`, then use `--execute` to append only enabled profiles. This models-only update preserves the user's role and limits; sign out and sign in again so a new dashboard session inherits the user models. It does not change ordinary API keys.
+For the shared installation whose `SHARED_DATA` is defined in Installation, preview `lf --data-root "$SHARED_DATA" profiles grant-ui-user my-ui-user ctx128k-mtp2 ctx262k-mtp2 --mtp2-shared-context --dry-run`, then use `--execute` to append only enabled profiles. This models-only update preserves the user's role and limits; sign out and sign in again so a new dashboard session inherits the user models. It does not change ordinary API keys.
+
+## Shared MTP2 serving
+
+The MTP2 64K, 128K and 262K aliases share one resident Q4 model in shared mode. Selecting another alias within that family keeps the weights resident; each request retains its own context cap and isolated session. Switching to MTP0 or a different engine requires a separate lifecycle transition and can reload the model.
+
+Shared serving allows at most **two active requests and four pending requests**. Generation is interleaved at complete speculative steps, including between prefill chunks. Session state and cache reservations still consume memory beyond the shared weights; admission remains bounded by queue deadlines and memory policy. Capacity exhaustion can wait within those bounds or return an explicit unavailable response. A caller key's own parallel limit also applies.
+
+Use the granted alias in the included client, passing the shared installation's data root:
+
+```sh
+uv run --no-project --python 3.12 python scripts/distribution/client_example.py \
+  --data-root "$SHARED_DATA" --api openai \
+  --model qwen3.8-flash-next-lily-q4-mtp2-128k --stream
+uv run --no-project --python 3.12 python scripts/distribution/client_example.py \
+  --data-root "$SHARED_DATA" --api legacy \
+  --model qwen3.8-flash-next-lily-q4-mtp2-262k --stream
+```
+
+The same aliases work through Chat Completions, legacy SSE and legacy plain text. The source catalog bounds the client model names; the running installation validates profile enablement and caller permissions. The 65,536-token default and maximum output budget includes thinking. Total context includes the actual tokenized prompt, chat template, tools and images; input plus output must fit the selected limit. Inputs are not silently truncated or routed to a smaller profile.
+
+Disconnecting cancels only that request, including during chunked prefill. Native terminal token counts are linked to the original caller for usage accounting. Prompt usage describes the full tokenized input, even if cancellation occurs before all prefill chunks finish. Output includes thinking; draft proposals and SSE frames are not completed output tokens. If native terminal usage cannot be confirmed, it remains unconfirmed rather than being recorded as an estimated zero or a refund.
 
 ## Images in Chat Completions
 
@@ -119,7 +140,7 @@ Authenticated `GET /api/capabilities` describes the Compat subset. The diagnosti
 
 Client disconnection closes the upstream request through Compat, LiteLLM and the lifecycle guard. Compat uses an internal stream even when assembling a plain-text response, allowing disconnects to cancel pending work. Cancellation is processed at safe inference boundaries; it does not promise immediate GPU preemption.
 
-Use ordinary HTTP client behavior. This Lily integration treats a TCP write-side half-close as cancellation, so clients must keep the request connection open while reading the response.
+Use ordinary HTTP client behavior. The native transport treats a confirmed TCP EOF, including a write-side half-close, as cancellation; clients must keep the request connection open while reading the response.
 
 Manual model unload is refused with HTTP 409 while inference is active. The model is loaded lazily and unloaded after its configured idle interval. The local API scope is Chat Completions; other OpenAI API families or features visible in upstream dashboards are not implied by this model profile.
 

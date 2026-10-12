@@ -121,6 +121,52 @@ The default data directory is `~/Library/Application Support/LiliuxFlow`. Manage
 
 Open [API management](http://127.0.0.1:4000/ui/) or [model management](http://127.0.0.1:8080/ui/). After a model is attached and verified, use [the included client](API.md) to send a request. Model loading is lazy, so the first request includes loading time.
 
+## Shared MTP2
+
+Shared mode uses one resident Q4 model for the 64K, 128K and 262K MTP2 aliases, with at most two active requests and four pending requests. Each request has its own context limit, session and cancellation lifecycle. The build and start selection are explicit; the original MTP0 installation remains the default.
+
+Use the `lf` function and `MODEL_DIR` defined above. This is an alternative **fresh installation** using the complete existing checkpoint in place. A new data directory still uses the same default ports: if an existing stack is running, either add the alternate `--port` settings from the next section to `setup`, or stop the old stack during a planned handover before starting the new one. Build before initializing the database.
+
+```sh
+SHARED_DATA="$HOME/Library/Application Support/LiliuxFlow shared"
+lf --data-root "$SHARED_DATA" setup --model-dir "$MODEL_DIR"
+lf --data-root "$SHARED_DATA" build \
+  --optin-engine latest13f-defer-pc123-mtp2-shared-context-v1 \
+  --ui-manifest manifests/distribution/ui-recipe-mtp2-shared.json --execute
+lf --data-root "$SHARED_DATA" verify-model
+lf --data-root "$SHARED_DATA" initialize --execute
+lf --data-root "$SHARED_DATA" doctor
+lf --data-root "$SHARED_DATA" start --mtp2-shared-context
+lf --data-root "$SHARED_DATA" status
+lf --data-root "$SHARED_DATA" profiles list --mtp2-shared-context
+lf --data-root "$SHARED_DATA" profiles info ctx128k-mtp2 --mtp2-shared-context
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --dry-run
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx128k-mtp2 --mtp2-shared-context --execute
+lf --data-root "$SHARED_DATA" profiles grant-owner ctx262k-mtp2 --mtp2-shared-context --execute
+
+uv run --no-project --python 3.12 python scripts/distribution/client_example.py \
+  --data-root "$SHARED_DATA" --api openai \
+  --model qwen3.8-flash-next-lily-q4-mtp2-128k --stream
+uv run --no-project --python 3.12 python scripts/distribution/client_example.py \
+  --data-root "$SHARED_DATA" --api openai \
+  --model qwen3.8-flash-next-lily-q4-mtp2-262k --stream
+```
+
+Startup creates the designated installation caller; grants append only the selected enabled aliases to that caller. Other application keys need their own exact model grants in API management. Empty or wildcard grants do not authorize MTP2. Parallel limits on each key still apply; to demonstrate two callers, use two explicitly authorized application keys, or one key whose parallel allowance supports two requests.
+
+To authorize one dashboard login user, replace `my-ui-user` with that user's ID:
+
+```sh
+lf --data-root "$SHARED_DATA" profiles grant-ui-user my-ui-user ctx128k-mtp2 ctx262k-mtp2 \
+  --mtp2-shared-context --dry-run
+lf --data-root "$SHARED_DATA" profiles grant-ui-user my-ui-user ctx128k-mtp2 ctx262k-mtp2 \
+  --mtp2-shared-context --execute
+```
+
+Sign out and sign in again to refresh the user's session models. This preserves the user's role and limits and does not change other application keys. Use application virtual keys for inference; management credentials belong in the management tools.
+
+An already built installation cannot be overwritten with `build`. Prepare a separate source checkout and data directory for an upgrade, then follow [Upgrade and rollback](OPERATIONS.md#upgrade-and-rollback) for backup, restoration and handover. See [Shared MTP2 operations](OPERATIONS.md#shared-mtp2-operations) for stopping or changing modes.
+
 ## Separate installations and port conflicts
 
 Use a dedicated data directory and choose all alternate ports before initialization if the defaults are occupied:

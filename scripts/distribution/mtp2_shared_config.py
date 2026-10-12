@@ -1,8 +1,9 @@
-"""Staged MTP2-only manager and request policy adapter.
+"""MTP2 manager configuration and request policy for the shared extension.
 
-This module is not wired into the installed supervisor. A caller must validate
-the installation and the shared native recipe before using its output. MTP0
-records and logical LiteLLM routes stay in their established generators.
+The normal source generator binds this adapter and the shared native recipe
+into the installed supervisor's trusted extension. MTP0 records and logical
+LiteLLM routes remain in their established generators. Request inputs cannot
+select physical model paths or override the finite context policy.
 
 SPDX-License-Identifier: Apache-2.0
 """
@@ -70,10 +71,10 @@ def _absolute_path(value):
 
 
 def shared_manager_config(manager, registry, *, runner_python, source_root, data_root, candidate_validation=False):
-    """Return a candidate config with one MTP2 row; never write or launch it.
+    """Return manager configuration with one physical MTP2 row; do not launch it.
 
     The arguments are internal installation values, never inference input. The
-    shared runner is a separate candidate entry point. Existing manager globals,
+    shared runner is a separate installed entry point. Existing manager globals,
     every MTP0/other record, and the input object remain byte-equivalent when
     serialized by their original JSON serializer.
     """

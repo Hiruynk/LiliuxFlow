@@ -17,6 +17,40 @@ lf stop
 
 Use [model management](http://127.0.0.1:8080/ui/) for model state and lifecycle actions, and [API management](http://127.0.0.1:4000/ui/) for application keys, permissions and usage. Ordinary manual unload is rejected with HTTP 409 while inference is active. `stop` checks the installation's ownership and lifecycle state before removing its LaunchAgent and stopping owned processes; a busy or unconfirmed state prevents the operation. Let active requests finish or cancel them through their clients before trying again.
 
+## Shared MTP2 operations
+
+After the [shared build and installation](INSTALLATION.md#shared-mtp2), explicitly select shared serving when starting it. Reuse the `SHARED_DATA` defined there:
+
+```sh
+lf --data-root "$SHARED_DATA" start --mtp2-shared-context
+lf --data-root "$SHARED_DATA" status
+lf --data-root "$SHARED_DATA" doctor
+lf --data-root "$SHARED_DATA" profiles list --mtp2-shared-context
+lf --data-root "$SHARED_DATA" profiles info ctx262k-mtp2 --mtp2-shared-context
+```
+
+The shared extension serves only the three MTP2 aliases with one resident physical model, two active requests and four pending requests. Changing context within that family does not reload the weights. The original MTP0 routes keep their separate engine and lifecycle. A caller grant selects allowed aliases, not the startup mode; use the shared flag for `profiles grant-owner` and `profiles grant-ui-user` as shown in Installation.
+
+Unload and idle lifetime operate on the whole physical MTP2 runtime. Ordinary unload returns HTTP 409 while any peer is active or waiting; one alias cannot unload another request's model. The 1,800-second idle interval belongs to that physical runtime. Disconnecting one client cancels only its request, and resource release waits for its owned native lifecycle to finish.
+
+Tenant caches stay in resident memory and share the fixed 24 GiB cache/reservation policy; shared disk caching is disabled. Session snapshots, speculative continuations and scratch state also consume memory. Observe actual headroom and swap rather than assuming that one copy of the weights makes additional sessions free.
+
+To stop normally, finish or cancel outstanding requests first:
+
+```sh
+lf --data-root "$SHARED_DATA" stop
+```
+
+When you explicitly need to cancel work and stop your installation, use:
+
+```sh
+lf --data-root "$SHARED_DATA" stop --force
+```
+
+Force stop cancels this installation's requests and stops only verified owned processes, with bounded termination and exit checks. PostgreSQL uses its normal fast-stop path after the installation data directory is verified. Credentials, database data, weights and caches are preserved. An uncertain or foreign process identity refuses cleanup; do not remove active lease files or signal unrelated processes.
+
+To change modes, stop the installation before restarting. Plain `start` selects MTP0; `start --mtp2-shared-context` explicitly restores shared mode. Do not assume a generic restart or rollback remembers the shared selection.
+
 ## Model catalog and attachment
 
 `lf models list` and `lf models info qwen3.8-flash-next-lily-q4` inspect the fixed catalog offline. The optional download flow requires explicit `--dry-run` (network metadata) or `--execute` (payload download); see [Installation](INSTALLATION.md).
@@ -74,13 +108,24 @@ Restore requires an independently initialized target with no application records
 
 Prepare an upgrade in a new data directory instead of overwriting an existing runtime. Keep the previous installation and a backup until the replacement is working. Multiple installations can reference one external model directory, but only one model runner may hold the model lease at a time.
 
-The rollback helper stops the current installation and starts a previously prepared installation. Both must belong to the same user and use the same port configuration:
+Use a separate source checkout as well as a new data directory, so building an upgrade does not change the running installation's source bindings. Back up the previous installation and restore into the independently initialized replacement if you need to carry over application data. Both data directories use the same default ports unless you explicitly configure alternatives; they cannot run on those ports together. Separate ports do not permit two copies of the model to hold the shared lease.
+
+The rollback helper stops the current installation and starts a previously prepared installation in the default mode. Both must belong to the same user and use the same port configuration:
 
 ```sh
 lf --data-root "$HOME/Library/Application Support/LiliuxFlow new" rollback \
   --previous-data-root "$HOME/Library/Application Support/LiliuxFlow previous" --execute
 ```
 
-Without `--execute`, the helper shows a rollback plan. Prepare and verify the previous runtime before using it as a rollback target.
+Without `--execute`, the helper shows a rollback plan. Prepare and verify the previous runtime before using it as a rollback target. The helper does not preserve the shared MTP2 startup selection. To return to a shared installation, stop the current one and explicitly start the verified previous shared installation instead:
+
+```sh
+lf --data-root "$HOME/Library/Application Support/LiliuxFlow new" stop
+lf --data-root "$HOME/Library/Application Support/LiliuxFlow previous" start --mtp2-shared-context
+lf --data-root "$HOME/Library/Application Support/LiliuxFlow previous" status
+lf --data-root "$HOME/Library/Application Support/LiliuxFlow previous" doctor
+```
+
+Keep caller grants and connection settings aligned with the chosen installation. Do not overwrite trust receipts or runtime files to make an older installation accept new source.
 
 `lf uninstall` stops the installation and marks it uninstalled while preserving its data, keys, database, caches and external weights. It is not a command to erase installation data.
