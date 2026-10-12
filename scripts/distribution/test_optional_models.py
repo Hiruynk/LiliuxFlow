@@ -35,7 +35,7 @@ class CatalogTests(unittest.TestCase):
     def test_global_version_is_offline_without_an_installation(self):
         with patch.object(installer, '_sdk', side_effect=AssertionError('version must not initialize SDK')), patch.object(cli, 'load_install', side_effect=AssertionError('version must not read installation')), patch.object(sys, 'argv', ['lf', '--version']), contextlib.redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(SystemExit) as result:cli.main()
-        self.assertEqual(result.exception.code, 0);self.assertEqual(output.getvalue().strip(), 'LiliuxFlow 0.1.2')
+        self.assertEqual(result.exception.code, 0);self.assertEqual(output.getvalue().strip(), 'LiliuxFlow 0.1.1')
     def test_canonical_inventory_is_shared_by_six_profiles_and_keeps_default(self):
         model = catalog.select_model(ROOT, catalog.MODEL_ID)
         self.assertEqual(model.total_bytes, 105_518_409_249)

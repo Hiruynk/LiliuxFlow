@@ -2,7 +2,7 @@
 <h1 align="center">LiliuxFlow</h1>
 <p align="center">本地 LLM 部署与服务管理平台</p>
 <p align="center">
-  <a href="https://github.com/Hiruynk/LiliuxFlow/releases"><img alt="version / v0.1.2" src="https://img.shields.io/badge/version-v0.1.2-2563eb?style=flat-square"></a>
+  <a href="https://github.com/Hiruynk/LiliuxFlow/releases"><img alt="version / v0.1.1" src="https://img.shields.io/badge/version-v0.1.1-2563eb?style=flat-square"></a>
   <a href="#requirements"><img alt="macOS / 27.0" src="https://img.shields.io/badge/macOS-27.0-4c4e75?style=flat-square&amp;logo=apple&amp;logoColor=white"></a>
   <a href="#requirements"><img alt="Apple Silicon / M5+" src="https://img.shields.io/badge/Apple_Silicon-M5%2B-e7883b?style=flat-square&amp;logo=apple&amp;logoColor=white"></a>
   <a href="LICENSE"><img alt="license / Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square"></a>
